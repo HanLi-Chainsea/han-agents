@@ -357,44 +357,40 @@ def detect_coverage_gaps(project: str) -> List[Dict]:
     偵測測試覆蓋缺口
 
     找出沒有對應測試的重要程式碼。
+    - 分批取完所有節點/邊，避免靜默截斷漏報（大專案）
+    - 同時認 'tests' 與 'tested_by' 兩種測試關係邊
+    - 重要節點納入 function / class / api / method
     """
     from servers.code_graph import get_code_nodes, get_code_edges
 
-    # 取得所有 nodes
-    nodes = get_code_nodes(project, limit=1000)
-    edges = get_code_edges(project, kind='tests', limit=500)
+    # 分批取完所有 nodes（修靜默截斷）
+    nodes = _fetch_all(lambda off: get_code_nodes(project, limit=500, offset=off))
 
-    # 找出被測試覆蓋的 nodes
-    covered_ids = set(e['to_id'] for e in edges)
+    # 收集被測試覆蓋的目標 id（兩種邊方向都認）
+    covered_ids = set()
+    for e in _fetch_all(lambda off: get_code_edges(project, kind='tests', limit=500, offset=off)):
+        covered_ids.add(e['to_id'])      # test --tests--> target
+    for e in _fetch_all(lambda off: get_code_edges(project, kind='tested_by', limit=500, offset=off)):
+        covered_ids.add(e['from_id'])    # target --tested_by--> test
 
-    # 找出重要但未覆蓋的 nodes
     gaps = []
-    important_kinds = {'function', 'class', 'api'}
+    important_kinds = {'function', 'class', 'api', 'method'}
 
     for node in nodes:
         if node['kind'] not in important_kinds:
             continue
-
-        # 跳過測試檔案本身
         if 'test' in node.get('file_path', '').lower():
             continue
-
-        # 跳過 private 函式
         if node.get('visibility') == 'private':
             continue
 
-        # 檢查是否有測試
         has_test = node['id'] in covered_ids
 
-        # 也用檔案名稱啟發式檢查
+        # 檔名啟發式 fallback
         if not has_test:
             file_path = node.get('file_path', '')
             file_stem = os.path.splitext(os.path.basename(file_path))[0]
-            test_patterns = [
-                f"{file_stem}.test",
-                f"{file_stem}.spec",
-                f"test_{file_stem}",
-            ]
+            test_patterns = [f"{file_stem}.test", f"{file_stem}.spec", f"test_{file_stem}"]
             for test_node in nodes:
                 if test_node['kind'] == 'file' and 'test' in test_node.get('file_path', '').lower():
                     test_file = os.path.basename(test_node.get('file_path', '')).lower()
@@ -413,6 +409,19 @@ def detect_coverage_gaps(project: str) -> List[Dict]:
             })
 
     return gaps
+
+
+def _fetch_all(fetch_page, page_size: int = 500) -> List[Dict]:
+    """分批取完所有結果，避免單次 LIMIT 靜默截斷。"""
+    out: List[Dict] = []
+    offset = 0
+    while True:
+        page = fetch_page(offset)
+        out.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return out
 
 
 # =============================================================================

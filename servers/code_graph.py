@@ -272,7 +272,8 @@ def get_code_nodes(
     project: str,
     kind: str = None,
     file_path: str = None,
-    limit: int = 100
+    limit: int = 100,
+    offset: int = 0
 ) -> List[Dict]:
     """查詢 Code Nodes"""
     with _get_conn() as conn:
@@ -287,8 +288,9 @@ def get_code_nodes(
             query += " AND file_path LIKE ?"
             params.append(f"%{file_path}%")
 
-        query += " ORDER BY file_path, line_start LIMIT ?"
+        query += " ORDER BY file_path, line_start LIMIT ? OFFSET ?"
         params.append(limit)
+        params.append(offset)
 
         cursor = conn.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
@@ -297,7 +299,8 @@ def get_code_edges(
     from_id: str = None,
     to_id: str = None,
     kind: str = None,
-    limit: int = 100
+    limit: int = 100,
+    offset: int = 0
 ) -> List[Dict]:
     """查詢 Code Edges"""
     with _get_conn() as conn:
@@ -316,8 +319,9 @@ def get_code_edges(
             query += " AND kind = ?"
             params.append(kind)
 
-        query += " LIMIT ?"
+        query += " LIMIT ? OFFSET ?"
         params.append(limit)
+        params.append(offset)
 
         cursor = conn.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
