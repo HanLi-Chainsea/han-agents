@@ -79,6 +79,28 @@ class TestFormatSections:
         assert pb.match == []
 
 
+class TestParseRobustness:
+    def test_bom_and_leading_blank_lines(self):
+        from servers.playbooks import _parse_playbook
+        raw = '﻿\n\n---\nname: x\nmatch: ["foo"]\n---\n## Executor Principles\n- a\n## Critic Checklist\n- b\n'
+        pb = _parse_playbook(raw)
+        assert pb is not None
+        assert pb.name == "x"
+        assert pb.match == ["foo"]
+        assert "a" in pb.executor_principles
+
+    def test_load_playbooks_failopen_on_listdir_error(self, monkeypatch):
+        import servers.playbooks as pbmod
+        monkeypatch.setattr(pbmod, "_CACHE", None)
+        # _PLAYBOOK_DIR 指向存在的目錄，但讓 listdir 拋錯（模擬權限/race）
+        monkeypatch.setattr(pbmod.os.path, "isdir", lambda p: True)
+        def boom(p):
+            raise PermissionError("denied")
+        monkeypatch.setattr(pbmod.os, "listdir", boom)
+        assert pbmod.load_playbooks(force_reload=True) == {}
+        assert pbmod.resolve_playbook("write unit tests for x") is None
+
+
 class TestPromptInjection:
     def test_executor_prompt_has_unit_test_principles(self):
         from servers.facade import _build_executor_prompt

@@ -45,6 +45,8 @@ def _parse_playbook(text: str) -> Optional[Playbook]:
         ## Critic Checklist
         ...
     """
+    # 容錯：去除 UTF-8 BOM 與開頭空白，避免 playbook 因前綴雜訊靜默失效
+    text = text.lstrip("﻿").lstrip()
     if not text.startswith("---"):
         return None
     parts = text.split("---", 2)
@@ -95,22 +97,25 @@ def _extract_section(body: str, heading: str) -> str:
 
 
 def load_playbooks(force_reload: bool = False) -> Dict[str, Playbook]:
-    """載入所有 playbook（快取）。目錄缺失 → 回空 dict（fail-open）。"""
+    """載入所有 playbook（快取）。目錄缺失或列舉失敗 → 回空 dict（fail-open）。"""
     global _CACHE
     if _CACHE is not None and not force_reload:
         return _CACHE
     result: Dict[str, Playbook] = {}
-    if os.path.isdir(_PLAYBOOK_DIR):
-        for fname in sorted(os.listdir(_PLAYBOOK_DIR)):
-            if not fname.endswith(".md"):
-                continue
-            try:
-                with open(os.path.join(_PLAYBOOK_DIR, fname), encoding="utf-8") as f:
-                    pb = _parse_playbook(f.read())
-                if pb:
-                    result[pb.name] = pb
-            except Exception:
-                continue  # 單檔壞掉不影響其他
+    try:
+        if os.path.isdir(_PLAYBOOK_DIR):
+            for fname in sorted(os.listdir(_PLAYBOOK_DIR)):
+                if not fname.endswith(".md"):
+                    continue
+                try:
+                    with open(os.path.join(_PLAYBOOK_DIR, fname), encoding="utf-8") as f:
+                        pb = _parse_playbook(f.read())
+                    if pb:
+                        result[pb.name] = pb
+                except Exception:
+                    continue  # 單檔壞掉不影響其他
+    except Exception:
+        result = {}  # 目錄列舉失敗 → fail-open
     _CACHE = result
     return result
 
