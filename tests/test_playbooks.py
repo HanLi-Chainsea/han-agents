@@ -77,3 +77,29 @@ class TestFormatSections:
         pb = _parse_playbook('---\nname: bad\nmatch: [1, 2, 3]\n---\n## Executor Principles\nx\n')
         assert pb is not None
         assert pb.match == []
+
+
+class TestPromptInjection:
+    def test_executor_prompt_has_unit_test_principles(self):
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t1", "description": "Write unit tests for servers/memory.py",
+                "assigned_agent": "executor"}
+        prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
+        assert "AAA" in prompt or "Arrange" in prompt
+        assert "FIRST" in prompt
+
+    def test_critic_prompt_requires_tests_run(self):
+        from servers.facade import _build_critic_prompt
+        critic_task = {"id": "c1", "original_task_id": "t1",
+                       "original_description": "Write unit tests for x",
+                       "result": "done"}
+        prompt = _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+        assert "實際被執行" in prompt
+
+    def test_non_test_task_has_no_test_principles(self):
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t2", "description": "Fix bug in parser logic",
+                "assigned_agent": "executor"}
+        prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
+        assert "FIRST" not in prompt
+        assert "Beyoncé" not in prompt
