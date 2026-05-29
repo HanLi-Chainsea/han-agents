@@ -7,8 +7,18 @@ HAN System - 場景 Recipe
 """
 
 import os
+import re
+import subprocess
 from typing import Dict, List, Optional
 from collections import defaultdict
+
+
+_TEST_FILE_RE = re.compile(r'(^|/)(tests?|__tests__)/|(^|/)test_[^/]+$|[^/]+_test\.[^/]+$|[^/]+\.(test|spec)\.[^/]+$')
+
+
+def is_test_file(path: str) -> bool:
+    """判斷是否為測試檔（路徑段 tests/test/__tests__，或 test_*/*_test/*.test.*/*.spec.* 命名）。"""
+    return bool(_TEST_FILE_RE.search(path or ''))
 
 
 SCHEMA = """
@@ -18,19 +28,19 @@ recipe_unit_tests(project_name, project_path, target_path=None, max_tasks=20) ->
     為未測試的程式碼建立 unit test 任務樹。
     自動：sync Code Graph → 偵測覆蓋缺口 → 建立 Epic/Story/Task
 
-    Returns:
-        {
-            'epic_id': str,
-            'task_count': int,
-            'story_count': int,
-            'gaps_found': int,
-            'stories': [...],
-            'message': str,
-        }
+recipe_code_review(project_name, project_path, target_path=None, diff_base="HEAD", max_tasks=20) -> Dict
+    為待審查檔案建立 code review 任務樹。
+    目標來源：target_path（指定路徑）或 git diff（預設 HEAD）。
+    第一次/無 git/無 diff 且未給 target_path → task_count=0 + 明確訊息。
+
+recipe_integration_tests(project_name, project_path, target_path=None, max_tasks=20) -> Dict
+    為各模組建立整合測試任務樹（以目錄為模組分組）。
+
+所有 recipe 回傳含 'epic_id' 供 get_next_dispatch() 消費。
 
 run_recipe(name, **kwargs) -> Dict
     按名稱執行 recipe。
-    Available: 'unit_tests'
+    Available: 'unit_tests', 'code_review', 'integration_tests'
 """
 
 
@@ -177,9 +187,183 @@ def recipe_unit_tests(
     }
 
 
+def _ensure_synced(project_name: str, project_path: str) -> Dict:
+    """確保專案已初始化並同步 Code Graph，回 tech_stack。"""
+    from servers.project import ensure_project
+    proj = ensure_project(project_name, project_path)
+    return proj.get('tech_stack', {})
+
+
+def _list_source_files(project_name: str, target_path: str = None) -> List[str]:
+    """從 Code Graph 取 file 節點，過濾 target_path、跳過測試檔。"""
+    from servers.code_graph import get_code_nodes
+    files = []
+    offset = 0
+    while True:
+        page = get_code_nodes(project_name, kind='file', limit=500, offset=offset)
+        files.extend(page)
+        if len(page) < 500:
+            break
+        offset += 500
+    result = []
+    for n in files:
+        fp = n.get('file_path') or ''
+        if is_test_file(fp):
+            continue
+        if target_path:
+            tp = target_path.rstrip('/')
+            if not (fp == tp or fp == './' + tp
+                    or fp.startswith(tp + '/') or fp.startswith('./' + tp + '/')):
+                continue
+        result.append(fp)
+    return sorted(set(result))
+
+
+def _git_changed_files(project_path: str, diff_base: str) -> Optional[List[str]]:
+    """回傳 git diff 變更檔（排除已刪除檔）；非 git repo、失敗或不合法 diff_base 回 None。"""
+    if not diff_base or diff_base.startswith("-"):
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "-C", project_path, "diff", "--name-only",
+             "--no-ext-diff", "--no-textconv", "--diff-filter=d", diff_base, "--"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        return [f for f in out.stdout.splitlines() if f.strip()]
+    except Exception:
+        return None
+
+
+def recipe_code_review(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    diff_base: str = "HEAD",
+    max_tasks: int = 20
+) -> Dict:
+    """為待審查的檔案建立 code review 任務樹。
+
+    目標來源：
+    - 有 target_path → 取該路徑下的原始碼檔（跳過測試檔）
+    - 否則 → git diff --name-only <diff_base> 的變更檔
+    - 第一次/無 git/無 diff 且未給 target_path → task_count=0 + 明確訊息
+
+    預設 diff_base="HEAD" 審「未提交的工作區變更」；若要審「分支 vs main」
+    已提交的變更，傳 diff_base="main"（或 merge-base range 由呼叫端先算好）。
+    """
+    from servers.tasks import create_task, create_subtask
+
+    _ensure_synced(project_name, project_path)
+
+    if max_tasks <= 0:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': 'max_tasks 必須 > 0。'}
+
+    if target_path:
+        files = _list_source_files(project_name, target_path)
+    else:
+        changed = _git_changed_files(project_path, diff_base)
+        if changed is None:
+            return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                    'message': '非 git repo 或無法取得 diff。請指定 target_path。'}
+        files = [f for f in changed if not is_test_file(f)]
+
+    if not files:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': '沒有可審查的檔案。請指定 target_path 或先有改動。'}
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Code Review: {min(len(files), max_tasks)} files",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    for fp in files:
+        if task_count >= max_tasks:
+            break
+        story_id = create_task(
+            project=project_name,
+            description=f"Code review {fp}",
+            task_level='story', epic_id=epic_id, priority=7)
+        create_subtask(
+            parent_id=story_id,
+            description=f"Code review {fp}. 依 playbook 原則逐項審查並分級回報。",
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 1
+
+    return {
+        'epic_id': epic_id, 'task_count': task_count, 'story_count': task_count,
+        'message': (f"Created {task_count} code review tasks. "
+                    f"Use get_next_dispatch('{epic_id}', ...) to start."),
+    }
+
+
+def recipe_integration_tests(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    max_tasks: int = 20
+) -> Dict:
+    """為各模組建立整合測試任務樹（以模組/目錄為單位，非單一 function）。"""
+    from servers.tasks import create_task, create_subtask
+
+    tech = _ensure_synced(project_name, project_path)
+    test_tool = tech.get('test_tool', 'unknown')
+
+    if max_tasks <= 0:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': 'max_tasks 必須 > 0。'}
+
+    files = _list_source_files(project_name, target_path)
+    if not files:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': '沒有可建立整合測試的檔案。請指定 target_path 或先 sync。'}
+
+    # 以「目錄」為模組分組（取檔案所在目錄）
+    by_module = defaultdict(list)
+    for fp in files:
+        module = os.path.dirname(fp) or fp
+        by_module[module].append(fp)
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Integration Tests: {min(len(by_module), max_tasks)} modules",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    built_modules = []
+    for module in sorted(by_module.keys()):
+        if task_count >= max_tasks:
+            break
+        story_id = create_task(
+            project=project_name,
+            description=f"Integration tests for module {module}",
+            task_level='story', epic_id=epic_id, priority=7)
+        create_subtask(
+            parent_id=story_id,
+            description=(f"Write integration tests for module {module}. "
+                        f"涵蓋跨檔案協作與邊界。Test tool: {test_tool}"),
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 1
+        built_modules.append(module)
+
+    return {
+        'epic_id': epic_id, 'task_count': task_count,
+        'story_count': task_count, 'modules': built_modules,
+        'message': (f"Created {task_count} integration test tasks across "
+                    f"{len(built_modules)} modules. "
+                    f"Use get_next_dispatch('{epic_id}', ...) to start."),
+    }
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,
+    'code_review': recipe_code_review,
+    'integration_tests': recipe_integration_tests,
 }
 
 

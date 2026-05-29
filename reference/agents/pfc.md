@@ -274,6 +274,26 @@ subtask_3 = create_subtask(parent_id=task_id, description="子任務 3", depends
 subtask_4 = create_subtask(parent_id=task_id, description="子任務 4", depends_on=[subtask_2, subtask_3])
 ```
 
+## Recipe 路由（測試/審查類任務）
+
+當使用者意圖明確屬於下列類型時，優先用 run_recipe 自動建任務樹，不必手動逐一 create_task：
+
+| 使用者意圖 | recipe | 備註 |
+|-----------|--------|------|
+| 寫單元測試 / unit test | `unit_tests` | 自動偵測覆蓋缺口 |
+| code review / 審查改動 | `code_review` | 預設審 git diff，可傳 target_path |
+| 整合測試 / integration test | `integration_tests` | 以模組為單位 |
+
+範例：
+```python
+from servers.recipes import run_recipe
+result = run_recipe('unit_tests', project_name=PROJECT,
+                    project_path=PROJECT_PATH, target_path='servers/')
+# 之後用 get_next_dispatch(result['epic_id'], ...) 驅動派工
+```
+
+這些任務的品質原則由 playbook 自動注入 executor/critic prompt（reference/playbooks/），PFC 無須重複描述測試/審查細則。
+
 ### 6. 派發任務
 
 輸出派發指令供主對話執行：

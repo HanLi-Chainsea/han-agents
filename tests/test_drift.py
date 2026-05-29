@@ -153,3 +153,52 @@ class TestDriftEdgeCases:
         summary = get_drift_summary("test-project_v2")
 
         assert isinstance(summary, str)
+
+
+class TestCoverageGapsImprovements:
+    def _seed(self, db_path):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        nodes = [
+            ("func.a.py:foo", "cov", "function", "foo", "a.py", 1, 5, "python"),
+            ("method.a.py:Bar.baz", "cov", "method", "baz", "a.py", 6, 10, "python"),
+            ("func.a.py:tested_fn", "cov", "function", "tested_fn", "a.py", 11, 15, "python"),
+        ]
+        for n in nodes:
+            conn.execute("""INSERT INTO code_nodes
+                (id, project, kind, name, file_path, line_start, line_end, language)
+                VALUES (?,?,?,?,?,?,?,?)""", n)
+        # tested_by 邊：tested_fn 被測試覆蓋
+        conn.execute("""INSERT INTO code_edges (project, from_id, to_id, kind)
+            VALUES ('cov', 'func.a.py:tested_fn', 'test.a_test.py:test_it', 'tested_by')""")
+        conn.commit()
+        conn.close()
+
+    def test_method_included_and_tested_by_excluded(self, mock_db_path):
+        self._seed(mock_db_path)
+        from servers.drift import detect_coverage_gaps
+        gaps = detect_coverage_gaps("cov")
+        names = {g["name"] for g in gaps}
+        assert "foo" in names          # 未測 function → gap
+        assert "baz" in names          # method 也要納入 → gap
+        assert "tested_fn" not in names  # 有 tested_by 邊 → 非 gap
+
+    def test_pagination_no_missed_coverage_over_500(self, mock_db_path):
+        import sqlite3
+        conn = sqlite3.connect(mock_db_path)
+        # 600 functions ALL in同一檔、同一 line_start：唯一可區分的排序鍵是 id。
+        # 若分頁無穩定 tie-breaker，跨頁可能重複/跳過 → 某些被覆蓋節點被誤判為 gap。
+        for i in range(600):
+            conn.execute("""INSERT INTO code_nodes
+                (id, project, kind, name, file_path, line_start, line_end, language)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                (f"func.same.py:fn{i:04d}", "pg", "function", f"fn{i:04d}",
+                 "same.py", 1, 5, "python"))
+            conn.execute("""INSERT INTO code_edges (project, from_id, to_id, kind)
+                VALUES ('pg', ?, ?, 'tested_by')""",
+                (f"func.same.py:fn{i:04d}", f"test.t.py:test{i:04d}"))
+        conn.commit()
+        conn.close()
+        from servers.drift import detect_coverage_gaps
+        gaps = detect_coverage_gaps("pg")
+        assert gaps == [], f"expected no gaps (all covered), got {len(gaps)}"

@@ -1918,6 +1918,16 @@ def _build_executor_prompt(
 Please address the issues above in this retry.
 """
 
+    # Playbook 原則注入（依描述分類；未命中則為空，fail-open）
+    playbook_section = ""
+    try:
+        from servers.playbooks import resolve_playbook, executor_section
+        pb = resolve_playbook(description)
+        if pb:
+            playbook_section = "\n" + executor_section(pb)
+    except Exception:
+        playbook_section = ""
+
     prompt = f'''TASK_ID = "{task_id}"
 PROJECT = "{project_name}"
 PROJECT_PATH = "{project_path}"
@@ -1927,6 +1937,7 @@ PROJECT_PATH = "{project_path}"
 {description}
 {context_section}
 {rejection_section}
+{playbook_section}
 {policy_section}
 ## Instructions
 
@@ -1956,6 +1967,16 @@ def _build_critic_prompt(
     description = critic_task.get('original_description', '')
     policy_section = _build_guardrail_policy_section('critic')
 
+    # Playbook 驗收清單注入（依原始任務描述分類；fail-open）
+    playbook_section = ""
+    try:
+        from servers.playbooks import resolve_playbook, critic_section
+        pb = resolve_playbook(description)
+        if pb:
+            playbook_section = "\n" + critic_section(pb)
+    except Exception:
+        playbook_section = ""
+
     prompt = f'''TASK_ID = "{critic_task_id}"
 ORIGINAL_TASK_ID = "{original_task_id}"
 PROJECT = "{project_name}"
@@ -1971,7 +1992,7 @@ Result: {critic_task.get('result', 'See code changes')}
 1. Does the output match the task description?
 2. Are there obvious errors or missing edge cases?
 3. Is the code quality acceptable?
-
+{playbook_section}
 {policy_section}
 
 ## Output Format

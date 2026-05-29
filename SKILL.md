@@ -160,7 +160,17 @@ while True:
     # 其他平台: 直接在 context 中執行 inst['prompt']
 ```
 
-**Available Recipes**: `unit_tests` (more coming)
+**Available Recipes**: `unit_tests`、`code_review`、`integration_tests`
+
+```python
+from servers.recipes import run_recipe
+# 使用者：「幫 servers/ 寫單元測試」
+run_recipe('unit_tests', project_name='p', project_path='/path', target_path='servers/')
+# 使用者：「code review 這次改動」
+run_recipe('code_review', project_name='p', project_path='/path')  # 預設 git diff HEAD
+# 使用者：「幫 auth 模組寫整合測試」
+run_recipe('integration_tests', project_name='p', project_path='/path', target_path='servers/auth/')
+```
 
 **get_next_dispatch() 自動處理**:
 - Executor → Critic validation loop（幂等，不會建重複 critic）
