@@ -7,6 +7,7 @@ HAN System - 場景 Recipe
 """
 
 import os
+import subprocess
 from typing import Dict, List, Optional
 from collections import defaultdict
 
@@ -174,6 +175,108 @@ def recipe_unit_tests(
             f"{len(stories_info)} files. "
             f"Use get_next_dispatch('{epic_id}', ...) to start execution."
         ),
+    }
+
+
+def _ensure_synced(project_name: str, project_path: str) -> Dict:
+    """確保專案已初始化並同步 Code Graph，回 tech_stack。"""
+    from servers.project import ensure_project
+    proj = ensure_project(project_name, project_path)
+    return proj.get('tech_stack', {})
+
+
+def _list_source_files(project_name: str, target_path: str = None) -> List[str]:
+    """從 Code Graph 取 file 節點，過濾 target_path、跳過測試檔。"""
+    from servers.code_graph import get_code_nodes
+    files = []
+    offset = 0
+    while True:
+        page = get_code_nodes(project_name, kind='file', limit=500, offset=offset)
+        files.extend(page)
+        if len(page) < 500:
+            break
+        offset += 500
+    result = []
+    for n in files:
+        fp = n.get('file_path') or ''
+        if 'test' in fp.lower():
+            continue
+        if target_path:
+            tp = target_path.rstrip('/')
+            if not (fp.startswith(tp) or fp.startswith('./' + tp)):
+                continue
+        result.append(fp)
+    return sorted(set(result))
+
+
+def _git_changed_files(project_path: str, diff_base: str) -> Optional[List[str]]:
+    """回傳 git diff 變更檔；非 git repo 或失敗回 None。"""
+    try:
+        out = subprocess.run(
+            ["git", "-C", project_path, "diff", "--name-only", diff_base],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        return [f for f in out.stdout.splitlines() if f.strip()]
+    except Exception:
+        return None
+
+
+def recipe_code_review(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    diff_base: str = "HEAD",
+    max_tasks: int = 20
+) -> Dict:
+    """為待審查的檔案建立 code review 任務樹。
+
+    目標來源：
+    - 有 target_path → 取該路徑下的原始碼檔（跳過測試檔）
+    - 否則 → git diff --name-only <diff_base> 的變更檔
+    - 第一次/無 git/無 diff 且未給 target_path → task_count=0 + 明確訊息
+    """
+    from servers.tasks import create_task, create_subtask
+
+    _ensure_synced(project_name, project_path)
+
+    if target_path:
+        files = _list_source_files(project_name, target_path)
+    else:
+        changed = _git_changed_files(project_path, diff_base)
+        if changed is None:
+            return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                    'message': '非 git repo 或無法取得 diff。請指定 target_path。'}
+        files = [f for f in changed if 'test' not in f.lower()]
+
+    if not files:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': '沒有可審查的檔案。請指定 target_path 或先有改動。'}
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Code Review: {len(files)} files",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    for fp in files:
+        if task_count >= max_tasks:
+            break
+        story_id = create_task(
+            project=project_name,
+            description=f"Code review {fp}",
+            task_level='story', epic_id=epic_id, priority=7)
+        create_subtask(
+            parent_id=story_id,
+            description=f"Code review {fp}. 依 playbook 原則逐項審查並分級回報。",
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 1
+
+    return {
+        'epic_id': epic_id, 'task_count': task_count, 'story_count': task_count,
+        'message': (f"Created {task_count} code review tasks. "
+                    f"Use get_next_dispatch('{epic_id}', ...) to start."),
     }
 
 
