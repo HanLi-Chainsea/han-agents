@@ -203,7 +203,7 @@ def _list_source_files(project_name: str, target_path: str = None) -> List[str]:
             continue
         if target_path:
             tp = target_path.rstrip('/')
-            if not (fp.startswith(tp) or fp.startswith('./' + tp)):
+            if not (fp.startswith(tp + '/') or fp.startswith('./' + tp + '/')):
                 continue
         result.append(fp)
     return sorted(set(result))

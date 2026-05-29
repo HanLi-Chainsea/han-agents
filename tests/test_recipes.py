@@ -37,3 +37,12 @@ class TestRecipeCodeReview:
         result = recipes.recipe_code_review("cr2", str(tmp_path))
         assert result["task_count"] == 0
         assert "target_path" in result["message"]
+
+    def test_target_path_no_sibling_false_match(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "cr3",
+                    ["servers/foo.py", "servers_other/bar.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_code_review("cr3", str(tmp_path), target_path="servers/")
+        assert result["task_count"] == 1  # 只 servers/，不含 servers_other/
