@@ -276,6 +276,8 @@ def get_code_nodes(
     offset: int = 0
 ) -> List[Dict]:
     """查詢 Code Nodes"""
+    if limit < 0 or offset < 0:
+        raise ValueError(f"limit/offset must be >= 0 (got limit={limit}, offset={offset})")
     with _get_conn() as conn:
         query = "SELECT * FROM code_nodes WHERE project = ?"
         params = [project]
@@ -288,7 +290,7 @@ def get_code_nodes(
             query += " AND file_path LIKE ?"
             params.append(f"%{file_path}%")
 
-        query += " ORDER BY file_path, line_start LIMIT ? OFFSET ?"
+        query += " ORDER BY file_path, line_start, id LIMIT ? OFFSET ?"
         params.append(limit)
         params.append(offset)
 
@@ -303,6 +305,8 @@ def get_code_edges(
     offset: int = 0
 ) -> List[Dict]:
     """查詢 Code Edges"""
+    if limit < 0 or offset < 0:
+        raise ValueError(f"limit/offset must be >= 0 (got limit={limit}, offset={offset})")
     with _get_conn() as conn:
         query = "SELECT * FROM code_edges WHERE project = ?"
         params = [project]
@@ -319,7 +323,7 @@ def get_code_edges(
             query += " AND kind = ?"
             params.append(kind)
 
-        query += " LIMIT ? OFFSET ?"
+        query += " ORDER BY id LIMIT ? OFFSET ?"
         params.append(limit)
         params.append(offset)
 
