@@ -19,19 +19,19 @@ recipe_unit_tests(project_name, project_path, target_path=None, max_tasks=20) ->
     為未測試的程式碼建立 unit test 任務樹。
     自動：sync Code Graph → 偵測覆蓋缺口 → 建立 Epic/Story/Task
 
-    Returns:
-        {
-            'epic_id': str,
-            'task_count': int,
-            'story_count': int,
-            'gaps_found': int,
-            'stories': [...],
-            'message': str,
-        }
+recipe_code_review(project_name, project_path, target_path=None, diff_base="HEAD", max_tasks=20) -> Dict
+    為待審查檔案建立 code review 任務樹。
+    目標來源：target_path（指定路徑）或 git diff（預設 HEAD）。
+    第一次/無 git/無 diff 且未給 target_path → task_count=0 + 明確訊息。
+
+recipe_integration_tests(project_name, project_path, target_path=None, max_tasks=20) -> Dict
+    為各模組建立整合測試任務樹（以目錄為模組分組）。
+
+所有 recipe 回傳含 'epic_id' 供 get_next_dispatch() 消費。
 
 run_recipe(name, **kwargs) -> Dict
     按名稱執行 recipe。
-    Available: 'unit_tests'
+    Available: 'unit_tests', 'code_review', 'integration_tests'
 """
 
 
@@ -336,6 +336,8 @@ def recipe_integration_tests(
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,
+    'code_review': recipe_code_review,
+    'integration_tests': recipe_integration_tests,
 }
 
 

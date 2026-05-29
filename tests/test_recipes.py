@@ -83,3 +83,17 @@ class TestRecipeIntegrationTests:
         # 任務描述須能被 playbook 分類為 integration_test（閉環驗證）
         pb = resolve_playbook("Write integration tests for module servers/auth")
         assert pb is not None and pb.name == "integration_test"
+
+
+class TestRecipeRegistry:
+    def test_all_three_registered(self):
+        from servers.recipes import RECIPES
+        assert set(RECIPES.keys()) >= {"unit_tests", "code_review", "integration_tests"}
+
+    def test_run_recipe_dispatches_code_review(self, mock_db_path, monkeypatch, tmp_path):
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.run_recipe("code_review", project_name="rr",
+                                    project_path=str(tmp_path), target_path="servers/")
+        assert "task_count" in result
