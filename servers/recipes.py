@@ -326,7 +326,7 @@ def recipe_integration_tests(
 
     return {
         'epic_id': epic_id, 'task_count': task_count,
-        'story_count': len(by_module), 'modules': sorted(by_module.keys()),
+        'story_count': task_count, 'modules': sorted(by_module.keys()),
         'message': (f"Created {task_count} integration test tasks across "
                     f"{len(by_module)} modules. "
                     f"Use get_next_dispatch('{epic_id}', ...) to start."),

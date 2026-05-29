@@ -62,6 +62,17 @@ class TestRecipeIntegrationTests:
         # auth 與 user 兩個模組 → 2 個 story
         assert result["story_count"] == 2
 
+    def test_story_count_respects_max_tasks(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "it3",
+                    ["a/x.py", "b/y.py", "c/z.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_integration_tests(
+            "it3", str(tmp_path), target_path=None, max_tasks=2)
+        assert result["task_count"] == 2
+        assert result["story_count"] == 2  # 與實際建立的 story 數一致
+
     def test_task_description_classifiable(self, mock_db_path, monkeypatch, tmp_path):
         _seed_files(mock_db_path, "it2", ["servers/auth/login.py"])
         from servers import recipes
