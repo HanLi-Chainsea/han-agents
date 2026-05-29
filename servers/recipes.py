@@ -7,9 +7,18 @@ HAN System - 場景 Recipe
 """
 
 import os
+import re
 import subprocess
 from typing import Dict, List, Optional
 from collections import defaultdict
+
+
+_TEST_FILE_RE = re.compile(r'(^|/)(tests?|__tests__)/|(^|/)test_[^/]+$|[^/]+_test\.[^/]+$|[^/]+\.(test|spec)\.[^/]+$')
+
+
+def is_test_file(path: str) -> bool:
+    """判斷是否為測試檔（路徑段 tests/test/__tests__，或 test_*/*_test/*.test.*/*.spec.* 命名）。"""
+    return bool(_TEST_FILE_RE.search(path or ''))
 
 
 SCHEMA = """
@@ -199,21 +208,25 @@ def _list_source_files(project_name: str, target_path: str = None) -> List[str]:
     result = []
     for n in files:
         fp = n.get('file_path') or ''
-        if 'test' in fp.lower():
+        if is_test_file(fp):
             continue
         if target_path:
             tp = target_path.rstrip('/')
-            if not (fp.startswith(tp + '/') or fp.startswith('./' + tp + '/')):
+            if not (fp == tp or fp == './' + tp
+                    or fp.startswith(tp + '/') or fp.startswith('./' + tp + '/')):
                 continue
         result.append(fp)
     return sorted(set(result))
 
 
 def _git_changed_files(project_path: str, diff_base: str) -> Optional[List[str]]:
-    """回傳 git diff 變更檔；非 git repo 或失敗回 None。"""
+    """回傳 git diff 變更檔（排除已刪除檔）；非 git repo、失敗或不合法 diff_base 回 None。"""
+    if not diff_base or diff_base.startswith("-"):
+        return None
     try:
         out = subprocess.run(
-            ["git", "-C", project_path, "diff", "--name-only", diff_base],
+            ["git", "-C", project_path, "diff", "--name-only",
+             "--no-ext-diff", "--no-textconv", "--diff-filter=d", diff_base, "--"],
             capture_output=True, text=True, timeout=10)
         if out.returncode != 0:
             return None
@@ -235,10 +248,17 @@ def recipe_code_review(
     - 有 target_path → 取該路徑下的原始碼檔（跳過測試檔）
     - 否則 → git diff --name-only <diff_base> 的變更檔
     - 第一次/無 git/無 diff 且未給 target_path → task_count=0 + 明確訊息
+
+    預設 diff_base="HEAD" 審「未提交的工作區變更」；若要審「分支 vs main」
+    已提交的變更，傳 diff_base="main"（或 merge-base range 由呼叫端先算好）。
     """
     from servers.tasks import create_task, create_subtask
 
     _ensure_synced(project_name, project_path)
+
+    if max_tasks <= 0:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': 'max_tasks 必須 > 0。'}
 
     if target_path:
         files = _list_source_files(project_name, target_path)
@@ -247,7 +267,7 @@ def recipe_code_review(
         if changed is None:
             return {'epic_id': None, 'task_count': 0, 'story_count': 0,
                     'message': '非 git repo 或無法取得 diff。請指定 target_path。'}
-        files = [f for f in changed if 'test' not in f.lower()]
+        files = [f for f in changed if not is_test_file(f)]
 
     if not files:
         return {'epic_id': None, 'task_count': 0, 'story_count': 0,
@@ -255,7 +275,7 @@ def recipe_code_review(
 
     epic_id = create_task(
         project=project_name,
-        description=f"Code Review: {len(files)} files",
+        description=f"Code Review: {min(len(files), max_tasks)} files",
         priority=7, task_level='epic')
 
     task_count = 0
@@ -292,6 +312,10 @@ def recipe_integration_tests(
     tech = _ensure_synced(project_name, project_path)
     test_tool = tech.get('test_tool', 'unknown')
 
+    if max_tasks <= 0:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': 'max_tasks 必須 > 0。'}
+
     files = _list_source_files(project_name, target_path)
     if not files:
         return {'epic_id': None, 'task_count': 0, 'story_count': 0,
@@ -305,7 +329,7 @@ def recipe_integration_tests(
 
     epic_id = create_task(
         project=project_name,
-        description=f"Integration Tests: {len(by_module)} modules",
+        description=f"Integration Tests: {min(len(by_module), max_tasks)} modules",
         priority=7, task_level='epic')
 
     task_count = 0

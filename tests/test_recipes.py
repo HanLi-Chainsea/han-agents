@@ -99,3 +99,47 @@ class TestRecipeRegistry:
         result = recipes.run_recipe("code_review", project_name="rr",
                                     project_path=str(tmp_path), target_path="servers/")
         assert "task_count" in result
+
+
+class TestRecipeHardening:
+    def test_is_test_file_precision(self):
+        from servers.recipes import is_test_file
+        assert is_test_file("tests/test_foo.py")
+        assert is_test_file("servers/test_bar.py")
+        assert is_test_file("a/foo_test.py")
+        assert is_test_file("a/foo.spec.ts")
+        # 不應誤判：
+        assert not is_test_file("servers/contest.py")
+        assert not is_test_file("servers/latest_report.py")
+        assert not is_test_file("servers/attestation.py")
+
+    def test_git_diff_base_rejects_option(self, monkeypatch, tmp_path):
+        from servers import recipes
+        # diff_base 以 '-' 開頭應被拒（回 None → recipe 回 0 並提示 target_path）
+        monkeypatch.setattr(recipes, "_ensure_synced", lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_code_review("h1", str(tmp_path), diff_base="--output=/tmp/x")
+        assert result["task_count"] == 0
+        assert "target_path" in result["message"]
+
+    def test_single_file_target(self, mock_db_path, monkeypatch, tmp_path):
+        # _seed_files defined at top of this test module
+        _seed_files(mock_db_path, "h2", ["servers/foo.py", "servers/bar.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced", lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_code_review("h2", str(tmp_path), target_path="servers/foo.py")
+        assert result["task_count"] == 1
+
+    def test_max_tasks_zero_no_epic(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "h3", ["servers/foo.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced", lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_code_review("h3", str(tmp_path), target_path="servers/", max_tasks=0)
+        assert result["epic_id"] is None
+        assert result["task_count"] == 0
+
+    def test_contest_file_not_excluded(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "h4", ["servers/contest.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced", lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_code_review("h4", str(tmp_path), target_path="servers/")
+        assert result["task_count"] == 1  # contest.py 不是測試檔
