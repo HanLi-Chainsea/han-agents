@@ -49,3 +49,31 @@ class TestFailOpen:
         monkeypatch.setattr(pbmod, "_CACHE", None)
         assert pbmod.load_playbooks(force_reload=True) == {}
         assert pbmod.resolve_playbook("write unit tests for x") is None
+
+
+class TestFormatSections:
+    def test_executor_section_format(self):
+        from servers.playbooks import load_playbooks, executor_section
+        ut = load_playbooks()["unit_test"]
+        text = executor_section(ut)
+        assert text.startswith("## Playbook: unit_test — Principles\n\n")
+        assert text.endswith("\n")
+
+    def test_critic_section_format(self):
+        from servers.playbooks import load_playbooks, critic_section
+        ut = load_playbooks()["unit_test"]
+        text = critic_section(ut)
+        assert text.startswith("## Playbook: unit_test — Checklist\n\n")
+
+    def test_empty_sections_return_empty_string(self):
+        from servers.playbooks import Playbook, executor_section, critic_section
+        pb = Playbook(name="empty")
+        assert executor_section(pb) == ""
+        assert critic_section(pb) == ""
+
+    def test_malformed_match_does_not_crash_resolve(self):
+        # fail-open: a playbook with bad match must not crash resolve_playbook
+        from servers.playbooks import _parse_playbook
+        pb = _parse_playbook('---\nname: bad\nmatch: [1, 2, 3]\n---\n## Executor Principles\nx\n')
+        assert pb is not None
+        assert pb.match == []

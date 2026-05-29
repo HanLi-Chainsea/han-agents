@@ -38,9 +38,9 @@ def _parse_playbook(text: str) -> Optional[Playbook]:
     格式：
         ---
         name: <str>
-        match: ["kw1", "kw2", ...]
+        match: ["kw1", "kw2", ...]   # 必須是 JSON array，且元素均為字串，寫在同一行
         ---
-        ## Executor Principles
+        ## Executor Principles        # heading 用單一空格（"## Executor Principles"）
         ...
         ## Critic Checklist
         ...
@@ -61,8 +61,12 @@ def _parse_playbook(text: str) -> Optional[Playbook]:
         elif line.startswith("match:"):
             raw = line[len("match:"):].strip()
             try:
-                match = json.loads(raw)
+                parsed = json.loads(raw)
             except Exception:
+                parsed = None
+            if isinstance(parsed, list) and all(isinstance(k, str) for k in parsed):
+                match = parsed
+            else:
                 match = []
     if not name:
         return None
