@@ -186,19 +186,19 @@ class TestCoverageGapsImprovements:
     def test_pagination_no_missed_coverage_over_500(self, mock_db_path):
         import sqlite3
         conn = sqlite3.connect(mock_db_path)
-        # 600 functions; every one is covered via a tested_by edge
+        # 600 functions ALL in同一檔、同一 line_start：唯一可區分的排序鍵是 id。
+        # 若分頁無穩定 tie-breaker，跨頁可能重複/跳過 → 某些被覆蓋節點被誤判為 gap。
         for i in range(600):
             conn.execute("""INSERT INTO code_nodes
                 (id, project, kind, name, file_path, line_start, line_end, language)
                 VALUES (?,?,?,?,?,?,?,?)""",
-                (f"func.f{i}.py:fn{i}", "pg", "function", f"fn{i}",
-                 f"f{i}.py", 1, 5, "python"))
+                (f"func.same.py:fn{i:04d}", "pg", "function", f"fn{i:04d}",
+                 "same.py", 1, 5, "python"))
             conn.execute("""INSERT INTO code_edges (project, from_id, to_id, kind)
                 VALUES ('pg', ?, ?, 'tested_by')""",
-                (f"func.f{i}.py:fn{i}", f"test.t{i}.py:test{i}"))
+                (f"func.same.py:fn{i:04d}", f"test.t.py:test{i:04d}"))
         conn.commit()
         conn.close()
         from servers.drift import detect_coverage_gaps
         gaps = detect_coverage_gaps("pg")
-        # 全部被 tested_by 覆蓋 → 不應有任何 gap（若分頁不穩定會漏判出現 gap）
-        assert gaps == [], f"expected no gaps, got {len(gaps)}"
+        assert gaps == [], f"expected no gaps (all covered), got {len(gaps)}"

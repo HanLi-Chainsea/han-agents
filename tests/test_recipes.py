@@ -113,13 +113,28 @@ class TestRecipeHardening:
         assert not is_test_file("servers/latest_report.py")
         assert not is_test_file("servers/attestation.py")
 
-    def test_git_diff_base_rejects_option(self, monkeypatch, tmp_path):
+    def test_git_diff_base_rejects_option(self, monkeypatch):
         from servers import recipes
-        # diff_base 以 '-' 開頭應被拒（回 None → recipe 回 0 並提示 target_path）
-        monkeypatch.setattr(recipes, "_ensure_synced", lambda p, path: {"test_tool": "pytest"})
-        result = recipes.recipe_code_review("h1", str(tmp_path), diff_base="--output=/tmp/x")
-        assert result["task_count"] == 0
-        assert "target_path" in result["message"]
+        # 直接測 helper：以 '-' 開頭的 diff_base 必須被拒，且「不得呼叫 subprocess」
+        called = {"ran": False}
+        def fake_run(*a, **k):
+            called["ran"] = True
+            raise AssertionError("subprocess should NOT run for an option-like diff_base")
+        monkeypatch.setattr(recipes.subprocess, "run", fake_run)
+        assert recipes._git_changed_files("/some/repo", "--output=/tmp/x") is None
+        assert recipes._git_changed_files("/some/repo", "-anything") is None
+        assert called["ran"] is False
+        # 對照組：正常 base 會實際呼叫 subprocess（用另一個 fake 確認有被呼叫）
+        ran2 = {"ran": False}
+        class R:
+            returncode = 0
+            stdout = "a.py\n"
+        def fake_run2(*a, **k):
+            ran2["ran"] = True
+            return R()
+        monkeypatch.setattr(recipes.subprocess, "run", fake_run2)
+        assert recipes._git_changed_files("/some/repo", "HEAD") == ["a.py"]
+        assert ran2["ran"] is True
 
     def test_single_file_target(self, mock_db_path, monkeypatch, tmp_path):
         # _seed_files defined at top of this test module
