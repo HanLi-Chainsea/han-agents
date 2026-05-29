@@ -46,3 +46,29 @@ class TestRecipeCodeReview:
                             lambda p, path: {"test_tool": "pytest"})
         result = recipes.recipe_code_review("cr3", str(tmp_path), target_path="servers/")
         assert result["task_count"] == 1  # 只 servers/，不含 servers_other/
+
+
+class TestRecipeIntegrationTests:
+    def test_groups_by_module(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "it",
+                    ["servers/auth/login.py", "servers/auth/token.py",
+                     "servers/user/profile.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_integration_tests(
+            "it", str(tmp_path), target_path="servers/")
+        assert result["epic_id"] is not None
+        # auth 與 user 兩個模組 → 2 個 story
+        assert result["story_count"] == 2
+
+    def test_task_description_classifiable(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "it2", ["servers/auth/login.py"])
+        from servers import recipes
+        from servers.playbooks import resolve_playbook
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        recipes.recipe_integration_tests("it2", str(tmp_path), target_path="servers/")
+        # 任務描述須能被 playbook 分類為 integration_test（閉環驗證）
+        pb = resolve_playbook("Write integration tests for module servers/auth")
+        assert pb is not None and pb.name == "integration_test"

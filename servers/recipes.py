@@ -280,6 +280,59 @@ def recipe_code_review(
     }
 
 
+def recipe_integration_tests(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    max_tasks: int = 20
+) -> Dict:
+    """為各模組建立整合測試任務樹（以模組/目錄為單位，非單一 function）。"""
+    from servers.tasks import create_task, create_subtask
+
+    tech = _ensure_synced(project_name, project_path)
+    test_tool = tech.get('test_tool', 'unknown')
+
+    files = _list_source_files(project_name, target_path)
+    if not files:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': '沒有可建立整合測試的檔案。請指定 target_path 或先 sync。'}
+
+    # 以「目錄」為模組分組（取檔案所在目錄）
+    by_module = defaultdict(list)
+    for fp in files:
+        module = os.path.dirname(fp) or fp
+        by_module[module].append(fp)
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Integration Tests: {len(by_module)} modules",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    for module in sorted(by_module.keys()):
+        if task_count >= max_tasks:
+            break
+        story_id = create_task(
+            project=project_name,
+            description=f"Integration tests for module {module}",
+            task_level='story', epic_id=epic_id, priority=7)
+        create_subtask(
+            parent_id=story_id,
+            description=(f"Write integration tests for module {module}. "
+                        f"涵蓋跨檔案協作與邊界。Test tool: {test_tool}"),
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 1
+
+    return {
+        'epic_id': epic_id, 'task_count': task_count,
+        'story_count': len(by_module), 'modules': sorted(by_module.keys()),
+        'message': (f"Created {task_count} integration test tasks across "
+                    f"{len(by_module)} modules. "
+                    f"Use get_next_dispatch('{epic_id}', ...) to start."),
+    }
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,
