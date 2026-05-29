@@ -72,6 +72,8 @@ class TestRecipeIntegrationTests:
             "it3", str(tmp_path), target_path=None, max_tasks=2)
         assert result["task_count"] == 2
         assert result["story_count"] == 2  # 與實際建立的 story 數一致
+        assert len(result["modules"]) == 2          # 只回報實際建立的模組
+        assert "across 2 modules" in result["message"]
 
     def test_task_description_classifiable(self, mock_db_path, monkeypatch, tmp_path):
         _seed_files(mock_db_path, "it2", ["servers/auth/login.py"])

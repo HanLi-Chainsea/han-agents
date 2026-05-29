@@ -309,6 +309,7 @@ def recipe_integration_tests(
         priority=7, task_level='epic')
 
     task_count = 0
+    built_modules = []
     for module in sorted(by_module.keys()):
         if task_count >= max_tasks:
             break
@@ -323,12 +324,13 @@ def recipe_integration_tests(
             assigned_agent='executor', requires_validation=True,
             task_level='task', epic_id=epic_id, story_id=story_id)
         task_count += 1
+        built_modules.append(module)
 
     return {
         'epic_id': epic_id, 'task_count': task_count,
-        'story_count': task_count, 'modules': sorted(by_module.keys()),
+        'story_count': task_count, 'modules': built_modules,
         'message': (f"Created {task_count} integration test tasks across "
-                    f"{len(by_module)} modules. "
+                    f"{len(built_modules)} modules. "
                     f"Use get_next_dispatch('{epic_id}', ...) to start."),
     }
 
