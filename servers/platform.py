@@ -21,9 +21,11 @@ PLATFORMS = {
         'name': 'Claude Code',
         'skills_dir': '~/.claude/skills',
         'agents_dir': '~/.claude/agents',
+        'commands_dir': '~/.claude/commands',
         'settings_path': '~/.claude/settings.json',
         'supports_agents': True,
         'supports_hooks': True,
+        'supports_commands': True,
     },
     'cursor': {
         'name': 'Cursor',
@@ -195,6 +197,60 @@ def setup_agents(platform_key=None, base_dir=None):
     return copied
 
 
+def get_commands_dir(platform_key=None, base_dir=None):
+    """取得平台的 slash-command 目錄（None 表示不支援）。"""
+    if platform_key is None:
+        platform_key, base_dir = detect_platform(base_dir)
+    config = PLATFORMS.get(platform_key)
+    if not config or not config.get('supports_commands'):
+        return None
+    commands_dir = config.get('commands_dir')
+    if not commands_dir:
+        return None
+    return os.path.normpath(os.path.expanduser(commands_dir))
+
+
+def setup_commands(platform_key=None, base_dir=None):
+    """安裝 HAN slash 指令到平台的 commands/han/ 目錄（冪等）。
+
+    來源 commands/han/*.md 內含 {{HAN_DIR}} 佔位符，安裝時替換為實際
+    han-agents 根目錄，讓指令在任何專案目錄下都能正確 import han。
+
+    Returns:
+        int: 安裝/更新的檔案數量，-1 表示平台不支援
+    """
+    if platform_key is None:
+        platform_key, base_dir = detect_platform(base_dir)
+    if base_dir is None:
+        base_dir = HAN_BASE_DIR
+
+    commands_dir = get_commands_dir(platform_key, base_dir)
+    if commands_dir is None:
+        return -1
+
+    source_dir = os.path.join(base_dir, 'commands', 'han')
+    if not os.path.exists(source_dir):
+        return 0
+
+    dest_dir = os.path.join(commands_dir, 'han')
+    os.makedirs(dest_dir, exist_ok=True)
+
+    written = 0
+    for f in globmod.glob(os.path.join(source_dir, '*.md')):
+        with open(f, 'r', encoding='utf-8') as src:
+            rendered = src.read().replace('{{HAN_DIR}}', base_dir)
+        dst = os.path.join(dest_dir, os.path.basename(f))
+        existing = None
+        if os.path.exists(dst):
+            with open(dst, 'r', encoding='utf-8') as d:
+                existing = d.read()
+        if existing != rendered:  # 只在缺檔或內容變更時寫入（冪等）
+            with open(dst, 'w', encoding='utf-8') as out:
+                out.write(rendered)
+            written += 1
+    return written
+
+
 def _is_han_hook(entry, script_name):
     for hook in entry.get('hooks', []):
         command = hook.get('command', '')
@@ -284,9 +340,13 @@ def auto_setup(base_dir=None):
     # 3. 註冊 hooks
     hooks_set = setup_hooks(platform_key, base_dir)
 
+    # 4. 安裝 slash 指令
+    commands_installed = setup_commands(platform_key, base_dir)
+
     return {
         'platform': platform_name,
         'platform_key': platform_key,
         'agents_copied': agents_copied,
         'hooks_set': hooks_set,
+        'commands_installed': commands_installed,
     }

@@ -87,10 +87,35 @@ class TestRecipeIntegrationTests:
         assert pb is not None and pb.name == "integration_test"
 
 
+class TestRecipeE2ETests:
+    def test_groups_by_module_and_classifiable(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "e2e",
+                    ["servers/auth/login.py", "servers/user/profile.py"])
+        from servers import recipes
+        from servers.playbooks import resolve_playbook
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_e2e_tests("e2e", str(tmp_path), target_path="servers/")
+        assert result["epic_id"] is not None
+        assert result["story_count"] == 2
+        # 任務描述須能被 e2e playbook 分類（閉環）
+        pb = resolve_playbook("Write end-to-end (E2E) tests for module servers/auth")
+        assert pb is not None and pb.name == "e2e_test"
+
+    def test_max_tasks_zero_no_epic(self, mock_db_path, monkeypatch, tmp_path):
+        _seed_files(mock_db_path, "e2e2", ["servers/auth/login.py"])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_e2e_tests("e2e2", str(tmp_path), target_path="servers/", max_tasks=0)
+        assert result["epic_id"] is None and result["task_count"] == 0
+
+
 class TestRecipeRegistry:
-    def test_all_three_registered(self):
+    def test_all_recipes_registered(self):
         from servers.recipes import RECIPES
-        assert set(RECIPES.keys()) >= {"unit_tests", "code_review", "integration_tests"}
+        assert set(RECIPES.keys()) >= {"unit_tests", "code_review",
+                                       "integration_tests", "e2e_tests"}
 
     def test_run_recipe_dispatches_code_review(self, mock_db_path, monkeypatch, tmp_path):
         from servers import recipes
