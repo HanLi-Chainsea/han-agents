@@ -235,10 +235,13 @@ def setup_commands(platform_key=None, base_dir=None):
     dest_dir = os.path.join(commands_dir, 'han')
     os.makedirs(dest_dir, exist_ok=True)
 
+    # 用 JSON 字面量替換，使路徑含空白/引號/反斜線時嵌入 Python 仍安全
+    han_dir_literal = json.dumps(os.path.abspath(base_dir))
+
     written = 0
     for f in globmod.glob(os.path.join(source_dir, '*.md')):
         with open(f, 'r', encoding='utf-8') as src:
-            rendered = src.read().replace('{{HAN_DIR}}', base_dir)
+            rendered = src.read().replace('{{HAN_DIR}}', han_dir_literal)
         dst = os.path.join(dest_dir, os.path.basename(f))
         existing = None
         if os.path.exists(dst):
@@ -320,10 +323,11 @@ def setup_hooks(platform_key=None, base_dir=None):
 
 
 def auto_setup(base_dir=None):
-    """一鍵自動設定：DB + agents + hooks（冪等，跨平台）
+    """一鍵自動設定：DB + agents + hooks + slash 指令（冪等，跨平台）
 
     Returns:
-        dict: {platform, agents_copied, hooks_set}
+        dict: {platform, platform_key, agents_copied, hooks_set, commands_installed}
+        commands_installed: 安裝/更新的 slash 指令數，-1 表平台不支援
     """
     if base_dir is None:
         base_dir = HAN_BASE_DIR

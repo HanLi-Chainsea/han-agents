@@ -110,6 +110,16 @@ class TestRecipeE2ETests:
         result = recipes.recipe_e2e_tests("e2e2", str(tmp_path), target_path="servers/", max_tasks=0)
         assert result["epic_id"] is None and result["task_count"] == 0
 
+    def test_default_cap_is_small(self, mock_db_path, monkeypatch, tmp_path):
+        # E2E「少而精」：預設上限刻意較小（5），即使有 7 個模組
+        _seed_files(mock_db_path, "e2e3",
+                    [f"servers/m{i}/x.py" for i in range(7)])
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        result = recipes.recipe_e2e_tests("e2e3", str(tmp_path), target_path="servers/")
+        assert result["task_count"] == 5
+
 
 class TestRecipeRegistry:
     def test_all_recipes_registered(self):

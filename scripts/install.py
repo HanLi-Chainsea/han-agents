@@ -109,6 +109,13 @@ def install():
     else:
         print(f"ℹ️  {platform_name} 不支援 Hooks，跳過 Hook 設定")
 
+    commands_installed = result.get('commands_installed', -1)
+    if commands_installed >= 0:
+        print(f"✅ 安裝 {commands_installed} 個 slash 指令到 ~/.claude/commands/han/"
+              f"（/han:unit-test、/han:integration-test、/han:e2e、/han:review）")
+    else:
+        print(f"ℹ️  {platform_name} 不支援 slash 指令，跳過")
+
     # 2. 完成
     print("\n" + "=" * 50)
     print("🎉 安裝完成！")

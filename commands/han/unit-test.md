@@ -8,37 +8,48 @@ description: 'HAN：為指定範圍自動建立並執行單元測試任務（rec
 
 ## 範圍解讀（`$ARGUMENTS`）
 - 是路徑（如 `servers/` 或 `servers/memory.py`）→ 當 `target_path`
-- 是模組名 / 自然語言範圍 → 先用它對應到路徑；對不到就用整個專案
+- 是模組名 / 自然語言範圍 → 先對應到路徑；對不到就用整個專案
 - 空白 → 整個專案
 
 ## 執行步驟
 
-1. 用 Bash 取得工作目錄與專案名：`PROJECT_PATH=$(pwd)`、`PROJECT=$(basename "$PROJECT_PATH")`。
+> 安全準則：**所有專案/路徑/範圍值一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全的字面量。
 
-2. 建立任務樹（Bash 執行 Python；`HAN_DIR` 已由安裝程序填入）：
+1. 設定環境變數（在同一個 Bash 呼叫裡）：
+```bash
+export HAN_PROJECT_PATH="$(pwd)"
+export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
+export HAN_TARGET="servers/"   # ← 換成解讀出的範圍路徑；整個專案則留空字串 ""
+```
+
+2. 建立任務樹（值全部讀環境變數）：
 ```bash
 python3 - <<'PY'
-import sys; sys.path.insert(0, "{{HAN_DIR}}")
+import os, sys
+sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import run_recipe
-r = run_recipe('unit_tests', project_name="<PROJECT>", project_path="<PROJECT_PATH>", target_path=<TARGET_OR_None>)
-print(r['message']); print("EPIC", r.get('epic_id'))
+r = run_recipe('unit_tests',
+               project_name=os.environ['HAN_PROJECT'],
+               project_path=os.environ['HAN_PROJECT_PATH'],
+               target_path=(os.environ.get('HAN_TARGET') or None))
+print(r['message']); print('EPIC', r.get('epic_id'))
 PY
 ```
-- 若 `task_count==0`／`epic_id` 為 None → 把訊息回報給使用者後**停止**（沒有缺口或沒指定範圍）。
+- 若 `task_count==0`／`EPIC` 為 None → 回報訊息後**停止**（沒有缺口或沒指定範圍）。
 
-3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）：
+3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。把 epic_id 放進 `HAN_EPIC` 再執行：
 ```bash
-python3 - <<'PY'
-import sys; sys.path.insert(0, "{{HAN_DIR}}")
+HAN_EPIC="<epic_id>" python3 - <<'PY'
+import os, sys, json
+sys.path.insert(0, {{HAN_DIR}})
 from servers.facade import get_next_dispatch
-import json
-inst = get_next_dispatch("<EPIC_ID>", "<PROJECT>", "<PROJECT_PATH>")
+inst = get_next_dispatch(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
 print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','progress','message')}, ensure_ascii=False))
-print("PROMPT_START"); print(inst.get('prompt','')); print("PROMPT_END")
+print('PROMPT_START'); print(inst.get('prompt','')); print('PROMPT_END')
 PY
 ```
-- 當 `action == 'dispatch'`：用 **Task 工具**派發，`subagent_type` 用回傳值、`prompt` 用 `PROMPT_START`…`PROMPT_END` 之間的內容。子代理完成後再次呼叫上面的 dispatch。
-- 當 `action == 'done'`：完成；`blocked`/`waiting`：把 `message` 回報並停止。
+- `action == 'dispatch'`：用 **Task 工具**派發，`subagent_type` 用回傳值、`prompt` 用 `PROMPT_START`…`PROMPT_END` 之間的內容。子代理完成後再次 dispatch。
+- `action == 'done'`：完成；`blocked`/`waiting`：回報 `message` 並停止。
 
 4. 收尾回報：建立了幾個任務、寫了哪些測試檔、執行 pass/fail 摘要。
 

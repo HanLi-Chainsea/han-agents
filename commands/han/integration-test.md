@@ -11,28 +11,39 @@ description: 'HAN：為指定範圍自動建立並執行整合測試任務（以
 
 ## 執行步驟
 
-1. Bash：`PROJECT_PATH=$(pwd)`、`PROJECT=$(basename "$PROJECT_PATH")`。
+> 安全準則：**所有專案/路徑/範圍值一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全的字面量。
+
+1. 設定環境變數：
+```bash
+export HAN_PROJECT_PATH="$(pwd)"
+export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
+export HAN_TARGET="servers/"   # ← 換成範圍路徑；整個專案則留空字串 ""
+```
 
 2. 建立任務樹：
 ```bash
 python3 - <<'PY'
-import sys; sys.path.insert(0, "{{HAN_DIR}}")
+import os, sys
+sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import run_recipe
-r = run_recipe('integration_tests', project_name="<PROJECT>", project_path="<PROJECT_PATH>", target_path=<TARGET_OR_None>)
-print(r['message']); print("EPIC", r.get('epic_id'))
+r = run_recipe('integration_tests',
+               project_name=os.environ['HAN_PROJECT'],
+               project_path=os.environ['HAN_PROJECT_PATH'],
+               target_path=(os.environ.get('HAN_TARGET') or None))
+print(r['message']); print('EPIC', r.get('epic_id'))
 PY
 ```
-- `task_count==0`／`epic_id` 為 None → 回報訊息後停止。
+- `task_count==0`／`EPIC` 為 None → 回報訊息後停止。
 
-3. 派工迴圈（重複至 `action != 'dispatch'`）：
+3. 派工迴圈（重複至 `action != 'dispatch'`），epic_id 放進 `HAN_EPIC`：
 ```bash
-python3 - <<'PY'
-import sys; sys.path.insert(0, "{{HAN_DIR}}")
+HAN_EPIC="<epic_id>" python3 - <<'PY'
+import os, sys, json
+sys.path.insert(0, {{HAN_DIR}})
 from servers.facade import get_next_dispatch
-import json
-inst = get_next_dispatch("<EPIC_ID>", "<PROJECT>", "<PROJECT_PATH>")
+inst = get_next_dispatch(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
 print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','progress','message')}, ensure_ascii=False))
-print("PROMPT_START"); print(inst.get('prompt','')); print("PROMPT_END")
+print('PROMPT_START'); print(inst.get('prompt','')); print('PROMPT_END')
 PY
 ```
 - `dispatch` → 用 **Task 工具** 以回傳的 `subagent_type` 與 prompt 派發；完成後再 dispatch。

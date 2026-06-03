@@ -47,3 +47,23 @@ class TestSetupCommands:
         from servers import platform as plat
         # cursor 沒有 supports_commands → -1
         assert plat.setup_commands(platform_key="cursor", base_dir="/x") == -1
+
+    def test_han_dir_rendered_as_safe_json_literal(self, tmp_path, monkeypatch):
+        """Critical: 安裝路徑含空白/引號時，{{HAN_DIR}} 必須以安全 JSON 字面量嵌入。"""
+        import json
+        from servers import platform as plat
+        cmds = tmp_path / "commands"
+        monkeypatch.setattr(plat, "get_commands_dir", lambda *a, **k: str(cmds))
+
+        tricky = str(tmp_path / 'we"ird dir')
+        os.makedirs(os.path.join(tricky, "commands", "han"), exist_ok=True)
+        with open(os.path.join(tricky, "commands", "han", "x.md"), "w", encoding="utf-8") as f:
+            f.write("sys.path.insert(0, {{HAN_DIR}})\n")
+
+        plat.setup_commands(platform_key="claude", base_dir=tricky)
+        content = (cmds / "han" / "x.md").read_text(encoding="utf-8")
+        assert "{{HAN_DIR}}" not in content
+        assert json.dumps(os.path.abspath(tricky)) in content
+        # 嵌入的字面量可被 Python 安全解析（不會因引號破壞語法）
+        line = next(l for l in content.splitlines() if "sys.path.insert" in l)
+        compile(line, "<rendered>", "exec")

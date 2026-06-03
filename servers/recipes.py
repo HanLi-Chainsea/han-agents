@@ -36,8 +36,8 @@ recipe_code_review(project_name, project_path, target_path=None, diff_base="HEAD
 recipe_integration_tests(project_name, project_path, target_path=None, max_tasks=20) -> Dict
     為各模組建立整合測試任務樹（以目錄為模組分組）。
 
-recipe_e2e_tests(project_name, project_path, target_path=None, max_tasks=20) -> Dict
-    為各模組建立 E2E 任務樹（聚焦關鍵使用者旅程）。
+recipe_e2e_tests(project_name, project_path, target_path=None, max_tasks=5) -> Dict
+    為各模組建立 E2E 任務樹（聚焦關鍵使用者旅程；上限刻意較小）。
 
 所有 recipe 回傳含 'epic_id' 供 get_next_dispatch() 消費。
 
@@ -366,12 +366,14 @@ def recipe_e2e_tests(
     project_name: str,
     project_path: str,
     target_path: str = None,
-    max_tasks: int = 20
+    max_tasks: int = 5
 ) -> Dict:
     """為各模組建立 E2E 任務樹（聚焦關鍵使用者旅程，非逐函式）。
 
-    與 integration 同以模組分組；任務描述框定為「end-to-end 使用者旅程」，
-    實際的「少而精、關鍵旅程」granularity 由 e2e playbook 注入 executor/critic 把關。
+    以模組分組，但**預設上限刻意較小（5）**以呼應 Test Pyramid「E2E 少而精」；
+    任務描述框定為「end-to-end 使用者旅程」，實際「只測關鍵旅程」的 granularity
+    由 e2e playbook 注入 executor/critic 把關。
+    注意：以模組為分組是粗略代理；無使用者旅程的後端/內部模組宜改用 integration。
     """
     from servers.tasks import create_task, create_subtask
 
