@@ -160,7 +160,7 @@ while True:
     # 其他平台: 直接在 context 中執行 inst['prompt']
 ```
 
-**Available Recipes**: `unit_tests`、`code_review`、`integration_tests`
+**Available Recipes**: `unit_tests`、`code_review`、`integration_tests`、`e2e_tests`
 
 ```python
 from servers.recipes import run_recipe
@@ -170,7 +170,22 @@ run_recipe('unit_tests', project_name='p', project_path='/path', target_path='se
 run_recipe('code_review', project_name='p', project_path='/path')  # 預設 git diff HEAD
 # 使用者：「幫 auth 模組寫整合測試」
 run_recipe('integration_tests', project_name='p', project_path='/path', target_path='servers/auth/')
+# 使用者：「幫結帳流程寫 E2E」
+run_recipe('e2e_tests', project_name='p', project_path='/path', target_path='servers/checkout/')
 ```
+
+### Slash 指令（直接觸發，免先叫 han）
+
+`commands/han/*.md` 提供斜線指令，由 `auto_setup()` 自動安裝到 `~/.claude/commands/han/`
+（安裝時把 `{{HAN_DIR}}` 替換為實際 han 路徑）。斜線指令是**確定觸發**，一定走
+dispatch → playbook 一定注入：
+
+| 指令 | 形狀 | 說明 |
+|------|------|------|
+| `/han:unit-test <範圍>` | recipe + dispatch | 找缺口、寫測試、跑過 |
+| `/han:integration-test <範圍>` | recipe + dispatch | 模組整合測試 |
+| `/han:e2e <範圍>` | recipe + dispatch | 關鍵旅程 E2E |
+| `/han:review <code 或 想法>` | **單次**（不派工、不寫檔） | 對著 Code Graph+SSOT+記憶批判，產出分級報告 |
 
 **get_next_dispatch() 自動處理**:
 - Executor → Critic validation loop（幂等，不會建重複 critic）

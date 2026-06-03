@@ -36,11 +36,14 @@ recipe_code_review(project_name, project_path, target_path=None, diff_base="HEAD
 recipe_integration_tests(project_name, project_path, target_path=None, max_tasks=20) -> Dict
     為各模組建立整合測試任務樹（以目錄為模組分組）。
 
+recipe_e2e_tests(project_name, project_path, target_path=None, max_tasks=5) -> Dict
+    為各模組建立 E2E 任務樹（聚焦關鍵使用者旅程；上限刻意較小）。
+
 所有 recipe 回傳含 'epic_id' 供 get_next_dispatch() 消費。
 
 run_recipe(name, **kwargs) -> Dict
     按名稱執行 recipe。
-    Available: 'unit_tests', 'code_review', 'integration_tests'
+    Available: 'unit_tests', 'code_review', 'integration_tests', 'e2e_tests'
 """
 
 
@@ -359,11 +362,76 @@ def recipe_integration_tests(
     }
 
 
+def recipe_e2e_tests(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    max_tasks: int = 5
+) -> Dict:
+    """為各模組建立 E2E 任務樹（聚焦關鍵使用者旅程，非逐函式）。
+
+    以模組分組，但**預設上限刻意較小（5）**以呼應 Test Pyramid「E2E 少而精」；
+    任務描述框定為「end-to-end 使用者旅程」，實際「只測關鍵旅程」的 granularity
+    由 e2e playbook 注入 executor/critic 把關。
+    注意：以模組為分組是粗略代理；無使用者旅程的後端/內部模組宜改用 integration。
+    """
+    from servers.tasks import create_task, create_subtask
+
+    tech = _ensure_synced(project_name, project_path)
+    test_tool = tech.get('test_tool', 'unknown')
+
+    if max_tasks <= 0:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': 'max_tasks 必須 > 0。'}
+
+    files = _list_source_files(project_name, target_path)
+    if not files:
+        return {'epic_id': None, 'task_count': 0, 'story_count': 0,
+                'message': '沒有可建立 E2E 測試的檔案。請指定 target_path 或先 sync。'}
+
+    by_module = defaultdict(list)
+    for fp in files:
+        module = os.path.dirname(fp) or fp
+        by_module[module].append(fp)
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"E2E Tests: {min(len(by_module), max_tasks)} modules",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    built_modules = []
+    for module in sorted(by_module.keys()):
+        if task_count >= max_tasks:
+            break
+        story_id = create_task(
+            project=project_name,
+            description=f"E2E tests for module {module}",
+            task_level='story', epic_id=epic_id, priority=7)
+        create_subtask(
+            parent_id=story_id,
+            description=(f"Write end-to-end (E2E) tests for the critical user "
+                        f"journeys through module {module}. Test tool: {test_tool}"),
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 1
+        built_modules.append(module)
+
+    return {
+        'epic_id': epic_id, 'task_count': task_count,
+        'story_count': task_count, 'modules': built_modules,
+        'message': (f"Created {task_count} E2E test tasks across "
+                    f"{len(built_modules)} modules. "
+                    f"Use get_next_dispatch('{epic_id}', ...) to start."),
+    }
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,
     'code_review': recipe_code_review,
     'integration_tests': recipe_integration_tests,
+    'e2e_tests': recipe_e2e_tests,
 }
 
 
