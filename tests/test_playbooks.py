@@ -6,11 +6,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class TestLoadPlaybooks:
-    def test_loads_three_playbooks(self):
+    def test_loads_playbooks(self):
         from servers.playbooks import load_playbooks
         pbs = load_playbooks()
         names = {pb.name for pb in pbs.values()}
-        assert {"unit_test", "code_review", "integration_test"}.issubset(names)
+        assert {"unit_test", "code_review", "integration_test", "e2e_test"}.issubset(names)
 
     def test_playbook_has_sections(self):
         from servers.playbooks import load_playbooks
@@ -33,6 +33,21 @@ class TestResolvePlaybook:
         assert pb is not None and pb.name == "code_review"
 
     def test_integration_test_match(self):
+        from servers.playbooks import resolve_playbook
+        pb = resolve_playbook("Write integration tests for auth module")
+        assert pb is not None and pb.name == "integration_test"
+
+    def test_e2e_test_match(self):
+        from servers.playbooks import resolve_playbook
+        pb = resolve_playbook("Write E2E tests for the checkout journey")
+        assert pb is not None and pb.name == "e2e_test"
+
+    def test_e2e_chinese_match(self):
+        from servers.playbooks import resolve_playbook
+        pb = resolve_playbook("幫登入到結帳做端對端測試")
+        assert pb is not None and pb.name == "e2e_test"
+
+    def test_integration_not_misclassified_as_e2e(self):
         from servers.playbooks import resolve_playbook
         pb = resolve_playbook("Write integration tests for auth module")
         assert pb is not None and pb.name == "integration_test"
