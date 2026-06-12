@@ -21,29 +21,13 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 export HAN_TARGET='servers/memory.py'   # ← 換成 $ARGUMENTS 解讀出的檔案或符號（單引號）
 ```
 
-2. 查目標節點的相依。`get_code_dependencies` 回傳每筆含 `id`/`kind`/`name`/`relation`/`direction`/`depth`。**分開呼叫 incoming 與 outgoing**（在 `direction='both'` 下，第二階的 `direction` 是相對當下節點、非相對目標，會混淆；分開呼叫才語義正確）：
+2. 產出影響半徑報告（查詢+格式化在 `servers.cli_views`，已單元測試鎖欄位契約；分扇入/扇出）：
 ```bash
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.code_graph import get_code_nodes, get_code_dependencies
-proj = os.environ['HAN_PROJECT']; tgt = os.environ['HAN_TARGET']
-# 先當路徑找；找不到再當符號名比對
-nodes = get_code_nodes(proj, file_path=tgt, limit=200)
-if not nodes:
-    nodes = [n for n in get_code_nodes(proj, limit=2000) if n.get('name') == tgt or tgt in n['id']]
-if not nodes:
-    print("（找不到目標節點，請先 /han:sync 或確認路徑/名稱）")
-for n in nodes:
-    incoming = get_code_dependencies(proj, n['id'], depth=2, direction='incoming') or []  # 誰依賴/呼叫我（扇入）
-    outgoing = get_code_dependencies(proj, n['id'], depth=2, direction='outgoing') or []  # 我依賴誰（扇出）
-    print(f"\n### {n['kind']} {n['id']}  影響半徑={len(incoming)+len(outgoing)}（扇入 {len(incoming)} / 扇出 {len(outgoing)}）")
-    print("  呼叫者/依賴我者（改動會波及）：")
-    for d in incoming[:20]:
-        print(f"    - {d.get('name') or d.get('id')} ({d.get('kind','?')}) via {d.get('relation','?')} [深度 {d.get('depth')}]")
-    print("  我依賴的：")
-    for d in outgoing[:20]:
-        print(f"    - {d.get('name') or d.get('id')} ({d.get('kind','?')}) via {d.get('relation','?')}")
+from servers.cli_views import impact_report
+print(impact_report(os.environ['HAN_PROJECT'], os.environ['HAN_TARGET']))
 PY
 ```
 

@@ -60,14 +60,23 @@ class TestSetupCommands:
         content = (han_dir / "unit-test.md").read_text(encoding="utf-8")
         assert "STALE" not in content and _BASE in content
 
-    def test_impact_command_uses_real_dep_fields(self):
-        """impact.md 必須用 get_code_dependencies 實際欄位，非錯誤的 edge_kind/to_id/node_kind。"""
-        content = open(os.path.join(_BASE, "commands", "han", "impact.md"), encoding="utf-8").read()
-        assert "relation" in content and "direction" in content
-        # 錯誤欄位名（曾用過）不得殘留；node 類型實際鍵是 'kind' 非 'node_kind'
-        assert "edge_kind" not in content
-        assert "to_id" not in content
-        assert "node_kind" not in content
+    def test_read_commands_delegate_to_cli_views(self):
+        """唯讀指令不得在 prose 裡硬寫 API 欄位，一律委派 servers.cli_views（欄位契約由 test_cli_views 鎖）。"""
+        expect = {
+            "impact.md": "impact_report", "recall.md": "recall_report",
+            "init.md": "init_report", "sync.md": "sync_report",
+            "status.md": "status_report", "drift.md": "drift_report",
+        }
+        for fname, fn in expect.items():
+            content = open(os.path.join(_BASE, "commands", "han", fname), encoding="utf-8").read()
+            assert "from servers.cli_views import" in content, f"{fname} 未委派 cli_views"
+            assert fn in content, f"{fname} 未呼叫 {fn}"
+            # 曾犯的硬寫欄位錯誤不得殘留
+            for bad in ("edge_kind", "to_id", "node_kind", "'framework'", ".get('stats')"):
+                assert bad not in content, f"{fname} 殘留硬寫欄位 {bad}"
+        # review.md 的 blast-radius 也走 cli_views
+        review = open(os.path.join(_BASE, "commands", "han", "review.md"), encoding="utf-8").read()
+        assert "blast_radius" in review and "recall_report" in review
 
     def test_get_code_dependencies_contract(self, sample_code_graph):
         """鎖定 get_code_dependencies 的完整 7 鍵 + 單向呼叫的方向語義。"""
@@ -94,16 +103,6 @@ class TestSetupCommands:
         assert "--resolvable=false" in content          # 不建立可阻擋合併的 discussion
         assert "/tmp/han-review.md" not in content       # 不可用固定共用暫存檔（競態/symlink）
         assert "-F " not in content                      # glab 無 -F 旗標
-
-    def test_init_command_uses_real_tech_stack_fields(self):
-        """init.md 必須讀 tech_stack 的 'frameworks'（複數陣列），非錯誤的 'framework'。"""
-        content = open(os.path.join(_BASE, "commands", "han", "init.md"), encoding="utf-8").read()
-        assert "'frameworks'" in content
-        assert "'framework'" not in content      # 單數錯誤鍵
-        assert "previously_initialized" in content  # already_initialized 是「執行前」狀態
-        # 鎖定 _detect_tech_stack 實作確實回傳 'frameworks' 鍵（避免 init.md 與實作漂移）
-        proj_src = open(os.path.join(_BASE, "servers", "project.py"), encoding="utf-8").read()
-        assert "'frameworks'" in proj_src
 
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat

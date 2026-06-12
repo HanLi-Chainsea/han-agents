@@ -17,18 +17,13 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 export HAN_QUERY='<取自 $ARGUMENTS 的主題/關鍵詞>'
 ```
 
-2. 查記憶：
+2. 查記憶（查詢+格式化在 `servers.cli_views`，已單元測試）：
 ```bash
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.memory import search_memory
-proj = os.environ['HAN_PROJECT']
-rows = search_memory(os.environ['HAN_QUERY'], project=proj, limit=10) or []
-if not rows:
-    print("（無相關記憶）")
-for m in rows:
-    print(f"- [{m.get('category')}] {m.get('title')}\n    {(m.get('content') or '')[:200]}")
+from servers.cli_views import recall_report
+print(recall_report(os.environ['HAN_PROJECT'], os.environ['HAN_QUERY']))
 PY
 ```
 
