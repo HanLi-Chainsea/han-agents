@@ -185,7 +185,7 @@ dispatch → playbook 一定注入：
 | `/han:unit-test <範圍>` | recipe + dispatch | 找缺口、寫測試、跑過 |
 | `/han:integration-test <範圍>` | recipe + dispatch | 模組整合測試 |
 | `/han:e2e <範圍>` | recipe + dispatch | 關鍵旅程 E2E |
-| `/han:review <code 或 想法>` | 單次（不改原始碼） | 帶脈絡批判，報告寫入 `.han/reviews/`，可選貼 PR/MR |
+| `/han:review <code 或 想法>` | 單次（不改原始碼） | 帶脈絡批判；有 PR/MR 預設貼 comment，否則顯示，`--out` 才寫檔 |
 | `/han:drift` | 單次讀 | SSOT(意圖) vs Code(現實) 偏差報告 |
 | `/han:impact <檔案/符號>` | 單次讀 | 改動影響半徑（誰呼叫、依賴誰） |
 | `/han:recall <主題>` | 單次讀 | 撈過往決策/教訓（長期記憶） |

@@ -71,27 +71,27 @@ PY
 
 ---
 
-## 輸出（寫檔 / 留言）
+## 輸出（落地位置）
 
-產出報告後，**除了在對話顯示，一律把報告寫成檔案留存**；若使用者要求貼到 PR/MR，再額外張貼。
+一份 review 屬於它所審的「變更」，所以**有 PR/MR 時，它的家就是那個 PR/MR**（好找、有組織、跟變更綁在一起）；沒有才退回對話/指定檔。**絕不倒進隱藏目錄或時間戳檔堆。**
 
-1. **預設：寫 Markdown 檔（安全、永遠可行）**
-```bash
-mkdir -p .han/reviews
-OUT=".han/reviews/review-$(git branch --show-current 2>/dev/null | tr '/' '-')-$(git rev-parse --short HEAD 2>/dev/null).md"
-# 把完整報告寫進 "$OUT"（用你產出的 markdown 內容）
-printf '%s\n' "<完整 markdown 報告>" > "$OUT"
-echo "報告已寫入：$OUT"
-```
-- 若 `$ARGUMENTS` 指定了輸出路徑（如 `--out docs/review.md`），改寫到該路徑。
+依序判斷：
 
-2. **可選：貼到 GitHub / GitLab（僅在使用者明確要求時）**
-   - 這是**對外發佈**動作（會公開、可能被索引）。**只有使用者要求（如帶 `--pr` / `--mr` 或明說「貼到 PR」）才執行**，並先確認目標 PR/MR。
-   - GitHub PR：`gh pr comment <number> --body-file "$OUT"`（或當前分支的 PR 省略 number）
-   - GitLab MR：`glab mr note <id> --message "$(cat "$OUT")"`（或用 API）
-   - 工具不可用 / 非 PR 情境 → 退回只寫 Markdown 檔並告知。
+1. **偵測當前分支是否有開啟的 PR/MR**：
+   - GitHub：`gh pr view --json number,url -q .url`（成功即有 PR）
+   - GitLab：`glab mr view`（成功即有 MR）
+
+2. **有 PR/MR → 預設貼成 comment**（這是對外發佈：先回報「將貼到 <url>」，使用者帶 `--no-post` 則略過只顯示）：
+   - 先把完整 markdown 報告寫到暫存檔，例如 `T=$(mktemp); printf '%s\n' "<報告>" > "$T"`
+   - GitHub：`gh pr comment --body-file "$T"`（當前分支的 PR）
+   - GitLab：`glab mr note "$(cat "$T")"`（或 API）
+   - 貼完回報 comment 連結。
+
+3. **沒有 PR/MR → 預設只在對話顯示完整報告**。要存檔再用 `--out <path>`（可見、git 可追蹤的路徑，如 `docs/review-<branch>.md`），不要自動建檔。
+
+4. **使用者明確 `--out <path>` → 一律寫該路徑**（並仍在對話顯示）。
 
 ## 重要
 - **一定要產出實際的 review 報告**（不是「我會去審」）；單次完成、不繞 dispatch。
 - CODE 模式至少要納入一項由 `get_code_dependencies` 查到的影響半徑觀察，IDEA 模式至少要撈一次記憶/SSOT——否則就退化成通用 review，失去 HAN 的脈絡價值。
-- **不修改原始碼**；只寫「報告檔」（`.han/reviews/` 或指定路徑），PR/MR 留言僅在明確要求時張貼。
+- **不修改原始碼**。落地位置：PR/MR 留言（有則優先）或對話；`--out` 才寫檔。不製造隱藏檔堆。
