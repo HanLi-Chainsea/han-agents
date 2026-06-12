@@ -185,7 +185,13 @@ dispatch → playbook 一定注入：
 | `/han:unit-test <範圍>` | recipe + dispatch | 找缺口、寫測試、跑過 |
 | `/han:integration-test <範圍>` | recipe + dispatch | 模組整合測試 |
 | `/han:e2e <範圍>` | recipe + dispatch | 關鍵旅程 E2E |
-| `/han:review <code 或 想法>` | **單次**（不派工、不寫檔） | 對著 Code Graph+SSOT+記憶批判，產出分級報告 |
+| `/han:review <code 或 想法>` | 單次（不改原始碼） | 帶脈絡批判；預設只顯示，`--out` 寫檔、`--post` 才貼 PR/MR（opt-in） |
+| `/han:drift` | 單次讀 | SSOT(意圖) vs Code(現實) 偏差報告 |
+| `/han:impact <檔案/符號>` | 單次讀 | 改動影響半徑（誰呼叫、依賴誰） |
+| `/han:recall <主題>` | 單次讀 | 撈過往決策/教訓（長期記憶） |
+| `/han:status` | 單次讀 | 專案狀態速覽（Code Graph 節點/邊/檔 + Skill 健康度） |
+| `/han:sync` | 維護 | 增量同步 Code Graph（不改原始碼） |
+| `/han:help` | 單次讀 | 列出所有 /han 指令與用途（動態） |
 
 **get_next_dispatch() 自動處理**:
 - Executor → Critic validation loop（幂等，不會建重複 critic）
