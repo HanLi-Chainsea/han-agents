@@ -30,13 +30,8 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 HAN_FILE='servers/foo.py' python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.code_graph import get_code_nodes, get_code_dependencies
-proj = os.environ['HAN_PROJECT']; fp = os.environ['HAN_FILE']
-nodes = get_code_nodes(proj, file_path=fp, limit=50)
-for n in nodes:
-    deps = get_code_dependencies(proj, n['id'], depth=1, direction='both') or []
-    names = [d.get('name') or d.get('id') for d in deps][:10]
-    print(f"{n['kind']} {n['id']} -> 影響/相依({len(deps)}): {names}")
+from servers.cli_views import blast_radius
+print(blast_radius(os.environ['HAN_PROJECT'], os.environ['HAN_FILE']))
 PY
 ```
    （對每個變更檔重複；這份相依清單就是要納入 review 的「blast radius」。）
@@ -56,13 +51,11 @@ PY
 HAN_QUERY='<取自想法的關鍵詞>' python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.memory import search_memory
-proj = os.environ['HAN_PROJECT']
-for m in (search_memory(os.environ['HAN_QUERY'], project=proj, limit=8) or []):
-    print("MEM:", m.get('title'), "->", (m.get('content') or '')[:160])
+from servers.cli_views import recall_report
+print(recall_report(os.environ['HAN_PROJECT'], os.environ['HAN_QUERY']))
 PY
 ```
-   （如有 SSOT flows/domains，亦可用 `servers.facade.get_full_context` 取相關 flow 比對。）
+   （如專案有定義 SSOT flows/domains，可一併比對想法會動到哪些 flow。）
 2. **對著專案現實批判**這個想法：
    - 與**現有架構**衝突嗎？會動到哪些 flow / 模組？
    - 是否**違反記憶裡的某個過往決策**（撈到就點名）？

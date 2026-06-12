@@ -16,14 +16,8 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.project import ensure_project
-r = ensure_project(os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
-ts = r.get('tech_stack') or {}
-sr = r.get('sync_result') or {}
-stats = (sr.get('stats') or sr)
-print("previously_initialized:", r.get('already_initialized'))  # 本次執行「前」是否已初始化
-print("tech_stack:", {k: ts.get(k) for k in ('primary_language','frameworks','test_tool')})
-print("code_graph:", stats)
+from servers.cli_views import init_report
+print(init_report(os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH']))
 PY
 ```
 

@@ -23,8 +23,8 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.drift import get_drift_summary
-print(get_drift_summary(os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH']))
+from servers.cli_views import drift_report
+print(drift_report(os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH']))
 PY
 ```
 

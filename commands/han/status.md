@@ -15,8 +15,8 @@ export HAN_PROJECT_PATH="$(pwd)"
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.facade import quick_status
-print(quick_status(os.environ['HAN_PROJECT_PATH']))
+from servers.cli_views import status_report
+print(status_report(os.environ['HAN_PROJECT_PATH']))
 PY
 ```
 

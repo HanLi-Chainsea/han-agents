@@ -18,10 +18,8 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
-from servers.facade import sync
-r = sync(os.environ['HAN_PROJECT_PATH'], os.environ['HAN_PROJECT'], incremental=True)
-stats = (r.get('stats') or r)
-print("synced:", stats)
+from servers.cli_views import sync_report
+print(sync_report(os.environ['HAN_PROJECT_PATH'], os.environ['HAN_PROJECT']))
 PY
 ```
 
