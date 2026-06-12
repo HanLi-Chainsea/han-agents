@@ -18,7 +18,7 @@ export HAN_PROJECT_PATH="$(pwd)"
 export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 ```
 
-2. 取得 drift 報告（必要時先 sync 確保 Code Graph 最新）：
+2. 取得 drift 報告（必要時先 `/han:sync` 把變更檔更新進圖譜；註：sync 不會移除已刪檔的舊節點）：
 ```bash
 python3 - <<'PY'
 import os, sys

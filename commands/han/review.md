@@ -77,14 +77,17 @@ PY
 
 > ⚠️ 寫檔/貼留言時，**一律用 Write 工具把完整 markdown 報告寫到檔案**（不要用 `printf`/`echo`/`"$(...)"` 把報告內容塞進 shell——報告可能含 `"`、`$()`、backtick，會造成 shell 注入）。再用「以檔案為輸入」的旗標帶入。
 
+> 寫檔一律用 **Write 工具搭配「字面路徑」**（不要用 shell 變數如 `$F`——它不跨 Bash 呼叫保留，Write 也只吃字面路徑）。
+
 1. **`--out <path>`** → 用 Write 工具把報告寫到該可見路徑（如 `docs/review-<branch>.md`），並在對話顯示。
 
-2. **`--post`（明確要求才發佈；這是對外公開動作）**：報告會公開在 PR/MR，**必須使用者明確帶 `--post` 或明說「貼到 PR/MR」才執行**，先確認目標：
-   - 偵測：GitHub `gh pr view --json url -q .url`；GitLab `glab mr view`
-   - 先取一個不會覆蓋既有檔的暫存路徑：`F=$(mktemp --suffix=.md)`，用 Write 工具把報告寫到 `$F`，再：
-     - GitHub：`gh pr comment --body-file "$F"`
-     - GitLab：`glab mr note -F "$F"`（以檔案為輸入，避免命令列長度/注入）
-   - 貼完回報 comment 連結；用畢 `rm -f "$F"` 清掉。
+2. **`--post`（明確要求才發佈；這是對外公開動作）**：報告會公開在 PR/MR，**必須使用者明確帶 `--post` 或明說「貼到 PR/MR」才執行**：
+   - 偵測目標：GitHub `gh pr view --json url -q .url`；GitLab `glab mr view`
+   - 用 Write 工具把完整報告寫到**字面暫存路徑** `/tmp/han-review.md`（覆蓋舊的暫存報告無妨）
+   - 發佈（讀該檔，不把報告內容塞進命令列）：
+     - GitHub：`gh pr comment --body-file /tmp/han-review.md`
+     - GitLab（當前分支的 MR，從 stdin 讀）：`glab mr note create < /tmp/han-review.md`
+   - 貼完回報 comment 連結，並 `rm -f /tmp/han-review.md`。
 
 3. **沒給旗標 → 只在對話顯示**，不自動建檔、不自動發佈。
 

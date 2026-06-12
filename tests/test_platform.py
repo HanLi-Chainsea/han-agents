@@ -70,14 +70,22 @@ class TestSetupCommands:
         assert "node_kind" not in content
 
     def test_get_code_dependencies_contract(self, sample_code_graph):
-        """鎖定 get_code_dependencies 的回傳鍵，避免指令本文與 API 漂移。"""
+        """鎖定 get_code_dependencies 的完整 7 鍵 + 單向呼叫的方向語義。"""
         from servers.code_graph import get_code_dependencies
-        deps = get_code_dependencies(
-            "test", "func.src/auth/login.py:authenticate", depth=1, direction="outgoing")
-        assert deps, "expected at least one outgoing dependency from sample graph"
-        for d in deps:
-            assert {"id", "kind", "relation", "direction"}.issubset(d.keys())
-            assert d["direction"] == "outgoing"  # 單向呼叫 → direction 相對目標正確
+        keys = {"id", "kind", "name", "file_path", "relation", "direction", "depth"}
+        # outgoing：authenticate 呼叫 validate_token
+        out = get_code_dependencies(
+            "test", "func.src/auth/login.py:authenticate", depth=2, direction="outgoing")
+        assert out, "expected outgoing deps from sample graph"
+        for d in out:
+            assert keys.issubset(d.keys()), f"missing keys: {keys - set(d.keys())}"
+            assert d["direction"] == "outgoing"
+        # incoming：validate_token 被 authenticate 呼叫
+        inc = get_code_dependencies(
+            "test", "func.src/auth/login.py:validate_token", depth=2, direction="incoming")
+        assert inc, "expected incoming deps from sample graph"
+        for d in inc:
+            assert d["direction"] == "incoming"
 
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat
