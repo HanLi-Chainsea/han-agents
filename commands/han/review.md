@@ -83,11 +83,10 @@ PY
 
 2. **`--post`（明確要求才發佈；這是對外公開動作）**：報告會公開在 PR/MR，**必須使用者明確帶 `--post` 或明說「貼到 PR/MR」才執行**：
    - 偵測目標：GitHub `gh pr view --json url -q .url`；GitLab `glab mr view`
-   - 用 Write 工具把完整報告寫到**字面暫存路徑** `/tmp/han-review.md`（覆蓋舊的暫存報告無妨）
-   - 發佈（讀該檔，不把報告內容塞進命令列）：
-     - GitHub：`gh pr comment --body-file /tmp/han-review.md`
-     - GitLab（當前分支的 MR，從 stdin 讀）：`glab mr note create < /tmp/han-review.md`
-   - 貼完回報 comment 連結，並 `rm -f /tmp/han-review.md`。
+   - 選一個**唯一**字面暫存路徑（避免競態/覆寫，例如 `/tmp/han-review-<你產生的隨機字串>.md`），用 Write 工具把完整報告寫到該路徑，且**後續發佈指令用同一個字面路徑**：
+     - GitHub：`gh pr comment --body-file /tmp/han-review-XXXX.md`
+     - GitLab（當前分支的 MR，從 stdin 讀；`--resolvable=false` 避免建立可阻擋合併的 discussion）：`glab mr note create --resolvable=false < /tmp/han-review-XXXX.md`
+   - 貼完回報 comment 連結，並 `rm -f` 該暫存檔。
 
 3. **沒給旗標 → 只在對話顯示**，不自動建檔、不自動發佈。
 

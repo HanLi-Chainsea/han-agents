@@ -87,6 +87,14 @@ class TestSetupCommands:
         for d in inc:
             assert d["direction"] == "incoming"
 
+    def test_review_post_flow_contract(self):
+        """review.md 的 GitLab 發佈須用 --resolvable=false，且不可寫死共用暫存路徑。"""
+        content = open(os.path.join(_BASE, "commands", "han", "review.md"), encoding="utf-8").read()
+        assert "glab mr note create" in content
+        assert "--resolvable=false" in content          # 不建立可阻擋合併的 discussion
+        assert "/tmp/han-review.md" not in content       # 不可用固定共用暫存檔（競態/symlink）
+        assert "-F " not in content                      # glab 無 -F 旗標
+
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat
         # cursor 沒有 supports_commands → -1
