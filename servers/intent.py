@@ -83,6 +83,16 @@ def load_manifest(project_dir: str) -> Optional[Dict]:
         if not isinstance(d, dict) or not isinstance(d.get('path'), str) or not d['path'].strip():
             raise ManifestError(
                 f'intent-manifest.json docs[{i}] 形狀錯誤（需 dict 且 path 為非空字串）')
+        # enum 驗證（codex round-5）：typo（如 "acitve"/"normativ"）若被靜默接受，
+        # 會無聲停用文件或降級 drift 車道 → false-clean
+        st = d.get('status', 'active')
+        if st not in ('active', 'archived'):
+            raise ManifestError(
+                f"docs[{i}].status 須為 active|archived（got: {st!r}）")
+        auth = d.get('authority', 'normative')
+        if auth not in ('normative', 'draft', 'non-normative'):
+            raise ManifestError(
+                f"docs[{i}].authority 須為 normative|draft|non-normative（got: {auth!r}）")
     return data
 
 

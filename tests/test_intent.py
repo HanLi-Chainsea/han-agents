@@ -634,3 +634,41 @@ class TestRound4Locks:
         r = link_claims([claim], 'pb', str(tmp_path))[0]
         assert r['matched'] is True
         assert r['prefix_matches'] == ['/api/foo/baz']   # foobar 不得入列
+
+
+class TestRound5Locks:
+    def test_status_typo_raises(self, tmp_path):
+        """status typo（acitve）不得靜默停用文件（false-clean 向量）。"""
+        import pytest
+        from servers.intent import load_manifest, ManifestError
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/a.md', 'status': 'acitve'}]}), encoding='utf-8')
+        with pytest.raises(ManifestError):
+            load_manifest(str(tmp_path))
+
+    def test_authority_typo_raises(self, tmp_path):
+        """authority typo 不得靜默把 drift 降級成 needs_review。"""
+        import pytest
+        from servers.intent import load_manifest, ManifestError
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/a.md', 'authority': 'normativ'}]}), encoding='utf-8')
+        with pytest.raises(ManifestError):
+            load_manifest(str(tmp_path))
+
+    def test_status_typo_warns_via_cli(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.cli_views as cv
+        from servers import drift as legacy
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/a.md', 'status': 'acitve'}]}), encoding='utf-8')
+        monkeypatch.setattr(legacy, 'get_drift_summary',
+                            lambda p, d=None: 'LEGACY_SENTINEL')
+        out = cv.drift_report('rp', str(tmp_path))
+        assert 'LEGACY_SENTINEL' in out and '⚠️' in out
+
+    def test_valid_enums_still_load(self, tmp_path):
+        from servers.intent import load_manifest
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'a.md', 'status': 'archived', 'authority': 'draft'},
+                     {'path': 'b.md'}]}), encoding='utf-8')
+        m = load_manifest(str(tmp_path))
+        assert len(m['docs']) == 2
