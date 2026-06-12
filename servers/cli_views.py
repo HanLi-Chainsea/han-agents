@@ -88,7 +88,10 @@ def impact_report(project: str, target: str) -> str:
     from servers.code_graph import get_code_dependencies
     nodes, truncated = _resolve_nodes(project, target)
     if not nodes:
-        return "（找不到目標節點，請先 /han:sync 或確認路徑/名稱）"
+        msg = "（找不到目標節點，請先 /han:sync 或確認路徑/名稱）"
+        if truncated:
+            msg += f"\n（注意：節點查詢達上限 {_NODE_LIMIT}，目標可能在未掃描範圍內）"
+        return msg
     out = []
     if truncated:
         out.append(f"（注意：節點查詢達上限 {_NODE_LIMIT}，目標解析可能不完整）")

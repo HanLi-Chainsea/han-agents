@@ -57,6 +57,21 @@ class TestImpactReport:
         from servers.cli_views import impact_report
         assert "找不到目標節點" in impact_report("test", "no_such_symbol_xyz")
 
+    def test_truncated_and_not_found_warns(self, monkeypatch):
+        """全庫掃描達上限且找不到目標時，必須附截斷警告（不可被提前 return 吃掉）。"""
+        import servers.cli_views as cv
+        from servers import code_graph
+
+        def fake_nodes(project, kind=None, file_path=None, limit=100, offset=0):
+            if file_path:
+                return []  # 路徑查無
+            return [{"id": f"n{i}", "kind": "function", "name": f"n{i}", "file_path": "x"}
+                    for i in range(cv._NODE_LIMIT)]  # 掃描達上限、無一匹配
+        monkeypatch.setattr(code_graph, "get_code_nodes", fake_nodes)
+        out = cv.impact_report("p", "zzz_target")
+        assert "找不到目標節點" in out
+        assert "未掃描範圍" in out  # 截斷警告
+
 
 class TestBlastRadius:
     def test_returns_summary(self, sample_code_graph):

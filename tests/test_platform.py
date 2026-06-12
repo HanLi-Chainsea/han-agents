@@ -74,9 +74,10 @@ class TestSetupCommands:
             # 曾犯的硬寫欄位錯誤不得殘留
             for bad in ("edge_kind", "to_id", "node_kind", "'framework'", ".get('stats')"):
                 assert bad not in content, f"{fname} 殘留硬寫欄位 {bad}"
-        # review.md 的 blast-radius 也走 cli_views
+        # review.md 的 blast-radius / 記憶查詢也走 cli_views，且不得直接點名底層 API
         review = open(os.path.join(_BASE, "commands", "han", "review.md"), encoding="utf-8").read()
         assert "blast_radius" in review and "recall_report" in review
+        assert "get_full_context" not in review  # 不得回退直接呼叫底層 API
 
     def test_get_code_dependencies_contract(self, sample_code_graph):
         """鎖定 get_code_dependencies 的完整 7 鍵 + 單向呼叫的方向語義。"""
