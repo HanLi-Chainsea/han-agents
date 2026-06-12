@@ -34,18 +34,21 @@ def status_report(project_path: str = None) -> str:
 
 
 def drift_report(project: str, project_dir: str = None) -> str:
-    """有 intent-manifest.json → doc-grounded intent 引擎；否則（或引擎異常）
-    fail-open 回 legacy SSOT drift。"""
+    """有 intent-manifest.json → doc-grounded intent 引擎；否則 legacy SSOT drift。
+    引擎異常時 fail-open 回 legacy，但**必須**在輸出前置警告——靜默 fallback 會把
+    引擎 bug 偽裝成『In sync』（codex Major）。"""
+    warning = ''
     if project_dir:
         try:
             from servers.intent import intent_drift_report
             rep = intent_drift_report(project, project_dir)
             if rep is not None:
                 return rep
-        except Exception:
-            pass  # fail-open：intent 引擎任何異常都不得擋 drift 查詢
+        except Exception as e:
+            warning = (f"⚠️ intent 引擎異常（已退回 legacy SSOT 檢查，"
+                       f"本報告**未**涵蓋 intent-manifest 文件）：{type(e).__name__}: {e}\n\n")
     from servers.drift import get_drift_summary
-    return get_drift_summary(project, project_dir)
+    return warning + get_drift_summary(project, project_dir)
 
 
 def sync_report(project_path: str, project: str) -> str:

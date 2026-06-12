@@ -73,7 +73,7 @@ class TestExtractClaims:
 
     def test_scoped_method_current(self, tmp_path):
         c = self._by_symbol(self._claims(tmp_path), 'payOrder')
-        assert c['anchor'] == 'method'
+        assert c['anchor'] == 'member'
         assert c['scope'] == 'OrderServiceImpl'
         assert c['status'] == 'current'          # 行首「既有」
         assert c['line'] == 4
@@ -146,8 +146,8 @@ SEED = [
      'create', 'b/Other.java', 30),
     ('class.c/TicketStrategy.java:TicketStrategy', 'class',
      'TicketStrategy', 'c/TicketStrategy.java', 5),
-    ('class.t/src/test/java/Helper.java:Helper', 'class',
-     'Helper', 't/src/test/java/Helper.java', 1),   # test path → 必須排除
+    ('class.src/test/java/Helper.java:Helper', 'class',
+     'Helper', 'src/test/java/Helper.java', 1),   # 真實 test path（無前置目錄）→ 必須排除
 ]
 
 
@@ -169,7 +169,7 @@ class TestLinkClaims:
 
     def test_scoped_method_exact(self, mock_db_path, tmp_path):
         _seed_code_nodes(mock_db_path, 'ip', SEED)
-        r = self._link([self._claim('method', 'create', 'GoodsOrderService')],
+        r = self._link([self._claim('member', 'create', 'GoodsOrderService')],
                        tmp_path)[0]
         assert r['matched'] is True and r['tier'] == 'method_scoped'
         assert r['locations'][0]['file'] == 'a/GoodsOrderService.java'
@@ -177,7 +177,7 @@ class TestLinkClaims:
     def test_scope_collision_not_matched(self, mock_db_path, tmp_path):
         """codex 抓包案的結構性防護：同名方法存在於他 scope，不得命中。"""
         _seed_code_nodes(mock_db_path, 'ip', SEED)
-        r = self._link([self._claim('method', 'create', 'OrderServiceImpl')],
+        r = self._link([self._claim('member', 'create', 'OrderServiceImpl')],
                        tmp_path)[0]
         assert r['matched'] is False
         assert 'GoodsOrderService' in r['same_name_other_scopes']
@@ -276,7 +276,7 @@ class TestIntentDriftReport:
         rep = intent_drift_report('rp', str(tmp_path))
         assert rep is not None
         # drift：current+missing（MissingThing）；且只有它
-        assert 'Drift（文件斷言存在、code 找不到）: 1' in rep
+        assert 'Drift（normative 文件斷言存在、code 找不到）: 1' in rep
         assert 'MissingThing' in rep
         # doc_stale：proposed 但 scoped method 已存在 → 非 drift
         assert 'Doc-stale' in rep and 'GoodsOrderService.create' in rep
@@ -298,14 +298,14 @@ class TestIntentDriftReport:
         from servers.intent import intent_drift_report
         _setup_report_project(tmp_path, mock_db_path)
         base = intent_drift_report('rp', str(tmp_path))
-        assert 'Drift（文件斷言存在、code 找不到）: 1' in base  # 基線只有 MissingThing
+        assert 'Drift（normative 文件斷言存在、code 找不到）: 1' in base  # 基線只有 MissingThing
         conn = sqlite3.connect(mock_db_path)
         conn.execute("UPDATE code_nodes SET name='GoodsOrderSvc', "
                      "id='interface.a/GoodsOrderService.java:GoodsOrderSvc' "
                      "WHERE name='GoodsOrderService' AND project='rp'")
         conn.commit(); conn.close()
         after = intent_drift_report('rp', str(tmp_path))
-        assert 'Drift（文件斷言存在、code 找不到）: 2' in after   # TP：改名被偵測
+        assert 'Drift（normative 文件斷言存在、code 找不到）: 2' in after   # TP：改名被偵測
         assert 'GoodsOrderService' in after.split('Doc-stale')[0]
         assert 'TicketStrategy' not in after.split('Doc-stale')[0]  # FP=0（控制組）
 
@@ -338,4 +338,138 @@ class TestDriftRouting:
         monkeypatch.setattr(intent, 'intent_drift_report', boom)
         monkeypatch.setattr(legacy, 'get_drift_summary',
                             lambda p, d=None: 'LEGACY_SENTINEL')
-        assert 'LEGACY_SENTINEL' in cv.drift_report('rp', str(tmp_path))
+        out = cv.drift_report('rp', str(tmp_path))
+        assert 'LEGACY_SENTINEL' in out
+        assert '⚠️' in out and 'intent 引擎異常' in out   # 不得靜默偽裝成 legacy 正常
+
+
+# =============================================================================
+# codex round-2 修正的鎖死測試
+# =============================================================================
+
+class TestUnmeasuredNotDrift:
+    """無法量測的來源絕不可充當 missing（codex Critical 1 / Major 5）。"""
+
+    def _claim(self, anchor, symbol, scope=None, status='current'):
+        return {'id': 'x', 'doc': 'd.md', 'line': 1, 'quote': '',
+                'anchor': anchor, 'symbol': symbol, 'scope': scope,
+                'status': status}
+
+    def test_empty_graph_class_unmeasured(self, mock_db_path, tmp_path):
+        from servers.intent import link_claims
+        r = link_claims([self._claim('class', 'Anything')], 'empty', str(tmp_path))[0]
+        assert r['matched'] is None and r['tier'] == 'unavailable'
+
+    def test_unscoped_only_graph_member_unmeasured(self, mock_db_path, tmp_path):
+        """regex-fallback 環境：只有無 scope 的 function id → member 無法驗證。"""
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'rf',
+                         [('function.x.java:create', 'function', 'create', 'x.java', 1),
+                          ('class.x.java:X', 'class', 'X', 'x.java', 1)])
+        r = link_claims([self._claim('member', 'create', 'X')], 'rf', str(tmp_path))[0]
+        assert r['matched'] is None and r['tier'] == 'unavailable'
+
+    def test_no_java_route_source_unmeasured(self, mock_db_path, tmp_path):
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'nr', SEED[:1])
+        r = link_claims([self._claim('route', '/v1/x/y')], 'nr', str(tmp_path))[0]
+        assert r['matched'] is None and r['tier'] == 'unavailable'
+
+
+class TestMemberWeakFallback:
+    """Class.member 的 field 案：scoped method 比對失敗 → member 弱搜尋承接
+    （codex Critical 2；spike tenantPoints 案的正反兩面）。"""
+
+    def test_existing_field_matched_weak(self, mock_db_path, tmp_path):
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'fw', SEED)
+        dto = tmp_path / 'a' / 'GoodsOrderSubmitDto.java'
+        dto.parent.mkdir(parents=True)
+        dto.write_text('public class GoodsOrderSubmitDto {\n'
+                       '  private Integer districtPoints;\n'
+                       '  // private Integer ghostField;\n'
+                       '}\n', encoding='utf-8')
+        claims = [{'id': 'x', 'doc': 'd.md', 'line': 1, 'quote': '',
+                   'anchor': 'member', 'symbol': 'districtPoints',
+                   'scope': 'GoodsOrderSubmitDto', 'status': 'current'},
+                  {'id': 'y', 'doc': 'd.md', 'line': 2, 'quote': '',
+                   'anchor': 'member', 'symbol': 'tenantPoints',
+                   'scope': 'GoodsOrderSubmitDto', 'status': 'current'},
+                  {'id': 'z', 'doc': 'd.md', 'line': 3, 'quote': '',
+                   'anchor': 'member', 'symbol': 'ghostField',
+                   'scope': 'GoodsOrderSubmitDto', 'status': 'current'}]
+        got = link_claims(claims, 'fw', str(tmp_path))
+        assert got[0]['matched'] is True and got[0]['tier'] == 'member_weak'
+        assert got[0]['locations'][0]['file'].endswith('GoodsOrderSubmitDto.java')
+        assert got[1]['matched'] is False    # tenantPoints 不存在 → 真 drift 保留
+        assert got[2]['matched'] is False    # 註解內的字不算存在
+
+
+class TestRouteBaseDetection:
+    """class 宣告之後的 @RequestMapping 是 method-level，不得當 prefix（codex Major 2）。"""
+
+    def test_method_level_request_mapping_not_prefix(self, mock_db_path, tmp_path):
+        from servers.intent import _scan_routes
+        ctrl = tmp_path / 'BarController.java'
+        ctrl.write_text('public class BarController {\n'
+                        '  @RequestMapping("/m1")\n'
+                        '  public void m1() {}\n'
+                        '  @PostMapping(path = "/m2")\n'
+                        '  public void m2() {}\n'
+                        '}\n', encoding='utf-8')
+        routes = _scan_routes(str(tmp_path))
+        assert '/m1' in routes and '/m2' in routes
+        assert '/m1/m2' not in routes        # 不得誤組 prefix
+
+
+class TestStatusUpgrade:
+    """同 symbol 先『建議』後『既有』→ status 必須升為 current（codex Major 3）。"""
+
+    def test_later_current_wins(self, tmp_path):
+        from servers.intent import extract_claims
+        doc = tmp_path / 'd.md'
+        doc.write_text('## 規劃\n- 建議使用 `TicketStrategy`\n'
+                       '## 現況\n- 既有 `TicketStrategy` 已上線\n', encoding='utf-8')
+        r = extract_claims(str(doc), 'd.md')
+        c = [c for c in r['claims'] if c['symbol'] == 'TicketStrategy'][0]
+        assert c['status'] == 'current'
+        assert c['line'] == 4               # line 跟著最強 status 那次
+
+
+class TestAuthorityGate:
+    """非 normative 文件的 current+missing → needs_review，不產生 drift（codex Major 8）。"""
+
+    def test_draft_doc_missing_goes_needs_review(self, mock_db_path, tmp_path):
+        from servers.intent import intent_drift_report
+        _seed_code_nodes(mock_db_path, 'ag', SEED)
+        (tmp_path / 'docs').mkdir()
+        (tmp_path / 'docs' / 'draft.md').write_text(
+            '## 現況\n- 既有 `NonExistentThing` 服務\n', encoding='utf-8')
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/draft.md', 'type': 'design',
+                      'authority': 'draft', 'status': 'active'}]}), encoding='utf-8')
+        rep = intent_drift_report('ag', str(tmp_path))
+        assert 'Drift（normative 文件斷言存在、code 找不到）: 0' in rep
+        assert 'NonExistentThing' in rep    # 出現在 needs_review 而非 drift
+
+
+class TestWatermarkSemantics:
+    def test_archived_doc_not_counted_unregistered(self, mock_db_path, tmp_path):
+        """archived 是『已登記未啟用』，不得計入未登記（codex Minor）。"""
+        from servers.intent import intent_drift_report
+        _seed_code_nodes(mock_db_path, 'wm', SEED)
+        (tmp_path / 'docs').mkdir()
+        (tmp_path / 'docs' / 'old.md').write_text('x', encoding='utf-8')
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/old.md', 'status': 'archived'}]}), encoding='utf-8')
+        rep = intent_drift_report('wm', str(tmp_path))
+        assert '未登記 md 檔: 0' in rep
+        assert '0 active / 1 total' in rep
+
+    def test_path_traversal_rejected(self, mock_db_path, tmp_path):
+        from servers.intent import intent_drift_report
+        _seed_code_nodes(mock_db_path, 'pt', SEED)
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': '../outside.md', 'status': 'active'}]}), encoding='utf-8')
+        rep = intent_drift_report('pt', str(tmp_path))
+        assert '路徑拒絕: ../outside.md' in rep
