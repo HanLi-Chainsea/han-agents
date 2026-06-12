@@ -174,6 +174,27 @@ run_recipe('integration_tests', project_name='p', project_path='/path', target_p
 run_recipe('e2e_tests', project_name='p', project_path='/path', target_path='servers/checkout/')
 ```
 
+### Intent Layer（doc-grounded 意圖層）
+
+在專案根放一份 `intent-manifest.json`，註冊真實開發文件（PRD/SA/SD）作為意圖來源——
+**取代手寫 flows/domains**（無 manifest 時 legacy SSOT 行為不變）：
+
+```json
+{
+  "docs": [
+    {"path": "docs/PRD.md", "type": "prd", "authority": "normative", "status": "active"},
+    {"path": "docs/SA.md",  "type": "sa",  "authority": "draft",     "status": "active"}
+  ]
+}
+```
+
+`/han:drift` 會自動：確定性抽取文件中的錨點 claim（`Class.method`、ClassName、
+UPPER_SNAKE、`/route`）→ 對 Code Graph **scoped** 比對 → 依 status 分車道
+（**只有「文件明示現存 + code 找不到」才報 drift**；「提案但已存在」走 Doc-stale
+提醒更新文件；status 不明用 git 訊號解歧）→ 附 Coverage watermark
+（未登記/未抽取 ≠ 無 drift）。詳見 `servers/intent.py` docstring 與
+`docs/superpowers/specs/2026-06-12-intent-layer-v1-design.md`。
+
 ### Slash 指令（直接觸發，免先叫 han）
 
 `commands/han/*.md` 提供斜線指令，由 `auto_setup()` 自動安裝到 `~/.claude/commands/han/`
