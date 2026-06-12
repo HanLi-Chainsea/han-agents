@@ -4,7 +4,13 @@ description: 'HAN：偵測 SSOT(意圖) 與 Code(現實) 的偏差，產出 drif
 
 # /han:drift — 設計與實作偏差偵測
 
-比對 HAN 的 **SSOT（應該怎樣）** 與 **Code Graph（實際怎樣）**，找出偏差。單次讀取，直接產出報告。
+比對「意圖」與 **Code Graph（實際怎樣）**，找出偏差。單次讀取，直接產出報告。
+
+**兩種模式（自動路由）**：
+- 專案根有 `intent-manifest.json` → **doc-grounded 模式**：意圖來自 manifest 註冊的
+  PRD/SA/SD（確定性錨點抽取 + scoped 比對 + git 訊號解 status），報告含四車道：
+  Drift / Doc-stale（文件過期，非 drift）/ Needs-review / Coverage watermark。
+- 無 manifest → legacy SSOT 模式（SKILL.md flows/domains 連結檢查）。
 
 > 範圍說明（誠實）：目前 `get_drift_summary()` 主要做 **SSOT 連結有效性 / 缺檔（missing_file / broken link）** 檢查。**若專案尚未定義 SSOT（SKILL.md flows/domains）或 Code Graph 為空，底層可能回 `✅ In sync`——這是「沒東西可比」而非「真的一致」**，呈現時務必點明這個前提，不要報成健康。
 

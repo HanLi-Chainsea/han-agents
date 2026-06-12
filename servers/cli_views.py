@@ -34,6 +34,16 @@ def status_report(project_path: str = None) -> str:
 
 
 def drift_report(project: str, project_dir: str = None) -> str:
+    """有 intent-manifest.json → doc-grounded intent 引擎；否則（或引擎異常）
+    fail-open 回 legacy SSOT drift。"""
+    if project_dir:
+        try:
+            from servers.intent import intent_drift_report
+            rep = intent_drift_report(project, project_dir)
+            if rep is not None:
+                return rep
+        except Exception:
+            pass  # fail-open：intent 引擎任何異常都不得擋 drift 查詢
     from servers.drift import get_drift_summary
     return get_drift_summary(project, project_dir)
 
