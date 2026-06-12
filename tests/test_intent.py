@@ -596,3 +596,41 @@ class TestRound3Locks:
         proj.mkdir()
         os.symlink(str(outside / 'secret.md'), str(proj / 'link.md'))
         assert _safe_doc_path('link.md', str(proj)) is False
+
+
+class TestRound4Locks:
+    def test_malformed_doc_entry_raises(self, tmp_path):
+        """docs 內非 dict 或 path 非法 → ManifestError（不可靜默產出乾淨報告）。"""
+        import pytest
+        from servers.intent import load_manifest, ManifestError
+        for bad in ([123], [{'type': 'prd'}], [{'path': ''}], ['docs/a.md']):
+            (tmp_path / 'intent-manifest.json').write_text(
+                json.dumps({'docs': bad}), encoding='utf-8')
+            with pytest.raises(ManifestError):
+                load_manifest(str(tmp_path))
+
+    def test_malformed_entry_warns_via_cli(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.cli_views as cv
+        from servers import drift as legacy
+        (tmp_path / 'intent-manifest.json').write_text(
+            json.dumps({'docs': [123]}), encoding='utf-8')
+        monkeypatch.setattr(legacy, 'get_drift_summary',
+                            lambda p, d=None: 'LEGACY_SENTINEL')
+        out = cv.drift_report('rp', str(tmp_path))
+        assert 'LEGACY_SENTINEL' in out and '⚠️' in out
+
+    def test_route_prefix_segment_boundary(self, mock_db_path, tmp_path):
+        """`/api/foo/*` 不得命中 /api/foobar（segment 邊界）。"""
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'pb', SEED)
+        (tmp_path / 'PController.java').write_text(
+            'public class PController {\n'
+            '  @PostMapping("/api/foobar")\n  public void a() {}\n'
+            '  @PostMapping("/api/foo/baz")\n  public void b() {}\n'
+            '}\n', encoding='utf-8')
+        claim = {'id': 'x', 'doc': 'd.md', 'line': 1, 'quote': '',
+                 'anchor': 'route_prefix', 'symbol': '/api/foo',
+                 'scope': None, 'status': 'current'}
+        r = link_claims([claim], 'pb', str(tmp_path))[0]
+        assert r['matched'] is True
+        assert r['prefix_matches'] == ['/api/foo/baz']   # foobar 不得入列

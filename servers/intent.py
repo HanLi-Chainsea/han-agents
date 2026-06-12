@@ -79,6 +79,10 @@ def load_manifest(project_dir: str) -> Optional[Dict]:
         raise ManifestError(f'intent-manifest.json 無法解析: {e}')
     if not isinstance(data, dict) or not isinstance(data.get('docs'), list):
         raise ManifestError('intent-manifest.json 形狀錯誤（需 {"docs": [...]}）')
+    for i, d in enumerate(data['docs']):
+        if not isinstance(d, dict) or not isinstance(d.get('path'), str) or not d['path'].strip():
+            raise ManifestError(
+                f'intent-manifest.json docs[{i}] 形狀錯誤（需 dict 且 path 為非空字串）')
     return data
 
 
@@ -376,7 +380,9 @@ def link_claims(claims: List[Dict], project: str, project_dir: str,
                     locs = route_map.get(norm, [])
                     r.update(matched=bool(locs), tier='route_exact', locations=locs[:3])
                 else:
-                    hit = sorted(k for k in route_map if k.startswith(norm))
+                    # segment 邊界：/api/foo 不得命中 /api/foobar（codex round-4）
+                    hit = sorted(k for k in route_map
+                                 if k == norm or k.startswith(norm + '/'))
                     r.update(matched=bool(hit), tier='route_prefix',
                              locations=[], prefix_matches=hit[:5])
         else:
