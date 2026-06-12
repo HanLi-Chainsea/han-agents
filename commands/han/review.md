@@ -71,7 +71,27 @@ PY
 
 ---
 
+## 輸出（寫檔 / 留言）
+
+產出報告後，**除了在對話顯示，一律把報告寫成檔案留存**；若使用者要求貼到 PR/MR，再額外張貼。
+
+1. **預設：寫 Markdown 檔（安全、永遠可行）**
+```bash
+mkdir -p .han/reviews
+OUT=".han/reviews/review-$(git branch --show-current 2>/dev/null | tr '/' '-')-$(git rev-parse --short HEAD 2>/dev/null).md"
+# 把完整報告寫進 "$OUT"（用你產出的 markdown 內容）
+printf '%s\n' "<完整 markdown 報告>" > "$OUT"
+echo "報告已寫入：$OUT"
+```
+- 若 `$ARGUMENTS` 指定了輸出路徑（如 `--out docs/review.md`），改寫到該路徑。
+
+2. **可選：貼到 GitHub / GitLab（僅在使用者明確要求時）**
+   - 這是**對外發佈**動作（會公開、可能被索引）。**只有使用者要求（如帶 `--pr` / `--mr` 或明說「貼到 PR」）才執行**，並先確認目標 PR/MR。
+   - GitHub PR：`gh pr comment <number> --body-file "$OUT"`（或當前分支的 PR 省略 number）
+   - GitLab MR：`glab mr note <id> --message "$(cat "$OUT")"`（或用 API）
+   - 工具不可用 / 非 PR 情境 → 退回只寫 Markdown 檔並告知。
+
 ## 重要
 - **一定要產出實際的 review 報告**（不是「我會去審」）；單次完成、不繞 dispatch。
 - CODE 模式至少要納入一項由 `get_code_dependencies` 查到的影響半徑觀察，IDEA 模式至少要撈一次記憶/SSOT——否則就退化成通用 review，失去 HAN 的脈絡價值。
-- 只讀不寫：不修改任何檔案。
+- **不修改原始碼**；只寫「報告檔」（`.han/reviews/` 或指定路徑），PR/MR 留言僅在明確要求時張貼。

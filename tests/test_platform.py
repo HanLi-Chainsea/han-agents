@@ -22,6 +22,23 @@ class TestSetupCommands:
         assert "{{HAN_DIR}}" not in content      # 佔位符已替換
         assert _BASE in content                  # 換成真實 han 路徑
 
+    def test_all_command_files_render_safely(self, tmp_path, monkeypatch):
+        """所有指令檔 render 後不得殘留 {{HAN_DIR}}，且每個 sys.path.insert 行可被 compile。"""
+        from servers import platform as plat
+        cmds = tmp_path / "commands"
+        monkeypatch.setattr(plat, "get_commands_dir", lambda *a, **k: str(cmds))
+        plat.setup_commands(platform_key="claude", base_dir=_BASE)
+
+        han_dir = cmds / "han"
+        md_files = list(han_dir.glob("*.md"))
+        assert len(md_files) >= 5  # 至少含本批新指令
+        for md in md_files:
+            content = md.read_text(encoding="utf-8")
+            assert "{{HAN_DIR}}" not in content, f"{md.name} 仍有未替換的佔位符"
+            for line in content.splitlines():
+                if "sys.path.insert" in line:
+                    compile(line.strip(), f"<{md.name}>", "exec")
+
     def test_idempotent(self, tmp_path, monkeypatch):
         from servers import platform as plat
         cmds = tmp_path / "commands"
