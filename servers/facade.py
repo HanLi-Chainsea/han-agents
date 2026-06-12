@@ -352,14 +352,34 @@ def status(project_path: str = None, project_name: str = None) -> Dict:
             skill['section_count'] = len(links.get('sections', {}))
         except:
             pass
-    else:
-        messages.append(f"Project Skill not found. Run: python <skills-path>/han-agents/scripts/init_project.py {project_name}")
+    # Intent Layer（doc-grounded，v1）：manifest 即意圖註冊表，取代 skill 生成
+    intent_info = {'has_manifest': False, 'active_docs': 0, 'total_docs': 0}
+    if project_path:
+        try:
+            from servers.intent import load_manifest
+            mf = load_manifest(project_path)
+            if mf:
+                docs = [d for d in mf['docs']]
+                intent_info = {
+                    'has_manifest': True,
+                    'total_docs': len(docs),
+                    'active_docs': sum(1 for d in docs
+                                       if d.get('status', 'active') == 'active'),
+                }
+        except Exception as e:
+            messages.append(f"intent-manifest.json 無法使用：{e}")
+
+    if not skill_dir and not intent_info['has_manifest']:
+        messages.append(
+            "意圖層未配置（選用）：在專案根放 intent-manifest.json 註冊 PRD/SA/SD "
+            "即可啟用 doc-grounded drift（/han:drift）；不需生成 Project Skill")
 
     return {
         'project_name': project_name,
         'project_path': project_path,
         'code_graph': code_graph,
         'skill': skill,
+        'intent': intent_info,
         'registry': registry,
         'health': health,
         'messages': messages
@@ -991,7 +1011,7 @@ def sync_skill_graph(project_path: str = None, project_name: str = None) -> Dict
             'types_found': [],
             'total_nodes': 0,
             'total_edges': 0,
-            'message': f'No Skill found. Run: python <skills-path>/han-agents/scripts/init_project.py {project_name}'
+            'message': f'No legacy Skill found for {project_name}. 注意：doc-grounded 意圖請改用 intent-manifest.json（/han:drift 會自動使用），不需生成 Skill'
         }
 
     # 解析 SKILL.md 連結
@@ -1065,12 +1085,18 @@ def quick_status(project_path: str = None) -> str:
             f"  Edges: {s['code_graph']['edge_count']}",
             f"  Files: {s['code_graph']['file_count']}",
             f"",
-            f"Skill:",
+            f"Skill (legacy):",
             f"  Has Skill: {'✅' if s['skill']['has_skill'] else '❌'}",
             f"  Path: {s['skill']['skill_path'] or 'N/A'}",
             f"  Flows: {s['skill']['flow_count']}",
             f"  Domains: {s['skill']['domain_count']}",
             f"  APIs: {s['skill']['api_count']}",
+            f"",
+            f"Intent:",
+            (f"  Manifest: ✅ ({s['intent']['active_docs']} active / "
+             f"{s['intent']['total_docs']} docs)"
+             if s.get('intent', {}).get('has_manifest')
+             else "  Manifest: ❌（選用：放 intent-manifest.json 啟用 doc-grounded drift）"),
         ]
         if s['messages']:
             lines.append("")

@@ -672,3 +672,33 @@ class TestRound5Locks:
                      {'path': 'b.md'}]}), encoding='utf-8')
         m = load_manifest(str(tmp_path))
         assert len(m['docs']) == 2
+
+
+class TestStatusIntentAware:
+    """quick_status 必須反映 intent layer 現況，不得再推銷過時的 Project Skill 生成
+    （v1 已定案：manifest 取代 skill 生成；init_project.py 也根本不會生成 skill）。"""
+
+    def _qs(self, tmp_path):
+        from servers.facade import quick_status
+        return quick_status(str(tmp_path))
+
+    def test_manifest_present_shown_no_legacy_warning(self, mock_db_path, tmp_path):
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/a.md'},
+                     {'path': 'docs/b.md', 'status': 'archived'}]}), encoding='utf-8')
+        out = self._qs(tmp_path)
+        assert 'Intent:' in out
+        assert '1 active / 2 docs' in out
+        assert 'Project Skill not found' not in out
+        assert 'init_project.py' not in out
+
+    def test_no_manifest_suggests_manifest_not_init_project(self, mock_db_path, tmp_path):
+        out = self._qs(tmp_path)
+        assert 'intent-manifest.json' in out      # 新路徑的建議
+        assert 'init_project.py' not in out        # 過時且錯誤的建議必須退場
+
+    def test_bad_manifest_surfaces_warning_without_crash(self, mock_db_path, tmp_path):
+        (tmp_path / 'intent-manifest.json').write_text('{broken', encoding='utf-8')
+        out = self._qs(tmp_path)
+        assert '無法使用' in out or '無法解析' in out
+        assert not out.startswith('Error:')
