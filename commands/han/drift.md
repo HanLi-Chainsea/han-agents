@@ -4,7 +4,9 @@ description: 'HAN：偵測 SSOT(意圖) 與 Code(現實) 的偏差，產出 drif
 
 # /han:drift — 設計與實作偏差偵測
 
-比對 HAN 的 **SSOT（應該怎樣）** 與 **Code Graph（實際怎樣）**，找出 missing implementation / missing spec / mismatch / stale spec。單次讀取，直接產出報告。
+比對 HAN 的 **SSOT（應該怎樣）** 與 **Code Graph（實際怎樣）**，找出偏差。單次讀取，直接產出報告。
+
+> 範圍說明（誠實）：目前 `get_drift_summary()` 主要做 **SSOT 連結有效性 / 缺檔（missing_file / broken link）** 檢查。**若專案尚未定義 SSOT（SKILL.md flows/domains）或 Code Graph 為空，底層可能回 `✅ In sync`——這是「沒東西可比」而非「真的一致」**，呈現時務必點明這個前提，不要報成健康。
 
 ## 執行步驟
 
@@ -27,10 +29,9 @@ PY
 ```
 
 3. 把報告整理呈現：
-   - 依嚴重度（🔴 critical / 🟠 high / 🟡 medium / 🟢 low）列出每筆 drift
-   - 每筆標明型別（missing_implementation / missing_spec / mismatch / stale_spec）、SSOT 項、Code 項、建議
-   - 若 `✅ In sync` 則明確回報無偏差
+   - 依嚴重度（🔴 critical / 🟠 high / 🟡 medium / 🟢 low）列出每筆 drift，標明型別（如 missing_file）、SSOT 項、Code 項、建議
+   - **若 `✅ In sync`：先確認專案有定義 SSOT 且 Code Graph 非空**（可參考 `/han:status`）。兩者皆空時要報「無可比對基準」而非「健康」。
 
 ## 重要
 - 單次讀取，**不寫檔、不派工、不改任何程式碼**。
-- 若報告為空或專案無 SSOT，明確告知（可能尚未定義 SKILL.md flows/domains）。
+- 別把空 SSOT/空圖譜的 `In sync` 誤報成「設計與實作一致」。

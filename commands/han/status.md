@@ -1,10 +1,10 @@
 ---
-description: 'HAN：快速顯示專案狀態（Code Graph 統計、任務、記憶）（單次讀取）'
+description: 'HAN：快速顯示專案狀態（Code Graph 節點/邊/檔數 + Skill 健康度）（單次讀取）'
 ---
 
 # /han:status — 專案狀態速覽
 
-顯示 HAN 對當前專案的掌握：Code Graph 節點/邊數、任務進度、記憶筆數等。
+顯示 HAN 對當前專案的掌握：專案名/路徑、健康度、Code Graph 節點/邊/檔數、Skill 資訊（`quick_status()` 的內容）。
 
 ## 執行步驟
 

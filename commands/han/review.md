@@ -4,7 +4,7 @@ description: 'HAN：帶專案脈絡的審查。吃 code 或想法/設計，對�
 
 # /han:review — 帶脈絡的審查（code 或想法）
 
-對 `$ARGUMENTS` 做**一次性批判並直接產出報告**。與 recipe 不同：**不建任務樹、不派工、不寫檔**——你（模型）讀取 HAN 的 Code Graph / SSOT / 記憶當脈絡後，直接寫出分級 review。
+對 `$ARGUMENTS` 做**一次性批判並直接產出報告**。與 recipe 不同：**不建任務樹、不派工、不改原始碼**——你（模型）讀取 HAN 的 Code Graph / SSOT / 記憶當脈絡後，直接寫出分級 review（預設顯示在對話；`--out`/`--post` 才落地）。
 
 > 與 ccg:review 的差異：ccg 是通用雙模型；`/han:review` 的價值是**專案脈絡**——對著「實際架構、相依關係、過往決策」審。不要做成多模型 fan-out。
 
@@ -73,25 +73,22 @@ PY
 
 ## 輸出（落地位置）
 
-一份 review 屬於它所審的「變更」，所以**有 PR/MR 時，它的家就是那個 PR/MR**（好找、有組織、跟變更綁在一起）；沒有才退回對話/指定檔。**絕不倒進隱藏目錄或時間戳檔堆。**
+**預設：在對話顯示完整報告。** 要落地到檔案或 PR/MR，依使用者指示：
 
-依序判斷：
+> ⚠️ 寫檔/貼留言時，**一律用 Write 工具把完整 markdown 報告寫到檔案**（不要用 `printf`/`echo`/`"$(...)"` 把報告內容塞進 shell——報告可能含 `"`、`$()`、backtick，會造成 shell 注入）。再用「以檔案為輸入」的旗標帶入。
 
-1. **偵測當前分支是否有開啟的 PR/MR**：
-   - GitHub：`gh pr view --json number,url -q .url`（成功即有 PR）
-   - GitLab：`glab mr view`（成功即有 MR）
+1. **`--out <path>`** → 用 Write 工具把報告寫到該可見路徑（如 `docs/review-<branch>.md`），並在對話顯示。
 
-2. **有 PR/MR → 預設貼成 comment**（這是對外發佈：先回報「將貼到 <url>」，使用者帶 `--no-post` 則略過只顯示）：
-   - 先把完整 markdown 報告寫到暫存檔，例如 `T=$(mktemp); printf '%s\n' "<報告>" > "$T"`
-   - GitHub：`gh pr comment --body-file "$T"`（當前分支的 PR）
-   - GitLab：`glab mr note "$(cat "$T")"`（或 API）
-   - 貼完回報 comment 連結。
+2. **`--post`（明確要求才發佈；這是對外公開動作）**：報告會公開在 PR/MR，**必須使用者明確帶 `--post` 或明說「貼到 PR/MR」才執行**，先確認目標：
+   - 偵測：GitHub `gh pr view --json url -q .url`；GitLab `glab mr view`
+   - 用 Write 工具把報告寫到暫存檔 `F`（例如 `docs/.review-tmp.md`），再：
+     - GitHub：`gh pr comment --body-file "$F"`
+     - GitLab：`glab mr note -F "$F"`（以檔案為輸入，避免命令列長度/注入）
+   - 貼完回報 comment 連結；用畢可刪暫存檔。
 
-3. **沒有 PR/MR → 預設只在對話顯示完整報告**。要存檔再用 `--out <path>`（可見、git 可追蹤的路徑，如 `docs/review-<branch>.md`），不要自動建檔。
-
-4. **使用者明確 `--out <path>` → 一律寫該路徑**（並仍在對話顯示）。
+3. **沒給旗標 → 只在對話顯示**，不自動建檔、不自動發佈。
 
 ## 重要
 - **一定要產出實際的 review 報告**（不是「我會去審」）；單次完成、不繞 dispatch。
 - CODE 模式至少要納入一項由 `get_code_dependencies` 查到的影響半徑觀察，IDEA 模式至少要撈一次記憶/SSOT——否則就退化成通用 review，失去 HAN 的脈絡價值。
-- **不修改原始碼**。落地位置：PR/MR 留言（有則優先）或對話；`--out` 才寫檔。不製造隱藏檔堆。
+- **不修改原始碼**；只有 `--out`/`--post` 才產生報告檔（用 Write 工具寫，非 shell）。發佈到 PR/MR 一律 opt-in。

@@ -60,6 +60,21 @@ class TestSetupCommands:
         content = (han_dir / "unit-test.md").read_text(encoding="utf-8")
         assert "STALE" not in content and _BASE in content
 
+    def test_impact_command_uses_real_dep_fields(self):
+        """impact.md 必須用 get_code_dependencies 實際欄位（relation/direction），非錯誤的 edge_kind/to_id。"""
+        content = open(os.path.join(_BASE, "commands", "han", "impact.md"), encoding="utf-8").read()
+        assert "direction" in content and "relation" in content
+        assert "edge_kind" not in content and "to_id" not in content
+
+    def test_get_code_dependencies_contract(self, sample_code_graph):
+        """鎖定 get_code_dependencies 的回傳鍵，避免指令本文與 API 漂移。"""
+        from servers.code_graph import get_code_dependencies
+        deps = get_code_dependencies(
+            "test", "func.src/auth/login.py:authenticate", depth=1, direction="both")
+        assert deps, "expected at least one dependency edge from sample graph"
+        for d in deps:
+            assert {"id", "relation", "direction"}.issubset(d.keys())
+
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat
         # cursor 沒有 supports_commands → -1
