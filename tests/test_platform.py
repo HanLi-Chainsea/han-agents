@@ -95,6 +95,16 @@ class TestSetupCommands:
         assert "/tmp/han-review.md" not in content       # 不可用固定共用暫存檔（競態/symlink）
         assert "-F " not in content                      # glab 無 -F 旗標
 
+    def test_init_command_uses_real_tech_stack_fields(self):
+        """init.md 必須讀 tech_stack 的 'frameworks'（複數陣列），非錯誤的 'framework'。"""
+        content = open(os.path.join(_BASE, "commands", "han", "init.md"), encoding="utf-8").read()
+        assert "'frameworks'" in content
+        assert "'framework'" not in content      # 單數錯誤鍵
+        assert "previously_initialized" in content  # already_initialized 是「執行前」狀態
+        # 鎖定 _detect_tech_stack 實作確實回傳 'frameworks' 鍵（避免 init.md 與實作漂移）
+        proj_src = open(os.path.join(_BASE, "servers", "project.py"), encoding="utf-8").read()
+        assert "'frameworks'" in proj_src
+
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat
         # cursor 沒有 supports_commands → -1
