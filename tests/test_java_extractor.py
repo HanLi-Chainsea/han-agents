@@ -555,3 +555,53 @@ public class Test {
 
         class_nodes = [n for n in result.nodes if n.kind == 'class']
         assert len(class_nodes) == 1
+
+
+# =============================================================================
+# Tree-sitter: Java interface 提取（fix/java-interface-extraction）
+# =============================================================================
+
+class TestJavaInterfaceExtractionTreeSitter:
+    """Java interface 必須產生 interface 節點，且成員方法要有 class-scope。
+
+    背景：JAVA_PACK 先前宣告 interface_types 但未掛 extract_interface，
+    導致 interface 被靜默丟棄、其方法以無 scope 的 function 流出 —
+    在真實專案（aipoolserver）上造成 16 筆假 drift。
+    """
+
+    @pytest.fixture
+    def java_interface_src(self):
+        return '''
+package com.ap.goods.service;
+
+public interface GoodsOrderService extends BaseOrderService {
+    String create(GoodsOrderDto dto);
+    void timeOutGoodsOrder(String orderId);
+}
+'''
+
+    def _ts_extract(self, src, path):
+        from tools.code_graph_extractor.backends.tree_sitter_backend import (
+            TreeSitterBackend, _load_grammar)
+        if _load_grammar('java', auto_install=False) is None:
+            pytest.skip('tree-sitter-java grammar not installed')
+        return TreeSitterBackend().extract(src, path)
+
+    def test_interface_node_extracted(self, java_interface_src):
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        ifaces = [n for n in r.nodes if n.kind == 'interface']
+        assert any(n.name == 'GoodsOrderService' for n in ifaces), \
+            f'interface 節點未被提取；nodes={[(n.kind, n.name) for n in r.nodes]}'
+
+    def test_interface_methods_are_scoped(self, java_interface_src):
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        ids = [n.id for n in r.nodes if n.kind in ('function', 'method')]
+        assert any(i.endswith('GoodsOrderService.create') for i in ids), \
+            f'create 未取得 interface scope；ids={ids}'
+        assert any(i.endswith('GoodsOrderService.timeOutGoodsOrder') for i in ids)
+
+    def test_interface_extends_edge(self, java_interface_src):
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        ext = [e for e in r.edges if e.kind == 'extends']
+        assert any('BaseOrderService' in e.to_id for e in ext), \
+            f'extends edge 缺失；edges={[(e.kind, e.to_id) for e in r.edges][:10]}'

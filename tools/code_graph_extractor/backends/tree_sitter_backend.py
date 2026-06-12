@@ -202,6 +202,10 @@ class LanguageQueryPack:
     extract_type_alias: Optional[Callable] = None
     extract_module: Optional[Callable] = None
 
+    # 若為 True，interface 成員會以 interface 名作 scope 提取
+    # （Java：interface 方法是 API 契約的一級公民；其他語言維持原行為）
+    interface_members_scoped: bool = False
+
     # Visibility detection
     detect_visibility: Optional[Callable] = None
 
@@ -582,6 +586,24 @@ def _java_detect_visibility(name: str, node=None, **kwargs) -> str:
     return 'package'
 
 
+def _java_extract_interface(node) -> Dict:
+    """Java interface：name + extends 清單（extends_interfaces > type_list）。"""
+    name_node = node.child_by_field_name('name')
+    bases = []
+    for child in node.children:
+        if child.type == 'extends_interfaces':
+            for t in child.named_children:
+                if t.type == 'type_list':
+                    for iface in t.named_children:
+                        bases.append(iface.text.decode())
+                else:
+                    bases.append(t.text.decode())
+    return {
+        'name': name_node.text.decode() if name_node else '',
+        'bases': bases,
+    }
+
+
 JAVA_PACK = LanguageQueryPack(
     language='java',
     class_types=['class_declaration', 'enum_declaration'],
@@ -596,6 +618,8 @@ JAVA_PACK = LanguageQueryPack(
     extract_class=_java_extract_class,
     extract_function=_java_extract_function,
     extract_import=_java_extract_import,
+    extract_interface=_java_extract_interface,
+    interface_members_scoped=True,
     detect_visibility=_java_detect_visibility,
 )
 
@@ -1086,6 +1110,15 @@ class ASTWalker:
                 line_number=node.start_point[0] + 1,
                 confidence=0.8,
             ))
+
+        # Java 等語言：interface 方法是 API 契約，需以 interface 名作 scope 提取
+        # （先前 interface 子節點完全不走訪 → Java interface 方法以無 scope 流出，
+        #   實測在真實專案造成大量假 drift）
+        if self.pack.interface_members_scoped:
+            self._class_stack.append((name, 'interface'))
+            for child in node.children:
+                self._visit(child)
+            self._class_stack.pop()
 
     def _handle_function(self, node):
         if not self.pack.extract_function:
