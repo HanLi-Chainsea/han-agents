@@ -30,10 +30,13 @@ class TestLoadManifest:
         from servers.intent import load_manifest
         assert load_manifest(str(tmp_path)) is None
 
-    def test_bad_json_returns_none(self, tmp_path):
-        from servers.intent import load_manifest
+    def test_bad_json_raises_not_silent(self, tmp_path):
+        """壞 manifest ≠ 無 manifest：必須 raise 讓上層帶警告，不可靜默走 legacy。"""
+        import pytest
+        from servers.intent import load_manifest, ManifestError
         (tmp_path / 'intent-manifest.json').write_text('{not json', encoding='utf-8')
-        assert load_manifest(str(tmp_path)) is None
+        with pytest.raises(ManifestError):
+            load_manifest(str(tmp_path))
 
 
 # =============================================================================
@@ -417,7 +420,8 @@ class TestRouteBaseDetection:
                         '  @PostMapping(path = "/m2")\n'
                         '  public void m2() {}\n'
                         '}\n', encoding='utf-8')
-        routes = _scan_routes(str(tmp_path))
+        routes, n_sources = _scan_routes(str(tmp_path))
+        assert n_sources == 1
         assert '/m1' in routes and '/m2' in routes
         assert '/m1/m2' not in routes        # 不得誤組 prefix
 
@@ -473,3 +477,122 @@ class TestWatermarkSemantics:
             'docs': [{'path': '../outside.md', 'status': 'active'}]}), encoding='utf-8')
         rep = intent_drift_report('pt', str(tmp_path))
         assert '路徑拒絕: ../outside.md' in rep
+
+
+# =============================================================================
+# codex round-3 修正的鎖死測試
+# =============================================================================
+
+class TestRound3Locks:
+    def _claim(self, anchor, symbol, scope=None, status='current'):
+        return {'id': 'x', 'doc': 'd.md', 'line': 1, 'quote': '',
+                'anchor': anchor, 'symbol': symbol, 'scope': scope,
+                'status': status}
+
+    def test_bad_manifest_warns_via_cli(self, mock_db_path, tmp_path, monkeypatch):
+        """壞 manifest → legacy + 顯式警告（不可偽裝成正常 legacy）。"""
+        import servers.cli_views as cv
+        from servers import drift as legacy
+        (tmp_path / 'intent-manifest.json').write_text('{broken', encoding='utf-8')
+        monkeypatch.setattr(legacy, 'get_drift_summary',
+                            lambda p, d=None: 'LEGACY_SENTINEL')
+        out = cv.drift_report('rp', str(tmp_path))
+        assert 'LEGACY_SENTINEL' in out and '⚠️' in out
+
+    def test_member_weak_java_only(self, mock_db_path, tmp_path):
+        """非 Java 檔（註解語法不明）不得參與弱搜尋 → 杜絕 # 註解 false clean。"""
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'jo', SEED)
+        (tmp_path / 'Ghost.py').write_text('# ghostField mentioned in comment\n',
+                                           encoding='utf-8')
+        r = link_claims([self._claim('member', 'ghostField', 'Ghost')],
+                        'jo', str(tmp_path))[0]
+        assert r['matched'] is False
+
+    def test_member_weak_exact_filename(self, mock_db_path, tmp_path):
+        """檔名必須 == Scope.java：`User.name` 不得命中 NotUserService.java。"""
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'ef', SEED)
+        (tmp_path / 'NotUserService.java').write_text(
+            'public class NotUserService { String name; }\n', encoding='utf-8')
+        r = link_claims([self._claim('member', 'name', 'User')],
+                        'ef', str(tmp_path))[0]
+        assert r['matched'] is False
+
+    def test_src_test_direct_level_excluded_from_scanners(self, mock_db_path, tmp_path):
+        """src/test 直層（無前置目錄）的 Controller / member 檔必須被排除。"""
+        from servers.intent import _scan_routes, link_claims
+        d = tmp_path / 'src' / 'test'
+        d.mkdir(parents=True)
+        (d / 'TFooController.java').write_text(
+            '@PostMapping("/t/only")\n', encoding='utf-8')
+        (d / 'Dto.java').write_text('String testOnlyField;\n', encoding='utf-8')
+        routes, n = _scan_routes(str(tmp_path))
+        assert '/t/only' not in routes and n == 0
+        _seed_code_nodes(mock_db_path, 'st', SEED)
+        r = link_claims([self._claim('member', 'testOnlyField', 'Dto')],
+                        'st', str(tmp_path))[0]
+        assert r['matched'] is False
+
+    def test_route_real_miss_is_drift_able(self, mock_db_path, tmp_path):
+        """有 Java route 來源時，查無 = 真缺失（matched False），非 unmeasured。"""
+        from servers.intent import link_claims
+        _seed_code_nodes(mock_db_path, 'rm', SEED)
+        (tmp_path / 'AController.java').write_text(
+            'public class AController {\n  @PostMapping("/a/exists")\n'
+            '  public void a() {}\n}\n', encoding='utf-8')
+        got = link_claims([self._claim('route', '/a/exists'),
+                           self._claim('route', '/a/missing')],
+                          'rm', str(tmp_path))
+        assert got[0]['matched'] is True
+        assert got[1]['matched'] is False and got[1]['tier'] == 'route_exact'
+
+    def test_route_location_line_exact(self, mock_db_path, tmp_path):
+        """block comment 不得讓 route 行號偏移（行數保留）。"""
+        from servers.intent import _scan_routes
+        (tmp_path / 'LController.java').write_text(
+            '/*\n multi\n line\n*/\npublic class LController {\n'
+            '  @PostMapping("/l/x")\n  public void x() {}\n}\n', encoding='utf-8')
+        routes, _ = _scan_routes(str(tmp_path))
+        assert routes['/l/x'][0]['line'] == 6
+
+    def test_report_unmeasured_not_drift_on_empty_graph(self, mock_db_path, tmp_path):
+        """report 層：空圖譜 → current claim 進 unmeasured，drift 必須為 0。"""
+        from servers.intent import intent_drift_report
+        (tmp_path / 'docs').mkdir()
+        (tmp_path / 'docs' / 'd.md').write_text(
+            '## 現況\n- 既有 `SomeService` 服務\n', encoding='utf-8')
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/d.md', 'status': 'active'}]}), encoding='utf-8')
+        rep = intent_drift_report('emptyproj', str(tmp_path))
+        assert 'Drift（normative 文件斷言存在、code 找不到）: 0' in rep
+        assert 'unmeasured: 1' in rep
+
+    def test_maps_built_once_for_multiple_docs(self, mock_db_path, tmp_path, monkeypatch):
+        """多 doc 共用 maps/routes，不得每 doc 重算（codex M7 鎖定）。"""
+        import servers.intent as intent
+        _seed_code_nodes(mock_db_path, 'mb', SEED)
+        (tmp_path / 'docs').mkdir()
+        for n in ('a.md', 'b.md'):
+            (tmp_path / 'docs' / n).write_text('- 既有 `TicketStrategy`\n',
+                                               encoding='utf-8')
+        (tmp_path / 'intent-manifest.json').write_text(json.dumps({
+            'docs': [{'path': 'docs/a.md'}, {'path': 'docs/b.md'}]}), encoding='utf-8')
+        calls = {'maps': 0, 'routes': 0}
+        real_maps, real_scan = intent._build_code_maps, intent._scan_routes
+        monkeypatch.setattr(intent, '_build_code_maps',
+                            lambda p: calls.__setitem__('maps', calls['maps'] + 1) or real_maps(p))
+        monkeypatch.setattr(intent, '_scan_routes',
+                            lambda d: calls.__setitem__('routes', calls['routes'] + 1) or real_scan(d))
+        intent.intent_drift_report('mb', str(tmp_path))
+        assert calls == {'maps': 1, 'routes': 1}
+
+    def test_symlink_escape_rejected(self, tmp_path):
+        from servers.intent import _safe_doc_path
+        outside = tmp_path / 'outside'
+        outside.mkdir()
+        (outside / 'secret.md').write_text('x', encoding='utf-8')
+        proj = tmp_path / 'proj'
+        proj.mkdir()
+        os.symlink(str(outside / 'secret.md'), str(proj / 'link.md'))
+        assert _safe_doc_path('link.md', str(proj)) is False

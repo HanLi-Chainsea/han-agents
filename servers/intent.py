@@ -48,7 +48,7 @@ _CONST_RE = re.compile(r'^[A-Z][A-Z0-9_]{4,}$')
 _CLASS_RE = re.compile(r'^[A-Z][A-Za-z0-9]*$')
 _ROUTE_RE = re.compile(r'^/[A-Za-z0-9_/{}.\-*]+$')
 _HEADING_RE = re.compile(r'^#{1,6}\s+(.*)$')
-_TEST_PATH_RE = re.compile(r'(^|/)src/test/')
+_TEST_PATH_RE = re.compile(r'(^|/)src/test(/|$)')
 _JAVA_CLASS_DECL_RE = re.compile(r'\b(?:class|interface|enum|record)\s+[A-Z]')
 
 _ROUTE_ANNOT_RE = re.compile(
@@ -61,25 +61,42 @@ _CLASS_LEVEL_ROUTE_RE = re.compile(
 # manifest
 # =============================================================================
 
+class ManifestError(ValueError):
+    """manifest 存在但無法使用（壞 JSON / 形狀錯）。
+    必須讓呼叫端看見（cli_views 會前置警告），不可與「無 manifest」混為一談。"""
+
+
 def load_manifest(project_dir: str) -> Optional[Dict]:
-    """讀專案根的 intent-manifest.json。缺檔/壞 JSON/形狀錯 → None（fail-open）。"""
+    """讀專案根的 intent-manifest.json。
+    缺檔 → None（合法的 legacy 模式）；存在但壞 → raise ManifestError（不可靜默）。"""
     path = os.path.join(project_dir, MANIFEST_NAME)
+    if not os.path.exists(path):
+        return None
     try:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
-        if not isinstance(data, dict) or not isinstance(data.get('docs'), list):
-            return None
-        return data
-    except Exception:
-        return None
+    except Exception as e:
+        raise ManifestError(f'intent-manifest.json 無法解析: {e}')
+    if not isinstance(data, dict) or not isinstance(data.get('docs'), list):
+        raise ManifestError('intent-manifest.json 形狀錯誤（需 {"docs": [...]}）')
+    return data
 
 
-def _safe_doc_path(rel: str) -> bool:
-    """manifest path 必須是專案內相對路徑（拒絕絕對路徑與 .. 跳脫）。"""
+def _safe_doc_path(rel: str, project_dir: str = None) -> bool:
+    """manifest path 必須是專案內相對路徑：拒絕絕對路徑、`..`，
+    且 realpath 必須落在專案 realpath 之內（防 symlink 跳脫）。"""
     if not rel or os.path.isabs(rel):
         return False
     parts = rel.replace('\\', '/').split('/')
-    return '..' not in parts
+    if '..' in parts:
+        return False
+    if project_dir:
+        real_root = os.path.realpath(project_dir)
+        real_doc = os.path.realpath(os.path.join(project_dir, rel))
+        if not (real_doc == real_root or
+                real_doc.startswith(real_root + os.sep)):
+            return False
+    return True
 
 
 # =============================================================================
@@ -235,11 +252,12 @@ def _strip_java_comments(txt: str) -> List[str]:
     return out
 
 
-def _scan_routes(project_dir: str) -> Dict[str, List[Dict]]:
+def _scan_routes(project_dir: str):
     """掃 *Controller*/*Feign* Java 檔的 active @*Mapping。
-    class-level base 只認「class 宣告之前」的 @RequestMapping（codex Major：
-    method-level @RequestMapping 不得被誤當 prefix）。"""
+    回 (routes, n_source_files)：n_source_files=0 表示「無可掃描來源」（→ unmeasured）；
+    >0 而 routes 查無 = 真缺失（可進 drift）。class-level base 只認 class 宣告之前。"""
     routes = {}
+    n_sources = 0
     for root, dirs, files in os.walk(project_dir):
         dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules')]
         if _TEST_PATH_RE.search(root.replace(project_dir, '', 1)):
@@ -254,6 +272,7 @@ def _scan_routes(project_dir: str) -> Dict[str, List[Dict]]:
                     open(p, encoding='utf-8', errors='replace').read())
             except Exception:
                 continue
+            n_sources += 1
             base = ''
             for s in lines:
                 if _JAVA_CLASS_DECL_RE.search(s):
@@ -268,12 +287,16 @@ def _scan_routes(project_dir: str) -> Dict[str, List[Dict]]:
                     full = (base + '/' + sub.lstrip('/')) if base and not sub.startswith(base) else sub
                     norm = re.sub(r'\{[^}]+\}', '{}', full.replace('//', '/').rstrip('/'))
                     routes.setdefault(norm, []).append({'file': rel, 'line': i})
-    return routes
+    return routes, n_sources
 
 
 def _member_weak_search(symbol: str, scope: str, project_dir: str) -> List[Dict]:
-    """member 弱搜尋：在檔名含 scope 的原始碼檔中（comment-stripped）找 symbol
-    整字出現（field/方法皆可）。Class.member 的 field 案（如 Dto 欄位）由此承接。"""
+    """member 弱搜尋（嚴格收緊，codex round-3）：
+    - **只搜 `{Scope}.java`**（Java 類檔慣例；杜絕 `User` 命中 NotUserService）
+    - 只支援 Java（我們的 comment stripper 只懂 //、/* */；其他語言的註解
+      無法剝除會造成「註解文字被當存在」的 false clean → 一律不搜）
+    """
+    target_fn = f'{scope}.java'
     hits = []
     pat = re.compile(r'(?<![A-Za-z0-9_.])' + re.escape(symbol) + r'(?![A-Za-z0-9_])')
     for root, dirs, files in os.walk(project_dir):
@@ -281,8 +304,7 @@ def _member_weak_search(symbol: str, scope: str, project_dir: str) -> List[Dict]
         if _TEST_PATH_RE.search(root.replace(project_dir, '', 1)):
             continue
         for fn in files:
-            if scope not in fn or not fn.rsplit('.', 1)[-1] in (
-                    'java', 'py', 'ts', 'js', 'go', 'rs', 'kt'):
+            if fn != target_fn:
                 continue
             p = os.path.join(root, fn)
             try:
@@ -299,7 +321,7 @@ def _member_weak_search(symbol: str, scope: str, project_dir: str) -> List[Dict]
 
 
 def link_claims(claims: List[Dict], project: str, project_dir: str,
-                _maps: Dict = None, _routes: Dict = None) -> List[Dict]:
+                _maps: Dict = None, _routes=None) -> List[Dict]:
     """比對 claims。_maps/_routes 可由呼叫端預建（report 對多 doc 共用，避免重算）。
     來源不可量測（空圖譜/無 scoped id/無 Java route 檔）→ tier='unavailable'。"""
     maps = _maps if _maps is not None else _build_code_maps(project)
@@ -343,15 +365,18 @@ def link_claims(claims: List[Dict], project: str, project_dir: str,
         elif a in ('route', 'route_prefix'):
             if routes is None:
                 routes = _scan_routes(project_dir)
-            if not routes:
+            route_map, n_sources = routes
+            if n_sources == 0:
+                # 無可掃描來源（非 Java 專案）→ unmeasured；
+                # 有來源但查無 → 真缺失，可進 drift（codex round-3 新發現）
                 r.update(matched=None, tier='unavailable', locations=[])
             else:
                 norm = re.sub(r'\{[^}]+\}', '{}', c['symbol'].rstrip('/'))
                 if a == 'route':
-                    locs = routes.get(norm, [])
+                    locs = route_map.get(norm, [])
                     r.update(matched=bool(locs), tier='route_exact', locations=locs[:3])
                 else:
-                    hit = sorted(k for k in routes if k.startswith(norm))
+                    hit = sorted(k for k in route_map if k.startswith(norm))
                     r.update(matched=bool(hit), tier='route_prefix',
                              locations=[], prefix_matches=hit[:5])
         else:
@@ -433,13 +458,13 @@ def intent_drift_report(project: str, project_dir: str) -> Optional[str]:
     active_docs = [d for d in all_docs if d.get('status', 'active') == 'active']
 
     maps = _build_code_maps(project)            # 多 doc 共用（codex Major：勿重算）
-    routes_cache = _scan_routes(project_dir)    # 同上；空 dict = 無 Java route 來源
+    routes_cache = _scan_routes(project_dir)    # (routes, n_sources)；多 doc 共用
 
     all_results, extract_failed, rejected_paths = [], [], []
     residual_total = 0
     for d in active_docs:
         rel = d.get('path', '')
-        if not _safe_doc_path(rel):
+        if not _safe_doc_path(rel, project_dir):
             rejected_paths.append(rel)
             continue
         ext = extract_claims(os.path.join(project_dir, rel), rel)
