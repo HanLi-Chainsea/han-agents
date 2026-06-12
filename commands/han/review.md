@@ -8,7 +8,7 @@ description: 'HAN：帶專案脈絡的審查。吃 code 或想法/設計，對�
 
 > 與 ccg:review 的差異：ccg 是通用雙模型；`/han:review` 的價值是**專案脈絡**——對著「實際架構、相依關係、過往決策」審。不要做成多模型 fan-out。
 
-> 安全準則：**所有值（專案名、關鍵詞、檔名）一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全的字面量。
+> 安全準則：**所有值（專案名、關鍵詞、檔名）一律透過環境變數傳入 Python，Python 內讀 `os.environ`、絕不內插**。設環境變數時用**單引號**；若值含 shell 特殊字元（`$` `` ` `` `"` `'` `;` `|` `&`）先過濾或拒絕。`{{HAN_DIR}}` 由安裝程序替換為安全的字面量。
 
 ## 模式判定
 - `$ARGUMENTS` 是路徑 / 含程式碼 / 空白 → **CODE 模式**
@@ -27,7 +27,7 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 1. 取得變更檔清單：`git diff --name-only HEAD`（或使用者指定的 base / 路徑；空白就審當前工作區 diff），以及 `git diff HEAD` 看實際變更。
 2. **對每個變更檔**查節點與 1-hop 相依，評估影響半徑（檔名逐一放進 `HAN_FILE` 重複執行）：
 ```bash
-HAN_FILE="servers/foo.py" python3 - <<'PY'
+HAN_FILE='servers/foo.py' python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
 from servers.code_graph import get_code_nodes, get_code_dependencies
@@ -53,7 +53,7 @@ PY
 
 1. 撈專案脈絡與相關過往經驗（關鍵詞透過環境變數傳入）：
 ```bash
-HAN_QUERY="<取自想法的關鍵詞>" python3 - <<'PY'
+HAN_QUERY='<取自想法的關鍵詞>' python3 - <<'PY'
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
 from servers.memory import search_memory
@@ -81,10 +81,10 @@ PY
 
 2. **`--post`（明確要求才發佈；這是對外公開動作）**：報告會公開在 PR/MR，**必須使用者明確帶 `--post` 或明說「貼到 PR/MR」才執行**，先確認目標：
    - 偵測：GitHub `gh pr view --json url -q .url`；GitLab `glab mr view`
-   - 用 Write 工具把報告寫到暫存檔 `F`（例如 `docs/.review-tmp.md`），再：
+   - 先取一個不會覆蓋既有檔的暫存路徑：`F=$(mktemp --suffix=.md)`，用 Write 工具把報告寫到 `$F`，再：
      - GitHub：`gh pr comment --body-file "$F"`
      - GitLab：`glab mr note -F "$F"`（以檔案為輸入，避免命令列長度/注入）
-   - 貼完回報 comment 連結；用畢可刪暫存檔。
+   - 貼完回報 comment 連結；用畢 `rm -f "$F"` 清掉。
 
 3. **沒給旗標 → 只在對話顯示**，不自動建檔、不自動發佈。
 

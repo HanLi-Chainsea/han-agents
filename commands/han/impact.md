@@ -1,5 +1,5 @@
 ---
-description: 'HAN：影響半徑分析。改動某檔案/符號會波及哪些相依節點（單次讀取，不寫檔不派工）'
+description: 'HAN：影響半徑分析。改動某檔案/符號會波及哪些相依節點（單次讀取，不改原始碼）'
 ---
 
 # /han:impact — 改動影響半徑
@@ -21,7 +21,7 @@ export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
 export HAN_TARGET='servers/memory.py'   # ← 換成 $ARGUMENTS 解讀出的檔案或符號（單引號）
 ```
 
-2. 查目標節點與雙向相依（depth=2）。`get_code_dependencies` 回傳每筆含 `id`/`relation`/`direction`('incoming'|'outgoing')/`node_kind`/`name`：
+2. 查目標節點的相依。`get_code_dependencies` 回傳每筆含 `id`/`kind`/`name`/`relation`/`direction`/`depth`。**分開呼叫 incoming 與 outgoing**（在 `direction='both'` 下，第二階的 `direction` 是相對當下節點、非相對目標，會混淆；分開呼叫才語義正確）：
 ```bash
 python3 - <<'PY'
 import os, sys
@@ -35,16 +35,15 @@ if not nodes:
 if not nodes:
     print("（找不到目標節點，請先 /han:sync 或確認路徑/名稱）")
 for n in nodes:
-    deps = get_code_dependencies(proj, n['id'], depth=2, direction='both') or []
-    incoming = [d for d in deps if d.get('direction') == 'incoming']  # 誰依賴/呼叫我（扇入）
-    outgoing = [d for d in deps if d.get('direction') == 'outgoing']  # 我依賴誰
-    print(f"\n### {n['kind']} {n['id']}  影響半徑={len(deps)}（扇入 {len(incoming)} / 扇出 {len(outgoing)}）")
+    incoming = get_code_dependencies(proj, n['id'], depth=2, direction='incoming') or []  # 誰依賴/呼叫我（扇入）
+    outgoing = get_code_dependencies(proj, n['id'], depth=2, direction='outgoing') or []  # 我依賴誰（扇出）
+    print(f"\n### {n['kind']} {n['id']}  影響半徑={len(incoming)+len(outgoing)}（扇入 {len(incoming)} / 扇出 {len(outgoing)}）")
     print("  呼叫者/依賴我者（改動會波及）：")
     for d in incoming[:20]:
-        print(f"    - {d.get('name') or d.get('id')} ({d.get('node_kind','?')}) via {d.get('relation','?')}")
+        print(f"    - {d.get('name') or d.get('id')} ({d.get('kind','?')}) via {d.get('relation','?')} [深度 {d.get('depth')}]")
     print("  我依賴的：")
     for d in outgoing[:20]:
-        print(f"    - {d.get('name') or d.get('id')} ({d.get('node_kind','?')}) via {d.get('relation','?')}")
+        print(f"    - {d.get('name') or d.get('id')} ({d.get('kind','?')}) via {d.get('relation','?')}")
 PY
 ```
 
@@ -55,5 +54,5 @@ PY
    - 若節點數達上限（200/2000）提示結果可能不完整
 
 ## 重要
-- 單次讀取，**不寫檔、不派工、不改任何程式碼**。
+- **不改你的原始碼、不派工**；僅讀 HAN 內部圖譜（首次查詢可能初始化 han DB）。
 - 找不到目標節點時，提示先 `/han:sync` 或確認名稱/路徑。

@@ -4,7 +4,9 @@ description: 'HAN：同步 Code Graph（增量解析當前專案，更新節點/
 
 # /han:sync — 同步 Code Graph
 
-重新解析當前專案、更新 HAN 的 Code Graph（增量；只重掃變更檔）。在 `/han:impact`、`/han:drift`、寫測試前先跑可確保圖譜最新。
+重新解析當前專案、更新 HAN 的 Code Graph（增量；只重掃變更檔）。在 `/han:impact`、`/han:drift`、寫測試前先跑，讓變更檔反映到圖譜。
+
+> 註：增量同步**更新/新增**變更檔的節點，但**不會自動刪除「已刪檔」遺留的舊節點/hash**。若有大量刪檔導致圖譜殘留，需做全量重建（非本指令範圍）。
 
 ## 執行步驟
 

@@ -61,19 +61,23 @@ class TestSetupCommands:
         assert "STALE" not in content and _BASE in content
 
     def test_impact_command_uses_real_dep_fields(self):
-        """impact.md 必須用 get_code_dependencies 實際欄位（relation/direction），非錯誤的 edge_kind/to_id。"""
+        """impact.md 必須用 get_code_dependencies 實際欄位，非錯誤的 edge_kind/to_id/node_kind。"""
         content = open(os.path.join(_BASE, "commands", "han", "impact.md"), encoding="utf-8").read()
-        assert "direction" in content and "relation" in content
-        assert "edge_kind" not in content and "to_id" not in content
+        assert "relation" in content and "direction" in content
+        # 錯誤欄位名（曾用過）不得殘留；node 類型實際鍵是 'kind' 非 'node_kind'
+        assert "edge_kind" not in content
+        assert "to_id" not in content
+        assert "node_kind" not in content
 
     def test_get_code_dependencies_contract(self, sample_code_graph):
         """鎖定 get_code_dependencies 的回傳鍵，避免指令本文與 API 漂移。"""
         from servers.code_graph import get_code_dependencies
         deps = get_code_dependencies(
-            "test", "func.src/auth/login.py:authenticate", depth=1, direction="both")
-        assert deps, "expected at least one dependency edge from sample graph"
+            "test", "func.src/auth/login.py:authenticate", depth=1, direction="outgoing")
+        assert deps, "expected at least one outgoing dependency from sample graph"
         for d in deps:
-            assert {"id", "relation", "direction"}.issubset(d.keys())
+            assert {"id", "kind", "relation", "direction"}.issubset(d.keys())
+            assert d["direction"] == "outgoing"  # 單向呼叫 → direction 相對目標正確
 
     def test_unsupported_platform_returns_minus_one(self):
         from servers import platform as plat
