@@ -55,7 +55,7 @@ from servers.cli_views import recall_report
 print(recall_report(os.environ['HAN_PROJECT'], os.environ['HAN_QUERY']))
 PY
 ```
-   （如有 SSOT flows/domains，亦可用 `servers.facade.get_full_context` 取相關 flow 比對。）
+   （如專案有定義 SSOT flows/domains，可一併比對想法會動到哪些 flow。）
 2. **對著專案現實批判**這個想法：
    - 與**現有架構**衝突嗎？會動到哪些 flow / 模組？
    - 是否**違反記憶裡的某個過往決策**（撈到就點名）？

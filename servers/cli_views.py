@@ -6,8 +6,9 @@ HAN System - CLI / Slash-command Views
 這樣 API 欄位漂移會被測試擋下，而非靠人肉 review（先前 node_kind/edge_kind/
 framework 之類的低級錯誤就是因為在 prose 裡硬寫欄位）。
 
-每個函式回傳「可直接 print 的字串」。只讀；除底層查詢可能更新 HAN 內部 metadata
-（如 search_memory 的 access_count）外，不寫使用者檔案。
+每個函式回傳「可直接 print 的字串」。**不寫使用者原始碼/檔案**；但部分函式會更新
+HAN 內部 SQLite（`sync_report`/`init_report` 同步圖譜、`recall_report` 更新
+search_memory 的 access_count）——這些是 HAN 自身狀態，非使用者檔案。
 """
 
 from typing import Optional
@@ -66,23 +67,31 @@ def recall_report(project: str, query: str, limit: int = 10) -> str:
     )
 
 
-def _resolve_nodes(project: str, target: str) -> list:
-    """先當路徑找；找不到再當符號名比對。"""
+_NODE_LIMIT = 2000
+
+
+def _resolve_nodes(project: str, target: str):
+    """先當路徑找；找不到再當符號名比對。回 (nodes, truncated)。"""
     from servers.code_graph import get_code_nodes
-    nodes = get_code_nodes(project, file_path=target, limit=200)
+    nodes = get_code_nodes(project, file_path=target, limit=_NODE_LIMIT)
     if not nodes:
-        nodes = [n for n in get_code_nodes(project, limit=2000)
-                 if n.get('name') == target or target in n['id']]
-    return nodes
+        scanned = get_code_nodes(project, limit=_NODE_LIMIT)
+        nodes = [n for n in scanned if n.get('name') == target or target in n['id']]
+        truncated = len(scanned) >= _NODE_LIMIT  # 全庫掃描可能漏節點
+    else:
+        truncated = len(nodes) >= _NODE_LIMIT
+    return nodes, truncated
 
 
 def impact_report(project: str, target: str) -> str:
     """改動影響半徑：分開查 incoming(扇入)/outgoing(扇出)，方向語義相對目標正確。"""
     from servers.code_graph import get_code_dependencies
-    nodes = _resolve_nodes(project, target)
+    nodes, truncated = _resolve_nodes(project, target)
     if not nodes:
         return "（找不到目標節點，請先 /han:sync 或確認路徑/名稱）"
     out = []
+    if truncated:
+        out.append(f"（注意：節點查詢達上限 {_NODE_LIMIT}，目標解析可能不完整）")
     for n in nodes:
         inc = get_code_dependencies(project, n['id'], depth=2, direction='incoming') or []
         outg = get_code_dependencies(project, n['id'], depth=2, direction='outgoing') or []
@@ -91,13 +100,11 @@ def impact_report(project: str, target: str) -> str:
             f"（扇入 {len(inc)} / 扇出 {len(outg)}）"
         )
         out.append("  呼叫者/依賴我者（改動會波及）：")
-        out += [f"    - {d.get('name') or d['id']} ({d.get('kind', '?')}) "
-                f"via {d.get('relation', '?')} [深度 {d.get('depth')}]" for d in inc[:20]]
+        out += [f"    - {d.get('name') or d['id']} ({d['kind']}) "
+                f"via {d['relation']} [深度 {d['depth']}]" for d in inc[:20]]
         out.append("  我依賴的：")
-        out += [f"    - {d.get('name') or d['id']} ({d.get('kind', '?')}) "
-                f"via {d.get('relation', '?')}" for d in outg[:20]]
-        if len(inc) >= 200 or len(outg) >= 200:
-            out.append("  （結果可能不完整，已達上限）")
+        out += [f"    - {d.get('name') or d['id']} ({d['kind']}) "
+                f"via {d['relation']}" for d in outg[:20]]
     return "\n".join(out)
 
 
