@@ -182,6 +182,7 @@ dispatch → playbook 一定注入：
 
 | 指令 | 形狀 | 說明 |
 |------|------|------|
+| `/han:init` | 維護 | 初始化專案（偵測技術棧 + 首次同步 Code Graph）— 第一步 |
 | `/han:unit-test <範圍>` | recipe + dispatch | 找缺口、寫測試、跑過 |
 | `/han:integration-test <範圍>` | recipe + dispatch | 模組整合測試 |
 | `/han:e2e <範圍>` | recipe + dispatch | 關鍵旅程 E2E |

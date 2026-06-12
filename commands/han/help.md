@@ -32,9 +32,9 @@ PY
 ```
 
 把結果整理成清楚的清單呈現給使用者；可順帶分組：
+- **初始化/維護**：init、sync、status、help
 - **寫測試（recipe）**：unit-test、integration-test、e2e
-- **分析/讀取（單次）**：review、drift、impact、recall、status
-- **維護**：sync、help
+- **分析/讀取（單次）**：review、drift、impact、recall
 
 ## 重要
 - **不改你的原始碼、不派工**。
