@@ -605,3 +605,41 @@ public interface GoodsOrderService extends BaseOrderService {
         ext = [e for e in r.edges if e.kind == 'extends']
         assert any('BaseOrderService' in e.to_id for e in ext), \
             f'extends edge 缺失；edges={[(e.kind, e.to_id) for e in r.edges][:10]}'
+
+    def test_no_unscoped_method_leakage(self, java_interface_src):
+        """方法只能以 scoped id 存在，不得同時流出無 scope 的版本（codex Major）。"""
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        fn_ids = sorted(n.id.rsplit(':', 1)[-1] for n in r.nodes
+                        if n.kind in ('function', 'method'))
+        assert fn_ids == ['GoodsOrderService.create',
+                          'GoodsOrderService.timeOutGoodsOrder'], fn_ids
+
+    def test_interface_contains_methods(self, java_interface_src):
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        contains = [(e.from_id, e.to_id) for e in r.edges if e.kind == 'contains']
+        assert any('GoodsOrderService' in f and t.endswith('GoodsOrderService.create')
+                   for f, t in contains), contains
+
+    def test_interface_multi_extends(self):
+        src = 'public interface A extends B, C<T> { void x(); }'
+        r = self._ts_extract(src, 'A.java')
+        targets = {e.to_id for e in r.edges if e.kind == 'extends'}
+        assert any('B' in t for t in targets) and any('C' in t for t in targets), targets
+
+    def test_interface_methods_implicit_public(self, java_interface_src):
+        """Java 語意：interface 無修飾方法為隱式 public，不是 package。"""
+        r = self._ts_extract(java_interface_src, 'GoodsOrderService.java')
+        for n in r.nodes:
+            if n.kind in ('function', 'method'):
+                assert n.visibility == 'public', (n.name, n.visibility)
+
+    def test_annotation_type_is_not_interface(self):
+        """@interface 是 annotation，不得偽裝成 interface（避免假 drift / parity 破壞）。"""
+        src = 'public @interface Mark { String value(); }'
+        r = self._ts_extract(src, 'Mark.java')
+        kinds = {(n.kind, n.name) for n in r.nodes if n.name == 'Mark'}
+        assert ('annotation', 'Mark') in kinds, kinds
+        assert ('interface', 'Mark') not in kinds, kinds
+        # annotation 成員不走訪（對齊 regex backend）
+        assert not any(n.kind in ('function', 'method') for n in r.nodes), \
+            [(n.kind, n.name) for n in r.nodes]
