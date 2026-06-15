@@ -20,6 +20,15 @@ class TestLoadPlaybooks:
         assert "AAA" in ut.executor_principles or "Arrange" in ut.executor_principles
         assert "REJECT" in ut.critic_checklist
 
+    def test_unit_test_playbook_covers_null_state(self):
+        # 同事使用回饋：可為 null/None 的狀態，即使規格沒寫明也常有對應行為，
+        # 漏測等於放掉一整類迴歸。playbook 必須明確要求釘住 null 行為（executor + critic）。
+        from servers.playbooks import load_playbooks
+        pbs = load_playbooks(force_reload=True)
+        ut = pbs["unit_test"]
+        assert "null" in ut.executor_principles.lower()
+        assert "null" in ut.critic_checklist.lower()
+
 
 class TestResolvePlaybook:
     def test_unit_test_match(self):

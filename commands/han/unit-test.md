@@ -11,20 +11,24 @@ description: 'HAN：為指定範圍自動建立並執行單元測試任務（rec
 - 是模組名 / 自然語言範圍 → 先對應到路徑；對不到就用整個專案
 - 空白 → 整個專案
 
+> **安全**：`HAN_TARGET` 必須是單純的相對路徑（如 `servers/` 或 `servers/x.py`），**不得**含 shell 特殊字元或命令替換（`$( )`、反引號、`;`、`"` 等）。若使用者範圍無法化為這樣的乾淨路徑，就用整個專案（空字串 `""`）。主代理在嵌入指令前自行確保此點。
+
 ## 執行步驟
 
 > 安全準則：**所有專案/路徑/範圍值一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全的字面量。
 
-1. 設定環境變數（在同一個 Bash 呼叫裡）：
+1. 確認測試範圍（人類參考用；**Bash 工具的 shell state 不會跨呼叫保留**，所以下面每個 python 區塊都各自在自己的命令列 inline 重算這些值，不依賴此處的 export）：
 ```bash
-export HAN_PROJECT_PATH="$(pwd)"
-export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
-export HAN_TARGET="servers/"   # ← 換成解讀出的範圍路徑；整個專案則留空字串 ""
+# 僅供閱讀：每個 python 區塊會在自己的命令列上 inline 重算這些值。
+# HAN_PROJECT_PATH = $(pwd)
+# HAN_PROJECT      = $(basename "$(pwd)")
+# HAN_TARGET       = 解讀出的範圍路徑；整個專案則留空字串 ""
 ```
 
-2. 建立任務樹（值全部讀環境變數）：
+2. 建立任務樹（值全部透過 inline 環境變數讀入；勿內插）：
 ```bash
-python3 - <<'PY'
+HAN_PROJECT_PATH="$(pwd)" HAN_PROJECT="$(basename "$(pwd)")" HAN_TARGET="servers/" python3 - <<'PY'
+# HAN_TARGET：← 換成解讀出的範圍路徑；整個專案則留空字串 ""
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import run_recipe
@@ -37,9 +41,9 @@ PY
 ```
 - 若 `task_count==0`／`EPIC` 為 None → 回報訊息後**停止**（沒有缺口或沒指定範圍）。
 
-3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。把 epic_id 放進 `HAN_EPIC` 再執行：
+3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 印出的同一個 epic_id 放進 `HAN_EPIC` 前綴，並 inline 重算其餘環境變數再執行：
 ```bash
-HAN_EPIC="<epic_id>" python3 - <<'PY'
+HAN_EPIC="<epic_id>" HAN_PROJECT="$(basename "$(pwd)")" HAN_PROJECT_PATH="$(pwd)" python3 - <<'PY'
 import os, sys, json
 sys.path.insert(0, {{HAN_DIR}})
 from servers.facade import get_next_dispatch
