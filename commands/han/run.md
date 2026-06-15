@@ -11,12 +11,13 @@ description: 'HAN：通用執行器——消費任一規劃產出的任務樹（
 
 > `{{HAN_DIR}}` 由安裝程序替換為安全字面量。值一律走環境變數，勿內插。
 
-1. 設定環境變數（`HAN_EPIC` 為 `$ARGUMENTS`；空白代表自動選）：
+1. 設定環境變數（在同一個 Bash 呼叫裡）：
 ```bash
 export HAN_PROJECT_PATH="$(pwd)"
 export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
-export HAN_EPIC=""   # ← 有指定就填 epic_id；否則留空自動選最新 pending
+export HAN_EPIC="$ARGUMENTS"   # ← 有指定 epic_id 就帶；空白＝步驟 2 自動選最新 pending
 ```
+> `HAN_EPIC` 在此可能為空白（代表自動選）；**步驟 2 解析出具體 epic_id 後，步驟 3 一律改用該具體 id**（見下方交接說明），切勿讓步驟 3 在空白 `HAN_EPIC` 下執行。
 
 2. 解析要執行的 epic：
 ```bash
@@ -37,9 +38,11 @@ print('RESOLVED_EPIC', eid)
 PY
 ```
 - 輸出 `NO_PENDING_EPIC` → 回報「找不到可執行的 epic，請先 `/han:refactor` 或指定 epic_id」並**停止**。
-- 否則記下 `RESOLVED_EPIC` 後面的 epic_id。
+- 否則記下 `RESOLVED_EPIC` 後面印出的 epic_id。
 
-3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。把 epic_id 放進 `HAN_EPIC` 再執行：
+> **交接（步驟 2 → 步驟 3）**：把 `RESOLVED_EPIC` 後面印出的那個具體 epic_id，填入步驟 3 的 `HAN_EPIC="<resolved_epic_id>"` 前綴。派工迴圈會跑很多輪（每個任務一輪），**每一輪都用同一個 epic_id**——直到迴圈結束都別換、別省略。**絕對不要在 `HAN_EPIC` 為空白的情況下執行步驟 3**（空白 epic 會讓 `get_next_dispatch` 直接回 `action='done'`，整個迴圈零工作量靜默結束）。
+
+3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 解析出的同一個 epic_id 放進 `HAN_EPIC` 前綴再執行：
 ```bash
 HAN_EPIC="<resolved_epic_id>" python3 - <<'PY'
 import os, sys, json
