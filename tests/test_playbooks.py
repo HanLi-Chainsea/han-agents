@@ -165,6 +165,15 @@ class TestPromptInjection:
         prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
         assert "null" in prompt.lower()
 
+    def test_unit_test_critic_prompt_injects_null_rule(self):
+        # 對稱：null 的 REJECT 規則也必須進到注入給 critic 的 prompt
+        from servers.facade import _build_critic_prompt
+        critic_task = {"id": "c3", "original_task_id": "t3",
+                       "original_description": "Write unit tests for servers/memory.py",
+                       "result": "done"}
+        prompt = _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+        assert "null" in prompt.lower()
+
 
 class TestUnitTestCommandEnvInlining:
     """回歸防護：/han:unit-test 指令的 env 必須 inline，不能靠不跨呼叫保留的獨立 export。"""
@@ -182,9 +191,21 @@ class TestUnitTestCommandEnvInlining:
 
     def test_every_python_block_inlines_project_env(self):
         # 每個 `python3 - <<'PY'` 區塊都呼叫 os.environ['HAN_PROJECT'/'HAN_PROJECT_PATH']，
-        # 故其啟動行必須 inline 帶上這兩個值（shell state 不跨 Bash 呼叫保留）。
+        # 故其啟動行必須在 `python3` 之前 inline 帶上這兩個值（shell state 不跨 Bash 呼叫保留）。
+        # 只看 `python3` 前綴，避免被後方註解或字串誤綠。
+        import re
         starts = [ln for ln in self._command_text().splitlines() if "python3 - <<'PY'" in ln]
         assert len(starts) >= 2, "預期至少兩個 python heredoc 區塊"
         for ln in starts:
-            assert "HAN_PROJECT=" in ln, f"區塊未 inline HAN_PROJECT：{ln}"
-            assert "HAN_PROJECT_PATH=" in ln, f"區塊未 inline HAN_PROJECT_PATH：{ln}"
+            prefix = ln.split("python3", 1)[0]
+            assert re.search(r"\bHAN_PROJECT=", prefix), f"區塊未在 python3 前 inline HAN_PROJECT：{ln}"
+            assert re.search(r"\bHAN_PROJECT_PATH=", prefix), f"區塊未在 python3 前 inline HAN_PROJECT_PATH：{ln}"
+
+    def test_user_derived_target_is_single_quoted(self):
+        # HAN_TARGET 是唯一來自使用者輸入、會進 shell 的值；必須以單引號包住，shell 不展開（防注入）。
+        import re
+        target_lines = [ln for ln in self._command_text().splitlines()
+                        if "HAN_TARGET=" in ln and "python3" in ln]
+        assert target_lines, "找不到帶 HAN_TARGET 的 python 啟動行"
+        for ln in target_lines:
+            assert re.search(r"HAN_TARGET='[^']*'", ln), f"HAN_TARGET 未以單引號包住：{ln}"
