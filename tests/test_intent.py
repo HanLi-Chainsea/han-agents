@@ -702,3 +702,5 @@ class TestStatusIntentAware:
         out = self._qs(tmp_path)
         assert '無法使用' in out or '無法解析' in out
         assert not out.startswith('Error:')
+        # 壞 manifest ≠ 未配置：不得同時叫使用者「去放一個 manifest」
+        assert '未配置' not in out

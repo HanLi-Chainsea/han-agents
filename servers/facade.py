@@ -302,6 +302,11 @@ def status(project_path: str = None, project_name: str = None) -> Dict:
                 'node_kinds': int,
                 'edge_kinds': int
             },
+            'intent': {                       # doc-grounded 意圖層（v1）
+                'has_manifest': bool,
+                'active_docs': int,
+                'total_docs': int
+            },
             'health': 'ok' | 'warning' | 'error',
             'messages': List[str]
         }
@@ -354,6 +359,7 @@ def status(project_path: str = None, project_name: str = None) -> Dict:
             pass
     # Intent Layer（doc-grounded，v1）：manifest 即意圖註冊表，取代 skill 生成
     intent_info = {'has_manifest': False, 'active_docs': 0, 'total_docs': 0}
+    manifest_broken = False  # manifest 存在但壞掉 ≠ 未配置：別誤報「未配置」
     if project_path:
         try:
             from servers.intent import load_manifest
@@ -367,9 +373,10 @@ def status(project_path: str = None, project_name: str = None) -> Dict:
                                        if d.get('status', 'active') == 'active'),
                 }
         except Exception as e:
+            manifest_broken = True
             messages.append(f"intent-manifest.json 無法使用：{e}")
 
-    if not skill_dir and not intent_info['has_manifest']:
+    if not skill_dir and not intent_info['has_manifest'] and not manifest_broken:
         messages.append(
             "意圖層未配置（選用）：在專案根放 intent-manifest.json 註冊 PRD/SA/SD "
             "即可啟用 doc-grounded drift（/han:drift）；不需生成 Project Skill")
