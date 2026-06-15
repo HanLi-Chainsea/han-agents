@@ -431,6 +431,16 @@ def recipe_e2e_tests(
 LONG_METHOD_LINES = 40
 HIGH_FANOUT = 8
 
+# 高把握重構型錄（與 reference/playbooks/refactor.md 一致）；只有這些型別可建成可執行任務
+HIGH_CONFIDENCE_REFACTORS = {
+    'Extract Method', 'Extract Function',
+    'Extract Variable', 'Introduce Variable',
+    'Inline Variable', 'Inline Method',
+    'Rename', 'Decompose Conditional',
+    'Replace Magic Number', 'Replace Magic Number with Constant',
+    'Replace Magic String with Constant',
+}
+
 
 def _call_fanout(project: str) -> Dict[str, int]:
     """回傳每個來源節點的 'calls' 出邊數（一次 group-by 查詢）。"""
@@ -517,6 +527,8 @@ def scan_refactor_candidates(
 
     分類（高/低把握）由指令層主代理依 refactor playbook 型錄進行。
     """
+    if max_candidates < 1:
+        max_candidates = 1
     _ensure_synced(project_name, project_path)
     hotspots = _detect_hotspots(project_name, target_path)
     truncated = len(hotspots) > max_candidates
@@ -548,41 +560,63 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
 
     items: 每項 {file_path, name, refactor_type, line_start, line_end}
     每項 -> 1 story + 3 相依 task：characterization-test -> refactor -> verify。
-    items 為空 -> 不建 epic。
+    只接受 refactor_type ∈ HIGH_CONFIDENCE_REFACTORS 且含 file_path/name 的項；
+    其餘列入 rejected、不建任務。無有效項 -> 不建 epic。
+    回傳 {'epic_id', 'story_count', 'task_count', 'rejected'}。
     """
     from servers.tasks import create_task, create_subtask
 
-    if not items:
-        return {'epic_id': None, 'story_count': 0, 'task_count': 0}
+    valid: List[Dict] = []
+    rejected: List[Dict] = []
+    for it in items or []:
+        fp = (it.get('file_path') or '').strip()
+        sym = (it.get('name') or '').strip()
+        rtype = (it.get('refactor_type') or '').strip()
+        if not fp or not sym:
+            rejected.append({'item': it, 'reason': 'missing file_path or name'})
+            continue
+        if rtype not in HIGH_CONFIDENCE_REFACTORS:
+            rejected.append({'item': it,
+                             'reason': f'refactor_type not in high-confidence catalog: {rtype!r}'})
+            continue
+        valid.append(it)
+
+    if not valid:
+        return {'epic_id': None, 'story_count': 0, 'task_count': 0, 'rejected': rejected}
 
     epic_id = create_task(
         project=project_name,
-        description=f"Refactor for Testability: {len(items)} units",
+        description=f"Refactor for Testability: {len(valid)} units",
         priority=7, task_level='epic')
 
     task_count = 0
-    for it in items:
-        sym = it.get('name', '?')
-        fp = it.get('file_path', '?')
-        rtype = it.get('refactor_type', 'Extract Method')
+    for it in valid:
+        sym = it['name'].strip()
+        fp = it['file_path'].strip()
+        rtype = it['refactor_type'].strip()
+        ls = it.get('line_start')
+        le = it.get('line_end')
+        loc = fp
+        if isinstance(ls, int) and isinstance(le, int) and ls > 0 and le >= ls:
+            loc = f"{fp} (lines {ls}-{le})"
 
         story_id = create_task(
             project=project_name,
-            description=f"Refactor for testability: {sym} in {fp}",
+            description=f"Refactor for testability: {sym} in {loc}",
             task_level='story', epic_id=epic_id, priority=7)
 
         t1 = create_subtask(
             parent_id=story_id,
             description=(
                 f"Write characterization tests pinning current behavior of "
-                f"{sym} in {fp} (refactor-for-testability safety net). "
+                f"{sym} in {loc} (refactor-for-testability safety net). "
                 f"Do not judge correctness; pin every branch's current behavior."),
             assigned_agent='executor', requires_validation=True,
             task_level='task', epic_id=epic_id, story_id=story_id)
         t2 = create_subtask(
             parent_id=story_id,
             description=(
-                f"Refactor for testability: apply {rtype} to {sym} in {fp}. "
+                f"Refactor for testability: apply {rtype} to {sym} in {loc}. "
                 f"Behavior-preserving, mechanical."),
             assigned_agent='executor', depends_on=[t1],
             requires_validation=True,
@@ -590,15 +624,15 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
         create_subtask(
             parent_id=story_id,
             description=(
-                f"Verify refactor of {sym} in {fp}: rerun characterization "
+                f"Verify refactor of {sym} in {loc}: rerun characterization "
                 f"tests, must stay green."),
             assigned_agent='executor', depends_on=[t2],
             requires_validation=True,
             task_level='task', epic_id=epic_id, story_id=story_id)
         task_count += 3
 
-    return {'epic_id': epic_id, 'story_count': len(items),
-            'task_count': task_count}
+    return {'epic_id': epic_id, 'story_count': len(valid),
+            'task_count': task_count, 'rejected': rejected}
 
 
 # Recipe registry

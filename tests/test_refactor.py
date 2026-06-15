@@ -90,6 +90,20 @@ class TestScanRefactorCandidates:
         assert r["candidates"] == []
         assert r["truncated"] is False
 
+    def test_max_candidates_clamped(self, mock_db_path, monkeypatch, tmp_path):
+        from servers import recipes
+        monkeypatch.setattr(recipes, "_ensure_synced",
+                            lambda p, path: {"test_tool": "pytest"})
+        funcs = [(f"f.{i}", f"fn{i}", "servers/c.py", 1, 100)
+                 for i in range(5)]
+        _seed_code(mock_db_path, "rf6", funcs)
+        # max_candidates=0 must clamp to 1, not misreport "no hotspots"
+        r = recipes.scan_refactor_candidates(
+            "rf6", str(tmp_path), target_path="servers/", max_candidates=0)
+        assert len(r["candidates"]) == 1
+        assert r["total_hotspots"] == 5
+        assert r["truncated"] is True
+
 
 class TestBuildRefactorEpic:
     def test_builds_three_step_dependency_chain(self, mock_db_path):
@@ -132,6 +146,39 @@ class TestBuildRefactorEpic:
         assert r["epic_id"] is None
         assert r["task_count"] == 0
 
+    def test_rejects_low_confidence_type(self, mock_db_path):
+        from servers import recipes
+        r = recipes.build_refactor_epic("rfbX", [{
+            "file_path": "servers/x.py", "name": "foo",
+            "refactor_type": "Introduce Interface",
+            "line_start": 1, "line_end": 80}])
+        assert r["epic_id"] is None
+        assert r["task_count"] == 0
+        assert len(r["rejected"]) == 1
+
+    def test_rejects_missing_fields(self, mock_db_path):
+        from servers import recipes
+        r = recipes.build_refactor_epic("rfbM", [{
+            "file_path": "servers/x.py",
+            "refactor_type": "Extract Method",
+            "line_start": 1, "line_end": 80}])  # missing name
+        assert r["epic_id"] is None
+        assert r["task_count"] == 0
+        assert len(r["rejected"]) == 1
+
+    def test_line_numbers_in_description(self, mock_db_path):
+        from servers import recipes
+        import sqlite3, os
+        recipes.build_refactor_epic("rfbL", [{
+            "file_path": "servers/x.py", "name": "foo",
+            "refactor_type": "Extract Method",
+            "line_start": 1, "line_end": 80}])
+        conn = sqlite3.connect(os.environ["HAN_DB_PATH"])
+        descs = [row[0] for row in conn.execute(
+            "SELECT description FROM tasks WHERE project='rfbL'").fetchall()]
+        conn.close()
+        assert any("lines 1-80" in d for d in descs)
+
     def test_task_descriptions_match_refactor_playbook(self, mock_db_path):
         from servers import recipes
         from servers.playbooks import resolve_playbook
@@ -159,7 +206,10 @@ class TestFindLatestPendingEpic:
                          priority=7, task_level="epic")
         e2 = create_task(project="rfe", description="Unit Test Coverage: ...",
                          priority=7, task_level="epic")
-        # e1 set to done -> should return the latest pending, e2
+        # e2 is the expected one: give it a pending child task so it has undone work
+        create_task(project="rfe", description="t",
+                    priority=7, task_level="task", epic_id=e2)
+        # e1 set to done -> should return the latest pending with work, e2
         update_task_status(e1, "done")
         got = find_latest_pending_epic("rfe")
         assert got is not None and got["id"] == e2
@@ -174,10 +224,36 @@ class TestFindLatestPendingEpic:
     def test_latest_among_multiple_pending(self, mock_db_path):
         from servers.tasks import create_task
         from servers.facade import find_latest_pending_epic
-        create_task(project="rfe3", description="epic one",
-                    priority=7, task_level="epic")
+        e1 = create_task(project="rfe3", description="epic one",
+                         priority=7, task_level="epic")
         e2 = create_task(project="rfe3", description="epic two",
                          priority=7, task_level="epic")
-        # both pending; the later-created epic must win even on same-second created_at
+        # both pending and each has a pending child task; the later-created epic
+        # (e2) must win even on same-second created_at
+        create_task(project="rfe3", description="t1",
+                    priority=7, task_level="task", epic_id=e1)
+        create_task(project="rfe3", description="t2",
+                    priority=7, task_level="task", epic_id=e2)
         got = find_latest_pending_epic("rfe3")
         assert got is not None and got["id"] == e2
+
+    def test_skips_epic_whose_tasks_all_done(self, mock_db_path):
+        from servers.tasks import create_task, update_task_status
+        from servers.facade import find_latest_pending_epic
+        # e_done: a pending epic whose only child task is done -> must be skipped
+        e_done = create_task(project="rfe4", description="completed epic",
+                             priority=7, task_level="epic")
+        t_done = create_task(project="rfe4", description="done task",
+                             priority=7, task_level="task", epic_id=e_done)
+        update_task_status(t_done, "done")
+        # if it were the only epic, result must be None (regression for re-select bug)
+        assert find_latest_pending_epic("rfe4") is None
+
+        # now add a genuinely pending epic with undone work -> THAT one must win,
+        # proving the all-done epic no longer shadows it
+        e_real = create_task(project="rfe4", description="real pending epic",
+                             priority=7, task_level="epic")
+        create_task(project="rfe4", description="pending task",
+                    priority=7, task_level="task", epic_id=e_real)
+        got = find_latest_pending_epic("rfe4")
+        assert got is not None and got["id"] == e_real

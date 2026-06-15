@@ -2132,13 +2132,29 @@ def _extract_class_name(description: str) -> Optional[str]:
 
 
 def find_latest_pending_epic(project_name: str) -> Optional[Dict]:
-    """回傳該專案最新（created_at DESC）狀態為 pending 的 epic，無則 None。
+    """回傳該專案最新、且仍有未完成任務的 pending epic；無則 None。
 
     供 /han:run 在未指定 epic_id 時選預設 epic。通用：不限 refactor。
-    回傳 {'id', 'description', 'status', ...}（get_epic_tasks 的 epic dict）。
+    只選「還有 status != 'done' 的子任務」的 epic，避免重複選中已全部完成
+    （但 epic row 仍停在 pending）的 epic，而 shadow 較舊但仍可執行的 epic。
+    回傳 {'id', 'description', 'status'} 或 None。
     """
-    from servers.tasks import get_epic_tasks
-    for epic in get_epic_tasks(project_name):  # 已 ORDER BY created_at DESC
-        if epic.get('status') == 'pending':
-            return epic
-    return None
+    from servers import managed_connection
+    with managed_connection() as db:
+        cur = db.cursor()
+        cur.execute('''
+            SELECT e.id, e.description, e.status
+            FROM tasks e
+            WHERE e.project = ? AND e.task_level = 'epic' AND e.status = 'pending'
+              AND EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.epic_id = e.id AND t.task_level = 'task'
+                    AND t.status != 'done'
+              )
+            ORDER BY e.created_at DESC, e.rowid DESC
+            LIMIT 1
+        ''', (project_name,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {'id': row[0], 'description': row[1], 'status': row[2]}

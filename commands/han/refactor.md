@@ -17,16 +17,18 @@ description: 'HAN：分析可測試性熱點並產出重構規劃（高把握→
 
 > 安全準則：**所有專案/路徑/範圍值一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全字面量。
 
-1. 設定環境變數：
+1. 確認目標範圍（人類參考用；**Bash 工具的 shell state 不會跨呼叫保留**，下面每個 python 區塊都各自 inline 重算這些值，不依賴此處的 export）：
 ```bash
-export HAN_PROJECT_PATH="$(pwd)"
-export HAN_PROJECT="$(basename "$HAN_PROJECT_PATH")"
-export HAN_TARGET="servers/"   # ← 換成解讀出的範圍路徑；整個專案則留空字串 ""
+# 僅供閱讀：每個 python 區塊會在自己的命令列上 inline 重算這些值。
+# HAN_PROJECT_PATH = $(pwd)
+# HAN_PROJECT      = $(basename "$(pwd)")
+# HAN_TARGET       = 解讀出的範圍路徑；整個專案則留空字串 ""
 ```
 
 2. 掃描候選（不建 epic、不改碼）：
 ```bash
-python3 - <<'PY'
+HAN_PROJECT_PATH="$(pwd)" HAN_PROJECT="$(basename "$(pwd)")" HAN_TARGET="servers/" python3 - <<'PY'
+# HAN_TARGET：← 換成解讀出的範圍路徑；整個專案則留空字串 ""
 import os, sys, json
 sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import scan_refactor_candidates
@@ -50,21 +52,24 @@ PY
 
 4. 建可執行任務樹（只放高把握；值用環境變數/檔案傳，勿內插）：先選一個**唯一**字面暫存路徑（避免競態/覆寫，例如用 `$RANDOM` 或時間戳），把 `high` 清單寫進該暫存 JSON，**後續讀檔用同一條路徑**——
 ```bash
-export HAN_HIGH_JSON="/tmp/han_refactor_high-$RANDOM.json"   # ← 唯一路徑；寫與讀共用
+# 用 mktemp 取唯一暫存檔（避免低熵 $RANDOM 與 symlink 競態）；寫、讀、清理都在同一個 Bash 區塊
+HAN_HIGH_JSON="$(mktemp "${TMPDIR:-/tmp}/han_refactor_high.XXXXXX")"
 cat > "$HAN_HIGH_JSON" <<'JSON'
 [
   {"file_path": "servers/x.py", "name": "foo", "refactor_type": "Extract Method", "line_start": 1, "line_end": 80}
 ]
 JSON
 # ↑ 上面是格式範例；換成你判定出的真正「高把握」清單（每項 {file_path, name, refactor_type, line_start, line_end}）。
-python3 - <<'PY'
+HAN_PROJECT="$(basename "$(pwd)")" HAN_HIGH_JSON="$HAN_HIGH_JSON" python3 - <<'PY'
 import os, sys, json
 sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import build_refactor_epic
 items = json.load(open(os.environ['HAN_HIGH_JSON'], encoding='utf-8'))
 r = build_refactor_epic(os.environ['HAN_PROJECT'], items)
-print('EPIC', r.get('epic_id'), 'stories', r.get('story_count'), 'tasks', r.get('task_count'))
+print('EPIC', r.get('epic_id'), 'stories', r.get('story_count'),
+      'tasks', r.get('task_count'), 'rejected', len(r.get('rejected', [])))
 PY
+rm -f "$HAN_HIGH_JSON"
 ```
 - `high` 為空 → 不建 epic（`EPIC None`）。
 
@@ -72,6 +77,7 @@ PY
    - 標頭：target、掃描熱點數、是否截斷、`epic_id`。
    - 區段 A「已排入計畫（高把握）」：逐項列 檔案/方法、重構型錄項、三步任務。
    - 區段 B「建議／需人工決定（沒把握）」：逐項列 位置、型錄項、**判定為沒把握的理由**。
+     - 若步驟 4 的 `build_refactor_epic` 回報 `rejected > 0`，把那些被退回的項（位置 + 理由）也列在此區段。
 
 6. 收尾回報：`epic_id`、報告路徑、高把握任務數、沒把握建議數。提示「要執行請跑 `/han:run <epic_id>`」。
 
