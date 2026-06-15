@@ -543,6 +543,64 @@ def scan_refactor_candidates(
     }
 
 
+def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
+    """為高把握重構項建任務樹。
+
+    items: 每項 {file_path, name, refactor_type, line_start, line_end}
+    每項 -> 1 story + 3 相依 task：characterization-test -> refactor -> verify。
+    items 為空 -> 不建 epic。
+    """
+    from servers.tasks import create_task, create_subtask
+
+    if not items:
+        return {'epic_id': None, 'story_count': 0, 'task_count': 0}
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Refactor for Testability: {len(items)} units",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    for it in items:
+        sym = it.get('name', '?')
+        fp = it.get('file_path', '?')
+        rtype = it.get('refactor_type', 'Extract Method')
+
+        story_id = create_task(
+            project=project_name,
+            description=f"Refactor for testability: {sym} in {fp}",
+            task_level='story', epic_id=epic_id, priority=7)
+
+        t1 = create_subtask(
+            parent_id=story_id,
+            description=(
+                f"Write characterization tests pinning current behavior of "
+                f"{sym} in {fp} (refactor-for-testability safety net). "
+                f"Do not judge correctness; pin every branch's current behavior."),
+            assigned_agent='executor', requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        t2 = create_subtask(
+            parent_id=story_id,
+            description=(
+                f"Refactor for testability: apply {rtype} to {sym} in {fp}. "
+                f"Behavior-preserving, mechanical."),
+            assigned_agent='executor', depends_on=[t1],
+            requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        create_subtask(
+            parent_id=story_id,
+            description=(
+                f"Verify refactor of {sym} in {fp}: rerun characterization "
+                f"tests, must stay green."),
+            assigned_agent='executor', depends_on=[t2],
+            requires_validation=True,
+            task_level='task', epic_id=epic_id, story_id=story_id)
+        task_count += 3
+
+    return {'epic_id': epic_id, 'story_count': len(items),
+            'task_count': task_count}
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,

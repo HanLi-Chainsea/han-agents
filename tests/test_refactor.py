@@ -89,3 +89,63 @@ class TestScanRefactorCandidates:
             "rf5", str(tmp_path), target_path="servers/")
         assert r["candidates"] == []
         assert r["truncated"] is False
+
+
+class TestBuildRefactorEpic:
+    def test_builds_three_step_dependency_chain(self, mock_db_path):
+        from servers import recipes
+        from servers.tasks import get_next_task, update_task_status
+        items = [{
+            "file_path": "servers/x.py", "name": "foo",
+            "refactor_type": "Extract Method",
+            "line_start": 1, "line_end": 80,
+        }]
+        r = recipes.build_refactor_epic("rfb", items)
+        assert r["epic_id"] is not None
+        assert r["story_count"] == 1
+        assert r["task_count"] == 3
+
+        # story is a child of the epic
+        import sqlite3, os
+        conn = sqlite3.connect(os.environ["HAN_DB_PATH"])
+        story_id = conn.execute(
+            "SELECT id FROM tasks WHERE epic_id=? AND task_level='story'",
+            (r["epic_id"],)).fetchone()[0]
+        conn.close()
+
+        # dependency ordering: first dispatchable task = characterization (no unmet deps)
+        t1 = get_next_task(story_id)
+        assert "characterization" in t1["description"].lower()
+        # before t1 done, refactor/verify must NOT be selected
+        update_task_status(t1["id"], "done")
+        t2 = get_next_task(story_id)
+        assert t2["description"].lower().startswith("refactor for testability")
+        update_task_status(t2["id"], "done")
+        t3 = get_next_task(story_id)
+        assert "verify refactor" in t3["description"].lower()
+        update_task_status(t3["id"], "done")
+        assert get_next_task(story_id) is None
+
+    def test_empty_items_no_epic(self, mock_db_path):
+        from servers import recipes
+        r = recipes.build_refactor_epic("rfb2", [])
+        assert r["epic_id"] is None
+        assert r["task_count"] == 0
+
+    def test_task_descriptions_match_refactor_playbook(self, mock_db_path):
+        from servers import recipes
+        from servers.playbooks import resolve_playbook
+        import sqlite3, os
+        recipes.build_refactor_epic("rfb3", [{
+            "file_path": "servers/y.py", "name": "bar",
+            "refactor_type": "Decompose Conditional",
+            "line_start": 1, "line_end": 60}])
+        conn = sqlite3.connect(os.environ["HAN_DB_PATH"])
+        descs = [row[0] for row in conn.execute(
+            "SELECT description FROM tasks WHERE project='rfb3' "
+            "AND task_level='task'").fetchall()]
+        conn.close()
+        assert len(descs) == 3
+        for d in descs:
+            pb = resolve_playbook(d)
+            assert pb is not None and pb.name == "refactor", d
