@@ -2129,3 +2129,16 @@ def _extract_class_name(description: str) -> Optional[str]:
     if match:
         return match.group(1)
     return None
+
+
+def find_latest_pending_epic(project_name: str) -> Optional[Dict]:
+    """回傳該專案最新（created_at DESC）狀態為 pending 的 epic，無則 None。
+
+    供 /han:run 在未指定 epic_id 時選預設 epic。通用：不限 refactor。
+    回傳 {'id', 'description', 'status', ...}（get_epic_tasks 的 epic dict）。
+    """
+    from servers.tasks import get_epic_tasks
+    for epic in get_epic_tasks(project_name):  # 已 ORDER BY created_at DESC
+        if epic.get('status') == 'pending':
+            return epic
+    return None

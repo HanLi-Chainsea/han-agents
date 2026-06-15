@@ -149,3 +149,24 @@ class TestBuildRefactorEpic:
         for d in descs:
             pb = resolve_playbook(d)
             assert pb is not None and pb.name == "refactor", d
+
+
+class TestFindLatestPendingEpic:
+    def test_returns_latest_pending(self, mock_db_path):
+        from servers.tasks import create_task, update_task_status
+        from servers.facade import find_latest_pending_epic
+        e1 = create_task(project="rfe", description="Refactor for Testability: 1 units",
+                         priority=7, task_level="epic")
+        e2 = create_task(project="rfe", description="Unit Test Coverage: ...",
+                         priority=7, task_level="epic")
+        # e1 set to done -> should return the latest pending, e2
+        update_task_status(e1, "done")
+        got = find_latest_pending_epic("rfe")
+        assert got is not None and got["id"] == e2
+
+    def test_none_when_no_pending(self, mock_db_path):
+        from servers.tasks import create_task, update_task_status
+        from servers.facade import find_latest_pending_epic
+        e = create_task(project="rfe2", description="X", priority=7, task_level="epic")
+        update_task_status(e, "done")
+        assert find_latest_pending_epic("rfe2") is None
