@@ -22,12 +22,19 @@ class TestLoadPlaybooks:
 
     def test_unit_test_playbook_covers_null_state(self):
         # 同事使用回饋：可為 null/None 的狀態，即使規格沒寫明也常有對應行為，
-        # 漏測等於放掉一整類迴歸。playbook 必須明確要求釘住 null 行為（executor + critic）。
+        # 漏測等於放掉一整類迴歸。playbook 必須明確「要求釘住」null 行為（executor + critic）。
+        # 斷言語意而非僅字串出現，避免「不用測 null」之類反向文字誤綠。
         from servers.playbooks import load_playbooks
         pbs = load_playbooks(force_reload=True)
         ut = pbs["unit_test"]
-        assert "null" in ut.executor_principles.lower()
-        assert "null" in ut.critic_checklist.lower()
+        exec_null = [ln for ln in ut.executor_principles.splitlines() if "null" in ln.lower()]
+        assert exec_null, "executor principles 未提及 null"
+        # 必須是「要求釘住 null 行為」的正向指示
+        assert any("釘住" in ln for ln in exec_null)
+        critic_null = [ln for ln in ut.critic_checklist.splitlines() if "null" in ln.lower()]
+        assert critic_null, "critic checklist 未提及 null"
+        # critic 的 null 規則必須帶 REJECT 後果，否則形同無效
+        assert any("REJECT" in ln for ln in critic_null)
 
 
 class TestResolvePlaybook:
@@ -149,3 +156,35 @@ class TestPromptInjection:
         prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
         assert "FIRST" not in prompt
         assert "Beyoncé" not in prompt
+
+    def test_unit_test_executor_prompt_injects_null_principle(self):
+        # null 原則必須真的進到注入給 executor 的 prompt，不只是躺在 playbook 檔裡
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t3", "description": "Write unit tests for servers/memory.py",
+                "assigned_agent": "executor"}
+        prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
+        assert "null" in prompt.lower()
+
+
+class TestUnitTestCommandEnvInlining:
+    """回歸防護：/han:unit-test 指令的 env 必須 inline，不能靠不跨呼叫保留的獨立 export。"""
+
+    def _command_text(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(os.path.dirname(here), "commands", "han", "unit-test.md")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_no_standalone_export_of_han_vars(self):
+        import re
+        for ln in self._command_text().splitlines():
+            assert not re.match(r"\s*export\s+HAN_", ln), f"殘留無效的獨立 export：{ln}"
+
+    def test_every_python_block_inlines_project_env(self):
+        # 每個 `python3 - <<'PY'` 區塊都呼叫 os.environ['HAN_PROJECT'/'HAN_PROJECT_PATH']，
+        # 故其啟動行必須 inline 帶上這兩個值（shell state 不跨 Bash 呼叫保留）。
+        starts = [ln for ln in self._command_text().splitlines() if "python3 - <<'PY'" in ln]
+        assert len(starts) >= 2, "預期至少兩個 python heredoc 區塊"
+        for ln in starts:
+            assert "HAN_PROJECT=" in ln, f"區塊未 inline HAN_PROJECT：{ln}"
+            assert "HAN_PROJECT_PATH=" in ln, f"區塊未 inline HAN_PROJECT_PATH：{ln}"

@@ -11,7 +11,10 @@ description: 'HAN：為指定範圍自動建立並執行單元測試任務（rec
 - 是模組名 / 自然語言範圍 → 先對應到路徑；對不到就用整個專案
 - 空白 → 整個專案
 
-> **安全**：`HAN_TARGET` 必須是單純的相對路徑（如 `servers/` 或 `servers/x.py`），**不得**含 shell 特殊字元或命令替換（`$( )`、反引號、`;`、`"` 等）。若使用者範圍無法化為這樣的乾淨路徑，就用整個專案（空字串 `""`）。主代理在嵌入指令前自行確保此點。
+> **安全（HAN_TARGET 是唯一來自使用者、可能被注入的值）**：主代理在嵌入指令前必須確保它**完全符合** allowlist `^[A-Za-z0-9._/-]+$`（單純相對路徑），且**不得**含 `..` 路徑段、空白、或任何 shell 特殊字元（`$ \` ; " ' ( ) & | < >`）。無法化為這樣的乾淨路徑 → 改用整個專案（空字串）。
+> **嵌入時一律用單引號包住此值**（`HAN_TARGET='servers/'`），讓 shell 不對它做任何展開；只有 `$(pwd)`、`$(basename ...)` 這類受信任值才用雙引號。
+>   - Good：`HAN_TARGET='servers/utils/'`、`HAN_TARGET=''`（整個專案）
+>   - Bad：`HAN_TARGET="$(rm -rf x)"`、含 `..`、絕對路徑、含空白或引號
 
 ## 執行步驟
 
@@ -22,13 +25,13 @@ description: 'HAN：為指定範圍自動建立並執行單元測試任務（rec
 # 僅供閱讀：每個 python 區塊會在自己的命令列上 inline 重算這些值。
 # HAN_PROJECT_PATH = $(pwd)
 # HAN_PROJECT      = $(basename "$(pwd)")
-# HAN_TARGET       = 解讀出的範圍路徑；整個專案則留空字串 ""
+# HAN_TARGET       = 解讀出的乾淨範圍路徑（單引號包住）；整個專案則留空字串 ''
 ```
 
 2. 建立任務樹（值全部透過 inline 環境變數讀入；勿內插）：
 ```bash
-HAN_PROJECT_PATH="$(pwd)" HAN_PROJECT="$(basename "$(pwd)")" HAN_TARGET="servers/" python3 - <<'PY'
-# HAN_TARGET：← 換成解讀出的範圍路徑；整個專案則留空字串 ""
+HAN_PROJECT_PATH="$(pwd)" HAN_PROJECT="$(basename "$(pwd)")" HAN_TARGET='servers/' python3 - <<'PY'
+# HAN_TARGET：← 換成解讀出的乾淨範圍路徑（單引號包住、符合 allowlist）；整個專案則留空字串 ''
 import os, sys
 sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import run_recipe
