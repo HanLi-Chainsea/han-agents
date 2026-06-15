@@ -12,6 +12,7 @@ match: ["e2e", "end-to-end", "端對端", "端到端", "e2e test", "端對端測
 - 外部第三方服務以 stub/mock 取得決定性結果；專案內部堆疊用真實（接近正式）環境
 - 清理副作用：測試後還原資料/狀態，確保可重複執行（Repeatable）
 - 寫完必須實際執行並回報 pass/fail 與指令；失敗時保留 screenshot/trace 以便除錯
+- **建置環境護欄（JDK / Gradle / 依賴 / CI）**：遇到相關問題時——(1) 優先非侵入式處理（補測試依賴、用既有版本、stub/mock）；(2) 若需改 root `build.gradle`/`build.gradle.kts`/`gradle.properties`/`settings.gradle`，**必須停止並標記人工確認**；(3) **不得為了測試通過而改變專案目標 JDK 版本**。原因：上雲版本固定，改版本會讓「上雲能不能跑」變未知數——寧可回報受阻也不動版本。
 
 ## Critic Checklist
 - [ ] 是否真的端到端跨越堆疊（UI→後端→DB），而非偽裝成 E2E 的整合/單元測試
@@ -20,3 +21,4 @@ match: ["e2e", "end-to-end", "端對端", "端到端", "e2e test", "端對端測
 - [ ] 測試是否獨立、自備狀態、清理副作用、可重複
 - [ ] 是否避免固定 sleep，改用自動等待 / web-first assertion
 - [ ] 是否實際被執行且通過（附輸出，否則 REJECT）
+- [ ] **未擅自改 build.gradle/gradle.properties/settings.gradle，且未為通過而變更目標 JDK 版本**（違反即 REJECT，破壞上雲版本一致性）

@@ -11,6 +11,11 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
 - 一個測試只驗一個行為，命名描述「行為與預期」
 - 寫完必須用專案 test_tool 實際執行，並在輸出回報 pass/fail 與執行指令
 - 不得寫空殼或恆真斷言（assert True）來騙過驗證
+- **建置環境護欄（JDK / Gradle / 依賴 / CI）**：遇到 JDK、Gradle、依賴缺失、CI 設定問題時——
+  1. 優先使用非侵入式方式處理（補測試依賴用 testImplementation、用既有版本、mock 外部依賴），不動建置設定；
+  2. 若需改 root `build.gradle`（或 `build.gradle.kts`、`gradle.properties`、`settings.gradle`），**必須停止並標記人工確認**，不要自行修改；
+  3. **不得為了讓測試通過而改變專案目標 JDK 版本**（`sourceCompatibility`/`targetCompatibility`/`toolchain`/`languageVersion`）。
+  > 為什麼：上雲時 JDK/Gradle 版本是固定的；若為了本地測試過而改版本，等於把「上雲能不能跑」變成未知數——本地綠燈不代表雲端可跑。寧可回報受阻，也不要動版本。
 
 ## Critic Checklist
 - [ ] 測試有實際被執行且全數通過（executor 須附執行輸出，否則 REJECT）
@@ -18,3 +23,5 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
 - [ ] 涵蓋錯誤路徑與邊界，而非只有 happy path
 - [ ] 符合 FIRST：獨立、可重複、自我驗證
 - [ ] 斷言有意義且每測只驗一件事；命名表達行為與預期
+- [ ] **未擅自修改 `build.gradle`/`build.gradle.kts`/`gradle.properties`/`settings.gradle`**；若有 diff 必須是人工確認過的（否則 REJECT）
+- [ ] **未變更專案目標 JDK 版本**（sourceCompatibility/targetCompatibility/toolchain）以求測試通過（違反即 REJECT，因破壞上雲版本一致性）
