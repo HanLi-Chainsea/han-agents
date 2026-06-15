@@ -256,11 +256,11 @@ facade.py ─────┬──→ code_graph.py ──→ registry.py
 
 ### 4.3 代理派發方式
 
-透過 Claude Code 的 Task tool 派發代理：
+透過 Claude Code 的 Agent tool 派發代理：
 
 ```python
 # 派發 PFC 規劃任務
-Task(
+Agent(
     subagent_type='pfc',
     prompt=f'''PROJECT = "{project_name}"
 PROJECT_PATH = "{project_path}"
@@ -276,7 +276,7 @@ PROJECT_PATH = "{project_path}"
 )
 
 # 派發 Executor 執行任務
-Task(
+Agent(
     subagent_type='executor',
     prompt=f'''TASK_ID = "{task_id}"
 Task: {description}
@@ -284,7 +284,7 @@ Steps: 1. Read 2. Execute 3. Verify'''
 )
 
 # 派發 Critic 驗證
-Task(
+Agent(
     subagent_type='critic',
     prompt=f'''PROJECT = "{project_name}"
 PROJECT_PATH = "{project_path}"
@@ -721,9 +721,9 @@ python "%USERPROFILE%\.claude\skills\han-agents\scripts\init_project.py" my-proj
 | 記憶與語義搜索 | ✅ 完整 | ✅ 完整 |
 | Code Graph 與偏差偵測 | ✅ 完整 | ✅ 完整 |
 | 任務生命週期管理 | ✅ 完整 | ✅ 完整 |
-| 多代理協調 | ✅ 原生（Task tool） | ⚠️ 循序執行 |
+| 多代理協調 | ✅ 原生（Agent tool） | ⚠️ 循序執行 |
 
-> **注意**：Claude Code 的 Task tool 支援真正的並行代理執行與隔離 context。其他平台可使用所有 API，但代理會在共享 context 中循序執行。
+> **注意**：Claude Code 的 Agent tool 支援真正的並行代理執行與隔離 context。其他平台可使用所有 API，但代理會在共享 context 中循序執行。
 
 ---
 

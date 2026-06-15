@@ -6,7 +6,7 @@
 
 一套三層架構的多 Agent 任務系統：**Intent**（意圖；doc-grounded `intent-manifest.json`，回退 legacy Skill）+ **Code Graph**（現實）+ **Memory**（經驗）。設計靈感源自神經科學，讓 PFC 協調多個專屬 Agent，透過自動化派遣迴圈完成任務。
 
-核心 Python 能力可在多數相容 [Agent Skills](https://agentskills.io) 的 AI 編程工具中使用；Claude Code 目前具備最完整的 Task tool 與 hook 整合。支援平台包含 Claude Code、Cursor、Windsurf、Cline、Codex CLI、Gemini CLI、Antigravity 以及 Kiro。
+核心 Python 能力可在多數相容 [Agent Skills](https://agentskills.io) 的 AI 編程工具中使用；Claude Code 目前具備最完整的 Agent tool 與 hook 整合。支援平台包含 Claude Code、Cursor、Windsurf、Cline、Codex CLI、Gemini CLI、Antigravity 以及 Kiro。
 
 ## 特色功能
 
@@ -165,8 +165,8 @@ while True:
     inst = get_next_dispatch(result['epic_id'], 'my-project', '/path/to/project', trace_id=trace_id)
     if inst['action'] != 'dispatch':
         break
-    # Claude Code：透過 Task tool 派遣
-    Task(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
+    # Claude Code：透過 Agent tool 派遣
+    Agent(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
 
 trace = finish_trace(trace_id)
 ```
@@ -387,9 +387,9 @@ python scripts/init_project.py my-project /path/to/project  # 初始化專案
 | Harness traces / evals / reviews | ✅ 完整支援 | ✅ 完整支援 |
 | Guardrail CLI | ✅ 完整支援 | ✅ 完整支援 |
 | PreToolUse / PostToolUse hooks | ✅ 原生支援 | ⚠️ 依平台能力而定 |
-| 多 Agent 協作 | ✅ 原生支援（Task tool） | ⚠️ 通常需循序執行 |
+| 多 Agent 協作 | ✅ 原生支援（Agent tool） | ⚠️ 通常需循序執行 |
 
-> Claude Code 的 Task tool 支援在獨立 context 中執行多個 Agent，並可透過 PreToolUse/PostToolUse hooks 做 lifecycle automation 與 guardrail enforcement。其他平台可使用 HAN 的 Python/CLI 核心能力，但 hook 與多 Agent 派發深度依平台而定。
+> Claude Code 的 Agent tool 支援在獨立 context 中執行多個 Agent，並可透過 PreToolUse/PostToolUse hooks 做 lifecycle automation 與 guardrail enforcement。其他平台可使用 HAN 的 Python/CLI 核心能力，但 hook 與多 Agent 派發深度依平台而定。
 
 ## 文件
 

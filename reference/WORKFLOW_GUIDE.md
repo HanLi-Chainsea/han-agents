@@ -73,8 +73,8 @@ while True:
     if inst['action'] != 'dispatch':
         print(inst['message'])
         break
-    # Claude Code: 用 Task tool 派發
-    Task(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
+    # Claude Code: 用 Agent tool 派發
+    Agent(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
     # 其他平台: 直接在 context 中執行 inst['prompt']
 ```
 
@@ -95,7 +95,7 @@ PFC (plan) → Executor (do) → Critic (verify) → Memory (store)
 ### Dispatch Executor
 
 ```python
-Task(
+Agent(
     subagent_type='executor',
     prompt=f'''TASK_ID = "{task_id}"
 Task: [description]
@@ -107,7 +107,7 @@ Steps: 1. Read 2. Execute 3. Verify'''
 ### Dispatch Critic
 
 ```python
-Task(
+Agent(
     subagent_type='critic',
     prompt=f'''TASK_ID = "{critic_id}"
 ORIGINAL_TASK_ID = "{original_id}"
@@ -138,7 +138,7 @@ Critic outputs APPROVED/CONDITIONAL/REJECTED → Hook: finish_validation()
 ```python
 task = get_task(original_task_id)
 if task.get('executor_agent_id'):
-    Task(subagent_type='executor', resume=task['executor_agent_id'],
+    Agent(subagent_type='executor', resume=task['executor_agent_id'],
          prompt="Fix based on Critic feedback")
 ```
 

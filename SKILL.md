@@ -4,7 +4,7 @@ description: |
   Multi-agent task system for complex tasks. Three-layer architecture (Skill + Code Graph + Memory),
   task lifecycle with validation, semantic search, drift detection. Use when: user requests PFC agent,
   complex multi-step tasks, multi-agent coordination, or mentions han.
-allowed-tools: Read, Write, Bash, Glob, Grep, Task
+allowed-tools: Read, Write, Bash, Glob, Grep, Agent, Task
 ---
 
 # HAN-Agents
@@ -155,8 +155,8 @@ while True:
     if inst['action'] != 'dispatch':
         print(inst['message'])
         break
-    # Claude Code: 用 Task tool 派發
-    Task(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
+    # Claude Code: 用 Agent tool 派發
+    Agent(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
     # 其他平台: 直接在 context 中執行 inst['prompt']
 ```
 
@@ -223,10 +223,10 @@ dispatch → playbook 一定注入：
 
 ## Manual Agent Dispatch (Advanced)
 
-直接使用 Task tool 派發 agent：
+直接使用 Agent tool（Claude Code 派工工具，舊稱 Task）派發 agent：
 
 ```
-Task(
+Agent(
     subagent_type='pfc',        # 或 executor, critic, researcher, memory, drift-detector
     prompt='任務描述...'
 )
@@ -235,7 +235,7 @@ Task(
 **⭐ 派發 PFC 時必須包含的指示：**
 
 ```
-Task(
+Agent(
     subagent_type='pfc',
     prompt=f'''PROJECT = "{project_name}"
 PROJECT_PATH = "{project_path}"
@@ -267,11 +267,11 @@ PROJECT_PATH = "{project_path}"
 
 ```python
 # ✅ 正確：使用者說「幫 src/ 寫測試」→ 直接傳描述
-Task(subagent_type='pfc', prompt='為 src/ 下的模組撰寫單元測試')
+Agent(subagent_type='pfc', prompt='為 src/ 下的模組撰寫單元測試')
 
 # ❌ 錯誤：主對話自己先 glob 再傳（可能漏檔案，且 PFC 會誤以為是指定範圍）
 files = glob('src/**/*.ts')  # 主對話搜尋
-Task(subagent_type='pfc', prompt=f'為以下檔案寫測試:\n{files}')
+Agent(subagent_type='pfc', prompt=f'為以下檔案寫測試:\n{files}')
 ```
 
 **派發流程：**
@@ -279,7 +279,7 @@ Task(subagent_type='pfc', prompt=f'為以下檔案寫測試:\n{files}')
 2. **沒指定 → 直接傳任務描述給 PFC，不要先搜尋**
 3. PFC 用 **Code Graph 確認完整範圍**
 4. PFC 規劃後輸出「派發指令」
-5. **主對話**使用 Task tool 執行派發
+5. **主對話**使用 Agent tool 執行派發
 
 ## ⭐ 主對話：收到 PFC 輸出後的處理
 
@@ -292,7 +292,7 @@ progress = get_task_progress(project="PROJECT_NAME")
 pending_tasks = [t for t in progress.get('tasks', []) if t['status'] == 'pending']
 
 # 2. 根據任務的 assigned_agent 派發對應 agent
-# 3. 使用 Task tool 派發（executor/critic/researcher/memory 等）
+# 3. 使用 Agent tool 派發（executor/critic/researcher/memory 等）
 ```
 
 **主對話職責（不可省略）：**
@@ -307,7 +307,7 @@ pending_tasks = [t for t in progress.get('tasks', []) if t['status'] == 'pending
 
 **範例 - 派發 Executor：**
 ```
-Task(
+Agent(
     subagent_type='executor',
     prompt=f'''TASK_ID = "{subtask_id}"
 Task: [description]
@@ -318,7 +318,7 @@ Steps: 1. Read 2. Execute 3. Verify'''
 
 **範例 - 派發 Critic：**
 ```
-Task(
+Agent(
     subagent_type='critic',
     prompt=f'''PROJECT = "{project_name}"
 PROJECT_PATH = "{project_path}"

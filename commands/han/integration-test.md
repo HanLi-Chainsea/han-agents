@@ -46,7 +46,7 @@ print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','p
 print('PROMPT_START'); print(inst.get('prompt','')); print('PROMPT_END')
 PY
 ```
-- `dispatch` → 用 **Task 工具** 以回傳的 `subagent_type` 與 prompt 派發；完成後再 dispatch。
+- `dispatch` → 用 **Agent 工具**（Claude Code 派工工具，舊稱 Task）以回傳的 `subagent_type` 與 prompt 派發；完成後再 dispatch。
 - `done` → 完成；`blocked`/`waiting` → 回報 message 並停止。
 
 4. 收尾：建立的任務數、寫了哪些測試檔、pass/fail 摘要。

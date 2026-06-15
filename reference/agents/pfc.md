@@ -303,7 +303,7 @@ result = run_recipe('unit_tests', project_name=PROJECT,
 
 ### Executor Prompt 範本
 ```python
-Task(
+Agent(
     subagent_type='executor',
     prompt=f'''
 TASK_ID = "{subtask_id}"
@@ -490,7 +490,7 @@ for task_to_validate in validation['pending_validation']:
 
 ### Critic Prompt 範本
 ```python
-Task(
+Agent(
     subagent_type='critic',
     prompt=f'''
 TASK_ID = "{critic_task_id}"
