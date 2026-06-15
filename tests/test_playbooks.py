@@ -20,6 +20,17 @@ class TestLoadPlaybooks:
         assert "AAA" in ut.executor_principles or "Arrange" in ut.executor_principles
         assert "REJECT" in ut.critic_checklist
 
+    def test_refactor_playbook_loaded(self):
+        from servers.playbooks import load_playbooks
+        pbs = load_playbooks(force_reload=True)
+        assert "refactor" in pbs
+        rf = pbs["refactor"]
+        assert rf.match
+        assert "Extract Method" in rf.executor_principles
+        assert "characterization" in rf.executor_principles.lower()
+        assert "build.gradle" in rf.executor_principles
+        assert "REJECT" in rf.critic_checklist
+
 
 class TestResolvePlaybook:
     def test_unit_test_match(self):
@@ -55,6 +66,17 @@ class TestResolvePlaybook:
     def test_no_match_returns_none(self):
         from servers.playbooks import resolve_playbook
         assert resolve_playbook("Fix bug in parser logic") is None
+
+    def test_refactor_three_step_descriptions_match(self):
+        from servers.playbooks import resolve_playbook
+        descs = [
+            "Write characterization tests pinning current behavior of foo in servers/x.py (refactor-for-testability safety net). Do not judge correctness; pin every branch's current behavior.",
+            "Refactor for testability: apply Extract Method to foo in servers/x.py. Behavior-preserving, mechanical.",
+            "Verify refactor of foo in servers/x.py: rerun characterization tests, must stay green.",
+        ]
+        for d in descs:
+            pb = resolve_playbook(d)
+            assert pb is not None and pb.name == "refactor", d
 
 
 class TestFailOpen:
