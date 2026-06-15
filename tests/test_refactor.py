@@ -170,3 +170,14 @@ class TestFindLatestPendingEpic:
         e = create_task(project="rfe2", description="X", priority=7, task_level="epic")
         update_task_status(e, "done")
         assert find_latest_pending_epic("rfe2") is None
+
+    def test_latest_among_multiple_pending(self, mock_db_path):
+        from servers.tasks import create_task
+        from servers.facade import find_latest_pending_epic
+        create_task(project="rfe3", description="epic one",
+                    priority=7, task_level="epic")
+        e2 = create_task(project="rfe3", description="epic two",
+                         priority=7, task_level="epic")
+        # both pending; the later-created epic must win even on same-second created_at
+        got = find_latest_pending_epic("rfe3")
+        assert got is not None and got["id"] == e2
