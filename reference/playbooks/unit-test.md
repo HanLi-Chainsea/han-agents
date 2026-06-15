@@ -8,6 +8,7 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
 - 遵守 FIRST：Fast（快）、Independent（彼此不依賴、不共享狀態）、Repeatable（多次執行結果一致，隔離外部依賴）、Self-validating（純 pass/fail，不需人工判讀）、Timely（緊貼被測程式）
 - 測「可觀察行為與契約」：透過 public API、驗 state 而非與協作者的互動細節，重構不應使測試破裂
 - 涵蓋 happy path、邊界值、錯誤/例外路徑、空輸入（Beyoncé Rule：重要行為就要有測試）
+- **明確涵蓋 null / None / 空狀態**：當**本次任務範圍內**的參數、回傳或物件欄位可能為 null/None（含 Optional 未設值、集合為空、Map 取不到 key）時，**即使原規格沒寫明，也要寫一個測試把「目前 null 時的實際行為」釘住**——null 往往有對應行為（回傳預設值、短路、拋特定例外），漏測等於放掉一整類迴歸（同事使用回饋）。先讀程式判定 null 走哪條路再對應斷言：會拋例外→斷言例外**型別**（錯誤訊息僅在屬公開契約時才一併斷言，避免綁死實作）；有預設值／短路→斷言該行為；**目前 null 會導致非預期崩潰（NPE 等）→ 仍要寫一個用 assertRaises 釘住該崩潰的測試，並在回報中標記為待修缺口**。重點：null 行為一定要有測試覆蓋，不可默默跳過（即使是崩潰也以 assertRaises 釘住現況）。
 - 一個測試只驗一個行為，命名描述「行為與預期」
 - 寫完必須用專案 test_tool 實際執行，並在輸出回報 pass/fail 與執行指令
 - 不得寫空殼或恆真斷言（assert True）來騙過驗證
@@ -21,6 +22,7 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
 - [ ] 測試有實際被執行且全數通過（executor 須附執行輸出，否則 REJECT）
 - [ ] 測的是行為/契約（public API、驗 state），而非實作細節
 - [ ] 涵蓋錯誤路徑與邊界，而非只有 happy path
+- [ ] **本次範圍內可為 null / None 的輸入、回傳或欄位都有對應測試**（釘住目前的 null 行為：預設值／短路／例外，或用 assertRaises 釘住目前的崩潰並標記缺口）；可為 null 卻完全沒測 → REJECT
 - [ ] 符合 FIRST：獨立、可重複、自我驗證
 - [ ] 斷言有意義且每測只驗一件事；命名表達行為與預期
 - [ ] **未擅自修改 `build.gradle`/`build.gradle.kts`/`gradle.properties`/`settings.gradle`**；若有 diff 必須是人工確認過的（否則 REJECT）
