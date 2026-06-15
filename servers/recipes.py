@@ -426,6 +426,123 @@ def recipe_e2e_tests(
     }
 
 
+# === 為可測試性重構：掃描（確定性，不建 epic、不改碼）===
+
+LONG_METHOD_LINES = 40
+HIGH_FANOUT = 8
+
+
+def _call_fanout(project: str) -> Dict[str, int]:
+    """回傳每個來源節點的 'calls' 出邊數（一次 group-by 查詢）。"""
+    from servers import managed_connection
+    with managed_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT from_id, COUNT(*) FROM code_edges "
+            "WHERE project = ? AND kind = 'calls' GROUP BY from_id",
+            (project,))
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _in_target(file_path: str, target_path: Optional[str]) -> bool:
+    if not target_path:
+        return True
+    tp = target_path.rstrip('/')
+    return (file_path == tp or file_path == './' + tp
+            or file_path.startswith(tp + '/')
+            or file_path.startswith('./' + tp + '/'))
+
+
+def _detect_hotspots(project: str, target_path: Optional[str]) -> List[Dict]:
+    """掃描可測試性熱點（過長方法或高 fan-out）。只讀 Code Graph，純確定性。
+
+    回傳依 score 由高至低排序的熱點清單；每項：
+      {id, file_path, name, line_start, line_end, length, fan_out, score}
+    """
+    from servers.code_graph import get_code_nodes
+
+    fanout = _call_fanout(project)
+    nodes: List[Dict] = []
+    for kind in ('function', 'method'):
+        offset = 0
+        while True:
+            page = get_code_nodes(project, kind=kind, limit=500, offset=offset)
+            nodes.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
+
+    spots: List[Dict] = []
+    for n in nodes:
+        fp = n.get('file_path') or ''
+        if is_test_file(fp) or not _in_target(fp, target_path):
+            continue
+        ls = n.get('line_start') or 0
+        le = n.get('line_end') or 0
+        length = max(0, le - ls)
+        fan_out = fanout.get(n.get('id'), 0)
+        if length >= LONG_METHOD_LINES or fan_out >= HIGH_FANOUT:
+            spots.append({
+                'id': n.get('id'),
+                'file_path': fp,
+                'name': n.get('name') or '?',
+                'line_start': ls,
+                'line_end': le,
+                'length': length,
+                'fan_out': fan_out,
+                'score': length + fan_out * 5,
+            })
+    spots.sort(key=lambda s: s['score'], reverse=True)
+    return spots
+
+
+def _find_pending_refactor_epic(project: str) -> Optional[str]:
+    """同專案是否已有 pending 的 refactor epic（被動提示用）。"""
+    from servers.tasks import get_epic_tasks
+    for epic in get_epic_tasks(project):  # created_at DESC
+        if (epic.get('status') == 'pending'
+                and (epic.get('description') or '').startswith(
+                    'Refactor for Testability')):
+            return epic.get('id')
+    return None
+
+
+def scan_refactor_candidates(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    max_candidates: int = 20,
+) -> Dict:
+    """掃可測試性熱點候選。**不分類、不建 epic、不改原始碼。**
+
+    分類（高/低把握）由指令層主代理依 refactor playbook 型錄進行。
+    """
+    _ensure_synced(project_name, project_path)
+    hotspots = _detect_hotspots(project_name, target_path)
+    truncated = len(hotspots) > max_candidates
+    candidates = hotspots[:max_candidates]
+    existing = _find_pending_refactor_epic(project_name)
+
+    scope = f" under {target_path}" if target_path else ""
+    if not candidates:
+        msg = f"No testability hotspots found{scope}."
+    else:
+        msg = (f"Found {len(hotspots)} testability hotspot(s){scope}; "
+               f"returning top {len(candidates)}.")
+        if truncated:
+            msg += f" Truncated {len(hotspots) - len(candidates)} (raise max_candidates to see more)."
+    if existing:
+        msg += f" NOTE: a pending refactor epic already exists: {existing}."
+
+    return {
+        'candidates': candidates,
+        'total_hotspots': len(hotspots),
+        'truncated': truncated,
+        'existing_pending_epic': existing,
+        'message': msg,
+    }
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,
