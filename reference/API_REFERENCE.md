@@ -95,7 +95,7 @@ inst = get_next_dispatch(epic_id, 'my-project', '/path/to/project')
 #     'action': 'dispatch' | 'done' | 'blocked' | 'waiting',
 #     'subagent_type': 'executor' | 'critic' | 'memory',
 #     'model_tier': 'planner' | 'worker' | 'fast',
-#     'prompt': str,        # Complete prompt for Task tool
+#     'prompt': str,        # Complete prompt for Agent tool
 #     'task_id': str,       # For tracking
 #     'progress': '3/7 tasks complete',
 #     'message': str,       # Human-readable status

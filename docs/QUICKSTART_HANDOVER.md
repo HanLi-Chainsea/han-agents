@@ -134,8 +134,8 @@ results = search_memory_semantic('認證模式', limit=5)
 ### 3. 代理派發
 
 ```python
-# 透過 Claude Code Task tool
-Task(
+# 透過 Claude Code Agent tool
+Agent(
     subagent_type='pfc',      # 或 executor, critic, memory, researcher
     prompt='任務描述...'
 )
@@ -154,7 +154,7 @@ while True:
     inst = get_next_dispatch(epic_id, 'my-project', '/path/to/project', trace_id=trace_id)
     if inst['action'] != 'dispatch':
         break
-    Task(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
+    Agent(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
 
 finish_trace(trace_id)
 result = evaluate_trace(trace_id, ['executor', 'critic', 'memory'], mode='subsequence')

@@ -177,14 +177,14 @@ SSOT files not found
 
 ```python
 # Executor
-Task(
+Agent(
     subagent_type='executor',
     prompt=f'''TASK_ID = "{task_id}"
 ...'''
 )
 
 # Critic
-Task(
+Agent(
     subagent_type='critic',
     prompt=f'''TASK_ID = "{critic_id}"
 ORIGINAL_TASK_ID = "{original_task_id}"

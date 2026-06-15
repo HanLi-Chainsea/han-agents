@@ -219,8 +219,8 @@ while True:
     inst = get_next_dispatch(result['epic_id'], 'my-project', '/path/to/project', trace_id=trace_id)
     if inst['action'] != 'dispatch':
         break
-    # Claude Code: dispatch via Task tool
-    Task(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
+    # Claude Code: dispatch via Agent tool
+    Agent(subagent_type=inst['subagent_type'], prompt=inst['prompt'])
 
 trace = finish_trace(trace_id)
 ```
@@ -424,7 +424,7 @@ python scripts/init_project.py my-project /path/  # Init a project
 | Task Lifecycle Management | Full | Full |
 | Multi-Agent Coordination | Native (parallel) | Sequential |
 
-> Claude Code's Task tool enables parallel agent execution with isolated contexts. Other platforms run agents sequentially in a shared context.
+> Claude Code's Agent tool enables parallel agent execution with isolated contexts. Other platforms run agents sequentially in a shared context.
 
 ---
 
