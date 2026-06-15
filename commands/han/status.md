@@ -1,10 +1,10 @@
 ---
-description: 'HAN：快速顯示專案狀態（Code Graph 節點/邊/檔數 + Skill 健康度）（單次讀取）'
+description: 'HAN：快速顯示專案狀態（Code Graph 節點/邊/檔數 + Intent manifest 狀態）（單次讀取）'
 ---
 
 # /han:status — 專案狀態速覽
 
-顯示 HAN 對當前專案的掌握：專案名/路徑、健康度、Code Graph 節點/邊/檔數、Skill 資訊（`quick_status()` 的內容）。
+顯示 HAN 對當前專案的掌握：專案名/路徑、健康度、Code Graph 節點/邊/檔數、Intent manifest 狀態（`intent-manifest.json` 的 active/total 文件數）與 legacy Skill 資訊（`quick_status()` 的內容）。
 
 ## 執行步驟
 

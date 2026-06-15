@@ -211,7 +211,7 @@ dispatch → playbook 一定注入：
 | `/han:drift` | 單次讀 | SSOT(意圖) vs Code(現實) 偏差報告 |
 | `/han:impact <檔案/符號>` | 單次讀 | 改動影響半徑（誰呼叫、依賴誰） |
 | `/han:recall <主題>` | 單次讀 | 撈過往決策/教訓（長期記憶） |
-| `/han:status` | 單次讀 | 專案狀態速覽（Code Graph 節點/邊/檔 + Skill 健康度） |
+| `/han:status` | 單次讀 | 專案狀態速覽（Code Graph 節點/邊/檔 + Intent manifest 狀態） |
 | `/han:sync` | 維護 | 增量同步 Code Graph（不改原始碼） |
 | `/han:help` | 單次讀 | 列出所有 /han 指令與用途（動態） |
 
