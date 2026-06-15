@@ -197,6 +197,37 @@ class TestBuildRefactorEpic:
             pb = resolve_playbook(d)
             assert pb is not None and pb.name == "refactor", d
 
+    def test_partial_failure_rolls_back(self, mock_db_path, monkeypatch):
+        from servers import recipes
+        from servers import tasks as tasks_mod
+        import sqlite3, os, pytest
+
+        calls = {"n": 0}
+        real_create_subtask = tasks_mod.create_subtask
+
+        def flaky_create_subtask(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:  # fail partway through building the tree
+                raise RuntimeError("boom")
+            return real_create_subtask(*args, **kwargs)
+
+        # build_refactor_epic imports create_subtask locally from servers.tasks,
+        # so patch it on the servers.tasks module.
+        monkeypatch.setattr(tasks_mod, "create_subtask", flaky_create_subtask)
+
+        items = [{"file_path": "servers/x.py", "name": "foo",
+                  "refactor_type": "Extract Method",
+                  "line_start": 1, "line_end": 80}]
+        with pytest.raises(RuntimeError):
+            recipes.build_refactor_epic("rfb_rollback", items)
+
+        # no epic / story / task rows should remain for this project
+        conn = sqlite3.connect(os.environ["HAN_DB_PATH"])
+        n = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE project='rfb_rollback'").fetchone()[0]
+        conn.close()
+        assert n == 0, f"partial tree left behind: {n} rows"
+
 
 class TestFindLatestPendingEpic:
     def test_returns_latest_pending(self, mock_db_path):

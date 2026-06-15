@@ -555,6 +555,25 @@ def scan_refactor_candidates(
     }
 
 
+def _delete_epic_tree(project: str, epic_id: str) -> None:
+    """Best-effort 補償刪除：移除某 epic 及其 story/task 與相依，避免建樹中途失敗遺留 partial tree。"""
+    from servers import managed_connection
+    with managed_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT id FROM tasks WHERE project = ? AND (id = ? OR epic_id = ?)",
+            (project, epic_id, epic_id))
+        ids = [r[0] for r in cur.fetchall()]
+        if ids:
+            qs = ','.join('?' * len(ids))
+            cur.execute(
+                f"DELETE FROM task_dependencies "
+                f"WHERE task_id IN ({qs}) OR depends_on_task_id IN ({qs})",
+                ids + ids)
+            cur.execute(f"DELETE FROM tasks WHERE id IN ({qs})", ids)
+        db.commit()
+
+
 def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
     """為高把握重構項建任務樹。
 
@@ -590,46 +609,50 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
         priority=7, task_level='epic')
 
     task_count = 0
-    for it in valid:
-        sym = it['name'].strip()
-        fp = it['file_path'].strip()
-        rtype = it['refactor_type'].strip()
-        ls = it.get('line_start')
-        le = it.get('line_end')
-        loc = fp
-        if isinstance(ls, int) and isinstance(le, int) and ls > 0 and le >= ls:
-            loc = f"{fp} (lines {ls}-{le})"
+    try:
+        for it in valid:
+            sym = it['name'].strip()
+            fp = it['file_path'].strip()
+            rtype = it['refactor_type'].strip()
+            ls = it.get('line_start')
+            le = it.get('line_end')
+            loc = fp
+            if isinstance(ls, int) and isinstance(le, int) and ls > 0 and le >= ls:
+                loc = f"{fp} (lines {ls}-{le})"
 
-        story_id = create_task(
-            project=project_name,
-            description=f"Refactor for testability: {sym} in {loc}",
-            task_level='story', epic_id=epic_id, priority=7)
+            story_id = create_task(
+                project=project_name,
+                description=f"Refactor for testability: {sym} in {loc}",
+                task_level='story', epic_id=epic_id, priority=7)
 
-        t1 = create_subtask(
-            parent_id=story_id,
-            description=(
-                f"Write characterization tests pinning current behavior of "
-                f"{sym} in {loc} (refactor-for-testability safety net). "
-                f"Do not judge correctness; pin every branch's current behavior."),
-            assigned_agent='executor', requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
-        t2 = create_subtask(
-            parent_id=story_id,
-            description=(
-                f"Refactor for testability: apply {rtype} to {sym} in {loc}. "
-                f"Behavior-preserving, mechanical."),
-            assigned_agent='executor', depends_on=[t1],
-            requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
-        create_subtask(
-            parent_id=story_id,
-            description=(
-                f"Verify refactor of {sym} in {loc}: rerun characterization "
-                f"tests, must stay green."),
-            assigned_agent='executor', depends_on=[t2],
-            requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
-        task_count += 3
+            t1 = create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Write characterization tests pinning current behavior of "
+                    f"{sym} in {loc} (refactor-for-testability safety net). "
+                    f"Do not judge correctness; pin every branch's current behavior."),
+                assigned_agent='executor', requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            t2 = create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Refactor for testability: apply {rtype} to {sym} in {loc}. "
+                    f"Behavior-preserving, mechanical."),
+                assigned_agent='executor', depends_on=[t1],
+                requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Verify refactor of {sym} in {loc}: rerun characterization "
+                    f"tests, must stay green."),
+                assigned_agent='executor', depends_on=[t2],
+                requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            task_count += 3
+    except Exception:
+        _delete_epic_tree(project_name, epic_id)  # 補償：不留 partial tree
+        raise
 
     return {'epic_id': epic_id, 'story_count': len(valid),
             'task_count': task_count, 'rejected': rejected}

@@ -13,6 +13,8 @@ description: 'HAN：分析可測試性熱點並產出重構規劃（高把握→
 - 模組名 / 自然語言 → 對應到路徑；對不到就用整個專案
 - 空白 → 整個專案
 
+> **安全**：`HAN_TARGET` 必須是單純的相對路徑（如 `servers/` 或 `servers/x.py`），**不得**含 shell 特殊字元或命令替換（`$( )`、反引號、`;`、`"` 等）。若使用者範圍無法化為這樣的乾淨路徑，就用整個專案（空字串 `""`）。主代理在嵌入指令前自行確保此點。
+
 ## 執行步驟
 
 > 安全準則：**所有專案/路徑/範圍值一律透過環境變數傳入 Python，絕不內插進 Python 程式碼字串**。`{{HAN_DIR}}` 由安裝程序替換為安全字面量。
@@ -54,6 +56,7 @@ PY
 ```bash
 # 用 mktemp 取唯一暫存檔（避免低熵 $RANDOM 與 symlink 競態）；寫、讀、清理都在同一個 Bash 區塊
 HAN_HIGH_JSON="$(mktemp "${TMPDIR:-/tmp}/han_refactor_high.XXXXXX")"
+trap 'rm -f "$HAN_HIGH_JSON"' EXIT
 cat > "$HAN_HIGH_JSON" <<'JSON'
 [
   {"file_path": "servers/x.py", "name": "foo", "refactor_type": "Extract Method", "line_start": 1, "line_end": 80}
@@ -66,10 +69,11 @@ sys.path.insert(0, {{HAN_DIR}})
 from servers.recipes import build_refactor_epic
 items = json.load(open(os.environ['HAN_HIGH_JSON'], encoding='utf-8'))
 r = build_refactor_epic(os.environ['HAN_PROJECT'], items)
-print('EPIC', r.get('epic_id'), 'stories', r.get('story_count'),
-      'tasks', r.get('task_count'), 'rejected', len(r.get('rejected', [])))
+print('EPIC', r.get('epic_id'), 'stories', r.get('story_count'), 'tasks', r.get('task_count'))
+print('REJECTED_JSON_START')
+print(json.dumps(r.get('rejected', []), ensure_ascii=False))
+print('REJECTED_JSON_END')
 PY
-rm -f "$HAN_HIGH_JSON"
 ```
 - `high` 為空 → 不建 epic（`EPIC None`）。
 
@@ -77,7 +81,7 @@ rm -f "$HAN_HIGH_JSON"
    - 標頭：target、掃描熱點數、是否截斷、`epic_id`。
    - 區段 A「已排入計畫（高把握）」：逐項列 檔案/方法、重構型錄項、三步任務。
    - 區段 B「建議／需人工決定（沒把握）」：逐項列 位置、型錄項、**判定為沒把握的理由**。
-     - 若步驟 4 的 `build_refactor_epic` 回報 `rejected > 0`，把那些被退回的項（位置 + 理由）也列在此區段。
+     - 解析步驟 4 輸出 `REJECTED_JSON_START`…`REJECTED_JSON_END` 之間的 JSON（被 `build_refactor_epic` 退回的項），把每一項的**位置 + 理由**也列在此區段。
 
 6. 收尾回報：`epic_id`、報告路徑、高把握任務數、沒把握建議數。提示「要執行請跑 `/han:run <epic_id>`」。
 
