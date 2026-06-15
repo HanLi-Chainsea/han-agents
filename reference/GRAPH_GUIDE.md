@@ -118,7 +118,8 @@ flows = list_nodes('my-project', kind='flow')
 
 ## Drift Detection
 
-檢查 Skill（意圖）vs Code（現實）的偏差。
+檢查意圖 vs Code（現實）的偏差。意圖來源優先取專案根的 `intent-manifest.json`
+（doc-grounded，註冊 PRD/SA/SD）；無 manifest 時回退 legacy SSOT（SKILL.md flows/domains）。
 
 ```python
 report = check_drift('/path/to/project', 'my-project', 'auth')

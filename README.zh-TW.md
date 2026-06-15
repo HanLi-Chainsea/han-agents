@@ -4,7 +4,7 @@
 
 **HAN** = **H**ierarchical **A**pproached **N**euromorphic Agents
 
-一套三層架構的多 Agent 任務系統：**Skill**（意圖）+ **Code Graph**（現實）+ **Memory**（經驗）。設計靈感源自神經科學，讓 PFC 協調多個專屬 Agent，透過自動化派遣迴圈完成任務。
+一套三層架構的多 Agent 任務系統：**Intent**（意圖；doc-grounded `intent-manifest.json`，回退 legacy Skill）+ **Code Graph**（現實）+ **Memory**（經驗）。設計靈感源自神經科學，讓 PFC 協調多個專屬 Agent，透過自動化派遣迴圈完成任務。
 
 核心 Python 能力可在多數相容 [Agent Skills](https://agentskills.io) 的 AI 編程工具中使用；Claude Code 目前具備最完整的 Task tool 與 hook 整合。支援平台包含 Claude Code、Cursor、Windsurf、Cline、Codex CLI、Gemini CLI、Antigravity 以及 Kiro。
 
