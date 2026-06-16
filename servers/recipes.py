@@ -426,6 +426,238 @@ def recipe_e2e_tests(
     }
 
 
+# === 為可測試性重構：掃描（確定性，不建 epic、不改碼）===
+
+LONG_METHOD_LINES = 40
+HIGH_FANOUT = 8
+
+# 高把握重構型錄（與 reference/playbooks/refactor.md 一致）；只有這些型別可建成可執行任務
+HIGH_CONFIDENCE_REFACTORS = {
+    'Extract Method', 'Extract Function',
+    'Extract Variable', 'Introduce Variable',
+    'Inline Variable', 'Inline Method',
+    'Rename', 'Decompose Conditional',
+    'Replace Magic Number', 'Replace Magic Number with Constant',
+    'Replace Magic String with Constant',
+}
+
+
+def _call_fanout(project: str) -> Dict[str, int]:
+    """回傳每個來源節點的 'calls' 出邊數（一次 group-by 查詢）。"""
+    from servers import managed_connection
+    with managed_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT from_id, COUNT(*) FROM code_edges "
+            "WHERE project = ? AND kind = 'calls' GROUP BY from_id",
+            (project,))
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _in_target(file_path: str, target_path: Optional[str]) -> bool:
+    if not target_path:
+        return True
+    tp = target_path.rstrip('/')
+    return (file_path == tp or file_path == './' + tp
+            or file_path.startswith(tp + '/')
+            or file_path.startswith('./' + tp + '/'))
+
+
+def _detect_hotspots(project: str, target_path: Optional[str]) -> List[Dict]:
+    """掃描可測試性熱點（過長方法或高 fan-out）。只讀 Code Graph，純確定性。
+
+    回傳依 score 由高至低排序的熱點清單；每項：
+      {id, file_path, name, line_start, line_end, length, fan_out, score}
+    """
+    from servers.code_graph import get_code_nodes
+
+    fanout = _call_fanout(project)
+    nodes: List[Dict] = []
+    for kind in ('function', 'method'):
+        offset = 0
+        while True:
+            page = get_code_nodes(project, kind=kind, limit=500, offset=offset)
+            nodes.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
+
+    spots: List[Dict] = []
+    for n in nodes:
+        fp = n.get('file_path') or ''
+        if is_test_file(fp) or not _in_target(fp, target_path):
+            continue
+        ls = n.get('line_start') or 0
+        le = n.get('line_end') or 0
+        length = max(0, le - ls)
+        fan_out = fanout.get(n.get('id'), 0)
+        if length >= LONG_METHOD_LINES or fan_out >= HIGH_FANOUT:
+            spots.append({
+                'id': n.get('id'),
+                'file_path': fp,
+                'name': n.get('name') or '?',
+                'line_start': ls,
+                'line_end': le,
+                'length': length,
+                'fan_out': fan_out,
+                'score': length + fan_out * 5,
+            })
+    spots.sort(key=lambda s: s['score'], reverse=True)
+    return spots
+
+
+def _find_pending_refactor_epic(project: str) -> Optional[str]:
+    """同專案是否已有 pending 的 refactor epic（被動提示用）。"""
+    from servers.tasks import get_epic_tasks
+    for epic in get_epic_tasks(project):  # created_at DESC
+        if (epic.get('status') == 'pending'
+                and (epic.get('description') or '').startswith(
+                    'Refactor for Testability')):
+            return epic.get('id')
+    return None
+
+
+def scan_refactor_candidates(
+    project_name: str,
+    project_path: str,
+    target_path: str = None,
+    max_candidates: int = 20,
+) -> Dict:
+    """掃可測試性熱點候選。**不分類、不建 epic、不改原始碼。**
+
+    分類（高/低把握）由指令層主代理依 refactor playbook 型錄進行。
+    """
+    if max_candidates < 1:
+        max_candidates = 1
+    _ensure_synced(project_name, project_path)
+    hotspots = _detect_hotspots(project_name, target_path)
+    truncated = len(hotspots) > max_candidates
+    candidates = hotspots[:max_candidates]
+    existing = _find_pending_refactor_epic(project_name)
+
+    scope = f" under {target_path}" if target_path else ""
+    if not candidates:
+        msg = f"No testability hotspots found{scope}."
+    else:
+        msg = (f"Found {len(hotspots)} testability hotspot(s){scope}; "
+               f"returning top {len(candidates)}.")
+        if truncated:
+            msg += f" Truncated {len(hotspots) - len(candidates)} (raise max_candidates to see more)."
+    if existing:
+        msg += f" NOTE: a pending refactor epic already exists: {existing}."
+
+    return {
+        'candidates': candidates,
+        'total_hotspots': len(hotspots),
+        'truncated': truncated,
+        'existing_pending_epic': existing,
+        'message': msg,
+    }
+
+
+def _delete_epic_tree(project: str, epic_id: str) -> None:
+    """Best-effort 補償刪除：移除某 epic 及其 story/task 與相依，避免建樹中途失敗遺留 partial tree。"""
+    from servers import managed_connection
+    with managed_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT id FROM tasks WHERE project = ? AND (id = ? OR epic_id = ?)",
+            (project, epic_id, epic_id))
+        ids = [r[0] for r in cur.fetchall()]
+        if ids:
+            qs = ','.join('?' * len(ids))
+            cur.execute(
+                f"DELETE FROM task_dependencies "
+                f"WHERE task_id IN ({qs}) OR depends_on_task_id IN ({qs})",
+                ids + ids)
+            cur.execute(f"DELETE FROM tasks WHERE id IN ({qs})", ids)
+        db.commit()
+
+
+def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
+    """為高把握重構項建任務樹。
+
+    items: 每項 {file_path, name, refactor_type, line_start, line_end}
+    每項 -> 1 story + 3 相依 task：characterization-test -> refactor -> verify。
+    只接受 refactor_type ∈ HIGH_CONFIDENCE_REFACTORS 且含 file_path/name 的項；
+    其餘列入 rejected、不建任務。無有效項 -> 不建 epic。
+    回傳 {'epic_id', 'story_count', 'task_count', 'rejected'}。
+    """
+    from servers.tasks import create_task, create_subtask
+
+    valid: List[Dict] = []
+    rejected: List[Dict] = []
+    for it in items or []:
+        fp = (it.get('file_path') or '').strip()
+        sym = (it.get('name') or '').strip()
+        rtype = (it.get('refactor_type') or '').strip()
+        if not fp or not sym:
+            rejected.append({'item': it, 'reason': 'missing file_path or name'})
+            continue
+        if rtype not in HIGH_CONFIDENCE_REFACTORS:
+            rejected.append({'item': it,
+                             'reason': f'refactor_type not in high-confidence catalog: {rtype!r}'})
+            continue
+        valid.append(it)
+
+    if not valid:
+        return {'epic_id': None, 'story_count': 0, 'task_count': 0, 'rejected': rejected}
+
+    epic_id = create_task(
+        project=project_name,
+        description=f"Refactor for Testability: {len(valid)} units",
+        priority=7, task_level='epic')
+
+    task_count = 0
+    try:
+        for it in valid:
+            sym = it['name'].strip()
+            fp = it['file_path'].strip()
+            rtype = it['refactor_type'].strip()
+            ls = it.get('line_start')
+            le = it.get('line_end')
+            loc = fp
+            if isinstance(ls, int) and isinstance(le, int) and ls > 0 and le >= ls:
+                loc = f"{fp} (lines {ls}-{le})"
+
+            story_id = create_task(
+                project=project_name,
+                description=f"Refactor for testability: {sym} in {loc}",
+                task_level='story', epic_id=epic_id, priority=7)
+
+            t1 = create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Write characterization tests pinning current behavior of "
+                    f"{sym} in {loc} (refactor-for-testability safety net). "
+                    f"Do not judge correctness; pin every branch's current behavior."),
+                assigned_agent='executor', requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            t2 = create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Refactor for testability: apply {rtype} to {sym} in {loc}. "
+                    f"Behavior-preserving, mechanical."),
+                assigned_agent='executor', depends_on=[t1],
+                requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            create_subtask(
+                parent_id=story_id,
+                description=(
+                    f"Verify refactor of {sym} in {loc}: rerun characterization "
+                    f"tests, must stay green."),
+                assigned_agent='executor', depends_on=[t2],
+                requires_validation=True,
+                task_level='task', epic_id=epic_id, story_id=story_id)
+            task_count += 3
+    except Exception:
+        _delete_epic_tree(project_name, epic_id)  # 補償：不留 partial tree
+        raise
+
+    return {'epic_id': epic_id, 'story_count': len(valid),
+            'task_count': task_count, 'rejected': rejected}
+
+
 # Recipe registry
 RECIPES = {
     'unit_tests': recipe_unit_tests,

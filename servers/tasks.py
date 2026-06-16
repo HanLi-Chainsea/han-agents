@@ -814,7 +814,7 @@ def get_epic_tasks(project: str, epic_id: str = None) -> List[Dict]:
                 SELECT id, description, status, phase, created_at
                 FROM tasks
                 WHERE project = ? AND task_level = 'epic'
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
             ''', (project,))
 
         epics = []

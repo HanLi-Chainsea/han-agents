@@ -207,7 +207,9 @@ dispatch → playbook 一定注入：
 | `/han:unit-test <範圍>` | recipe + dispatch | 找缺口、寫測試、跑過 |
 | `/han:integration-test <範圍>` | recipe + dispatch | 模組整合測試 |
 | `/han:e2e <範圍>` | recipe + dispatch | 關鍵旅程 E2E |
+| `/han:run [epic_id]` | dispatch | 通用執行器，消費任一 epic 跑 executor→critic 派工迴圈（省略 epic_id 則取最新 pending） |
 | `/han:review <code 或 想法>` | 單次（不改原始碼） | 帶脈絡批判；預設只顯示，`--out` 寫檔、`--post` 才貼 PR/MR（opt-in） |
+| `/han:refactor <path>` | 規劃（不改原始碼） | 分析可測試性熱點、產出重構規劃（高把握→可執行任務樹；沒把握→建議）。只規劃不改碼 |
 | `/han:drift` | 單次讀 | SSOT(意圖) vs Code(現實) 偏差報告 |
 | `/han:impact <檔案/符號>` | 單次讀 | 改動影響半徑（誰呼叫、依賴誰） |
 | `/han:recall <主題>` | 單次讀 | 撈過往決策/教訓（長期記憶） |
