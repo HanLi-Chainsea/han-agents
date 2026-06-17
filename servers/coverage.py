@@ -89,9 +89,12 @@ def _result(status: str, error: Optional[str] = None,
 
 
 def _valid_arc(arc) -> bool:
-    """防 coverage json 未來版本格式異動：只接受 [int, int] 形狀的 arc。"""
+    """防 coverage json 未來版本格式異動：只接受 [int, int] 形狀的 arc。
+
+    排除 bool：JSON 的 true/false 是 int 子類，若混進 arc 會被誤當成行號 1/0。
+    """
     return (isinstance(arc, (list, tuple)) and len(arc) == 2
-            and isinstance(arc[0], int) and isinstance(arc[1], int))
+            and all(isinstance(x, int) and not isinstance(x, bool) for x in arc))
 
 
 def measure_branch_coverage(project_path: str,
@@ -205,8 +208,10 @@ def _attribute_targets(file_index: Dict[str, Dict],
         entry = file_index.get(canon) if canon else None
         if entry is None:
             return _result('no_targets', f'target 檔未被測試執行（未覆蓋）: {fp}')
-        mb = entry.get('missing_branches', [])
-        eb = entry.get('executed_branches', [])
+        # 用 .get(key) 不帶預設：欄位缺失 → None → 非 list → schema_error。
+        # 不可用 .get(key, []) 把「缺欄位」當成「無未覆蓋分支」而誤判全覆蓋（假綠）。
+        mb = entry.get('missing_branches')
+        eb = entry.get('executed_branches')
         if (not isinstance(mb, list) or not isinstance(eb, list)
                 or not all(_valid_arc(a) for a in mb)
                 or not all(_valid_arc(a) for a in eb)):

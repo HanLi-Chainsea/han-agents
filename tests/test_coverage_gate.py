@@ -523,6 +523,36 @@ class TestMeasureFailClosedHardening:
         res = _attribute_targets(file_index, targets, root)
         assert res['tool_status'] == 'schema_error'
 
+    def test_missing_branch_keys_is_schema_error_not_false_green(self, tmp_path):
+        # coverage json schema 若移除/改名 branch 欄位，缺欄位不可被當成空集合 → 假綠。
+        from servers.coverage import _attribute_targets
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, 'x.py'))
+        file_index = {canon: {}}  # 兩個 branch 欄位都不存在
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_bool_arc_is_schema_error(self, tmp_path):
+        # JSON true/false 是 int 子類，不可被當成行號 1/0。
+        from servers.coverage import _attribute_targets
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, 'x.py'))
+        file_index = {canon: {'missing_branches': [[True, False]],
+                              'executed_branches': []}}
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+
+    def test_valid_arc_rejects_bool(self):
+        from servers.coverage import _valid_arc
+        assert _valid_arc([2, 4]) is True
+        assert _valid_arc([True, 4]) is False
+        assert _valid_arc([2, False]) is False
+
     def test_wellformed_branches_attribute_ok(self, tmp_path):
         from servers.coverage import _attribute_targets
         root = str(tmp_path)
