@@ -248,3 +248,21 @@ class TestFormatMissingIssues:
         assert 'servers/x.py' in issues[0]
         assert 'classify' in issues[0]
         assert '2→4' in issues[0] and '4→5' in issues[0]
+
+
+class TestCriticDispatchHasOriginalTaskId:
+    def test_critic_dispatch_exposes_original_task_id(self, mock_db_path, tmp_path):
+        # mock_db_path：隔離 DB；tmp_path：當 project_path 傳給 get_next_dispatch。
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.facade import get_next_dispatch
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True)
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: tests/test_x.py')
+
+        inst = get_next_dispatch(epic, 'proj', str(tmp_path))
+        assert inst['subagent_type'] == 'critic'
+        assert inst['original_task_id'] == task

@@ -1666,6 +1666,7 @@ def get_next_dispatch(
                 'model_tier': _AGENT_TIERS['critic'],
                 'prompt': critic_prompt,
                 'task_id': critic_task['id'],
+                'original_task_id': critic_task['original_task_id'],
                 'progress': f'{total_done}/{total_all} tasks complete',
                 'message': f"Validating: {task['description'][:60]}",
             })
