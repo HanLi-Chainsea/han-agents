@@ -405,6 +405,7 @@ def detect_coverage_gaps(project: str) -> List[Dict]:
                 'name': node['name'],
                 'file_path': node.get('file_path'),
                 'line_start': node.get('line_start'),
+                'line_end': node.get('line_end'),
                 'has_test': False
             })
 
