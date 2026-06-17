@@ -75,7 +75,7 @@ measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
   - **關鍵實作細節：** executor 重試 prompt 的 rejection context 來自 `working_memory['critic_suggestions']`（見 `_get_rejected_tasks`），而 `finish_validation` **不寫**此鍵。故 gate 退件時必須先 `set_working_memory(original_task_id, 'critic_suggestions', <issues 字串>)`，行號才會進到 executor 重試 prompt。
 - **全覆蓋**（`ok && fully_covered`）→ 照常派 LLM critic 做質性檢查（AAA/測行為/命名）。
 - **唯一 fail-open**（`unavailable`：coverage 未安裝 / pytest 中斷/內部錯 / json 失敗）→ 派 LLM critic，但 critic prompt 與收尾報告**大聲標記** `⚠️ 分支覆蓋率工具未量到（<error>），本任務回退人工逐分支核對`；LLM critic 既有 checklist 仍要求驗證測試實際執行。
-- **無限退件防護：** 確定性退件走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 轉 blocked + human-review（既有機制，免新增）。gate 迴圈另記已處理的 critic id，避免狀態未推進時的無限迴圈。未覆蓋退件的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
+- **無限退件防護：** 確定性退件走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 由 `finish_validation` 把任務轉 `blocked` + 開 human-review item（既有機制）。**但**（codex 計畫審查 Major）：`get_next_dispatch` 的 blocked 偵測只看 `get_task_progress(...).failed > 0`，**抓不到 `'blocked'` 狀態**，若 gate 退件後仍 `continue` 重取 dispatch，會誤判成 `waiting`（任務卡死、無人察覺）。故 `_gate_reject` 必須保存 `finish_validation` 回傳值；當其 `status == 'blocked'` 時回 `{'verdict':'blocked', ...}`，`get_next_dispatch_gated` 直接回 `action='blocked'`（指向 human_review），不再 `continue`。gate 迴圈另記已處理的 critic id，避免狀態未推進時的無限迴圈。未覆蓋退件的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
 
 ### 3. `reference/playbooks/unit-test.md`
 
@@ -106,7 +106,8 @@ recipe 建任務 → task.metadata.coverage_targets = [{file,name,line_start,lin
        ok & 未覆蓋 / tests_failed / no_targets / 推不出測試檔
             → set_working_memory(critic_suggestions=[行號/原因])  ← 行號進 executor 重試 prompt 的關鍵
             → finish_validation(critic_task_id, approved=False, issues=[...])  ← 確定性退件
-            → 既有 bookkeeping：rejection_count++ / MAX_RETRIES→blocked / 否則 resume_executor(帶行號)
+            → 既有 bookkeeping：rejection_count++ / 否則 resume_executor(帶行號)
+            → 達 MAX_RETRIES：finish_validation 回 status='blocked'；gate 把 blocked 上帶 → action='blocked'（human_review，不可誤回 waiting）
        ok & 全覆蓋        → 派 LLM critic 做質性檢查
        unavailable        → fail-open，派 LLM critic（報告大聲標記 error）
 ```
@@ -122,7 +123,7 @@ recipe 建任務 → task.metadata.coverage_targets = [{file,name,line_start,lin
 | coverage 未安裝 / json 產製失敗 / pytest 中斷·內部錯 / 逾時（`unavailable`） | **fail-open** 派 LLM critic（報告大聲標記 `error`）——唯一 fail-open 類別 |
 | 防禦性/不可達分支 | 尊重 `# pragma: no cover`/`no branch`；executor 須說明理由 |
 | 多任務並行 | 隔離 `COVERAGE_FILE`，無 `.coverage` 競態 |
-| 退件無限迴圈 | 走 `finish_validation` → `MAX_RETRIES` 自動 blocked + human-review |
+| 退件無限迴圈 | 走 `finish_validation` → `MAX_RETRIES` 轉 blocked；gate 把 `finish_validation` 的 `status='blocked'` 上帶為 `action='blocked'`（指向 human-review），不誤回 waiting |
 
 ## 安全（明文化，M6）
 

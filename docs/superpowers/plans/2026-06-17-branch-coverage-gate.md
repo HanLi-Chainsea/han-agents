@@ -528,6 +528,19 @@ class TestMeasureBranchCoverage:
         assert res['tool_status'] == 'no_targets'
         assert res['error']
 
+    def test_no_tests_collected_rc5_is_no_targets(self, tmp_path):
+        # pytest 收集到 0 個測試 → exit code 5。屬 Critical 1 明列行為：
+        # 沒有任何測試被跑 ≠ 覆蓋成功，必須是確定性的 no_targets（→ 退件），不可 fail-open。
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        # 檔案存在（通過 os.path.isfile 過濾）但無任何 test_ 函式 → pytest rc==5
+        (tmp_path / 'test_empty.py').write_text('# no tests here\nVALUE = 1\n')
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_empty.py'], targets)
+        assert res['tool_status'] == 'no_targets'
+        assert res['error']
+
     def test_no_coverage_file_left_behind(self, tmp_path):
         from servers.coverage import measure_branch_coverage
         _write_fixture(tmp_path)
@@ -1092,6 +1105,29 @@ class TestRunCoverageGate:
         assert verdict['verdict'] == 'proceed'
         assert '⚠️' in verdict['warn']
 
+    def test_uncovered_at_retry_limit_returns_blocked(
+            self, mock_db_path, tmp_path, monkeypatch):
+        # 邊界（codex Major）：原任務已達 MAX_RETRIES-1 次退件，這次再退就達上限。
+        # finish_validation 會把任務設 'blocked' 並開 human_review；gate 必須把 blocked 往上帶，
+        # 不能仍回 'rejected'（否則 get_next_dispatch_gated 會 continue → 誤判成 waiting，任務卡死）。
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import get_task, update_task
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        # 預先把 rejection_count 設到上限前一格：retry_count = (MAX_RETRIES-1)+1 = MAX_RETRIES → blocked
+        update_task(task, rejection_count=facade.MAX_RETRIES - 1)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'blocked'
+        assert get_task(task)['status'] == 'blocked'
+
 
 class TestGetNextDispatchGated:
     def test_gated_rejects_then_executor_prompt_carries_missing_arc(
@@ -1126,6 +1162,34 @@ class TestGetNextDispatchGated:
         # 不是只 assert subagent_type == executor
         assert '2→4' in inst['prompt']
         assert 'x.py' in inst['prompt']
+
+    def test_gated_returns_blocked_at_retry_limit_not_waiting(
+            self, mock_db_path, tmp_path, monkeypatch):
+        # 邊界（codex Major）：退到 MAX_RETRIES 時，gated dispatch 必須回 action='blocked'
+        # （指向 human_review），不可 continue 後因 get_next_dispatch 抓不到 'blocked' 而回 'waiting'。
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status, update_task
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets':
+                                        [{'file_path': 'x.py', 'name': 'f',
+                                          'line_start': 1, 'line_end': 9}]})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        update_task(task, rejection_count=facade.MAX_RETRIES - 1)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+        inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
+        assert inst['action'] == 'blocked'
+        assert inst.get('subagent_type') != 'critic'
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
@@ -1145,10 +1209,19 @@ def _gate_reject(critic_task_id: str, original_task_id: str,
     關鍵：executor 重試 prompt 的 rejection context 來自 working_memory['critic_suggestions']
     （見 _get_rejected_tasks），而 finish_validation **不寫**此鍵。故 gate 必須先自己寫，
     行號才會出現在 executor 重試 prompt 裡。值為字串（直接被注入 prompt）。
+
+    重試上限：達 MAX_RETRIES 時 finish_validation 會把原任務設為 'blocked' 並回
+    status='blocked'/next_action='human_review'（servers/facade.py finish_validation 的
+    rejected 分支）。但 get_next_dispatch 的 blocked 偵測只看 get_task_progress(...).failed>0，
+    **抓不到 'blocked' 狀態** → 會誤判成 'waiting'（任務卡死、無人察覺）。故 gate 必須自己把
+    blocked 往上帶，讓 get_next_dispatch_gated 直接回 action='blocked'（指向 human_review）。
     """
     from servers.memory import set_working_memory
     set_working_memory(original_task_id, 'critic_suggestions', '\n'.join(issues))
-    finish_validation(critic_task_id, original_task_id, approved=False, issues=issues)
+    fv = finish_validation(critic_task_id, original_task_id, approved=False, issues=issues) or {}
+    if fv.get('status') == 'blocked':
+        return {'verdict': 'blocked', 'issues': issues,
+                'message': fv.get('message'), 'review_id': fv.get('review_id')}
     return {'verdict': 'rejected', 'issues': issues}
 
 
@@ -1160,7 +1233,9 @@ def run_coverage_gate(critic_task_id: str,
 
     fail-state 分流（對齊「工具確認、非 LLM 宣稱」）：
       - 有未覆蓋分支 / 測試失敗(tests_failed) / 沒測到(no_targets) / 推不出測試檔
-        → **確定性退件**（finish_validation + 寫 critic_suggestions），回 {'verdict':'rejected'}。
+        → **確定性退件**（_gate_reject：寫 critic_suggestions + finish_validation），
+        回 {'verdict':'rejected'}；若該退件令原任務達 MAX_RETRIES，_gate_reject 改回
+        {'verdict':'blocked', ...}（上游轉 action='blocked' → human_review）。
       - 全覆蓋 → {'verdict':'proceed', 'warn': None}。
       - 真正 infra（coverage 未安裝 / unavailable）→ fail-open，回
         {'verdict':'proceed', 'warn': <警示字串>}（上游把警示前置到 critic prompt）。
@@ -1235,6 +1310,15 @@ def get_next_dispatch_gated(parent_id: str,
         seen_critics.add(critic_id)
         verdict = run_coverage_gate(
             critic_id, inst['original_task_id'], project_name, project_path)
+        if verdict['verdict'] == 'blocked':
+            # 達 MAX_RETRIES：finish_validation 已開 human_review。直接回 blocked，
+            # 不再 continue（否則 get_next_dispatch 的 blocked 偵測抓不到 'blocked' 狀態 → 誤回 waiting）。
+            return {
+                'action': 'blocked',
+                'progress': inst.get('progress'),
+                'message': verdict.get('message') or '任務已達最大驗證重試次數，需人工審查。',
+                'review_id': verdict.get('review_id'),
+            }
         if verdict['verdict'] == 'rejected':
             continue  # 退件已處理，迴圈重取 → executor 重試
         if verdict.get('warn'):
