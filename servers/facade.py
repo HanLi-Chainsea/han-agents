@@ -1850,12 +1850,15 @@ def run_coverage_gate(critic_task_id: str,
     status = res['tool_status']
 
     if status == 'ok':
-        # 人類可見：每個 target 的實際覆蓋數字都印到 stderr（通過/缺口都印），
+        # 人類可見：每個 target 的實際覆蓋數字＋逐條分支都印到 stderr（通過/缺口都印），
         # 讓跑 /han:unit-test 的人「看得到覆蓋率」，不再靜默通過。
-        for line in cov.format_coverage_summary(res['per_target']):
+        summary = cov.format_coverage_summary(res['per_target'])
+        for line in summary:
             sys.stderr.write(line + '\n')
         if res['fully_covered']:
-            return {'verdict': 'proceed', 'warn': None}
+            # 同時把摘要回傳：stderr 是即時的、迴圈結束後就消失；回傳值讓 dispatch
+            # 迴圈攔得到，最後能寫進收尾的人類報告（不只 stderr）。
+            return {'verdict': 'proceed', 'warn': None, 'coverage_summary': summary}
         issues = cov.format_missing_issues(res['per_target'])
         issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
         return _gate_reject(critic_task_id, original_task_id, issues)
@@ -1909,6 +1912,9 @@ def get_next_dispatch_gated(parent_id: str,
             continue  # 退件已處理，迴圈重取 → executor 重試
         if verdict.get('warn'):
             inst['prompt'] = verdict['warn'] + '\n\n' + inst['prompt']
+        if verdict.get('coverage_summary'):
+            # 掛到回傳的 critic dispatch 上，讓 /han:unit-test 迴圈每輪攔得到，收尾寫進報告。
+            inst['coverage_summary'] = verdict['coverage_summary']
         return inst
 
 

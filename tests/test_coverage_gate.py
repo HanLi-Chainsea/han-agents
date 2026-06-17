@@ -347,6 +347,27 @@ class TestRunCoverageGate:
         assert verdict['verdict'] == 'proceed'
         assert verdict.get('warn') in (None, '')
 
+    def test_proceed_carries_coverage_summary_for_final_report(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """全覆蓋放行時，gate 要把人類可讀的覆蓋摘要一併回傳，供收尾報告引用
+        （不只是寫 stderr，否則迴圈結束後就拿不到）。"""
+        import servers.coverage as cov
+        import servers.facade as facade
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}, {'from': 2, 'to': 4}],
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}]})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        summary = '\n'.join(verdict['coverage_summary'])
+        assert '2/2' in summary and 'x.py' in summary
+        assert '✓' in summary and 'L2→3' in summary
+
     def test_unavailable_proceeds_with_warning(self, mock_db_path, tmp_path, monkeypatch):
         import servers.coverage as cov
         import servers.facade as facade
@@ -406,6 +427,36 @@ class TestGetNextDispatchGated:
         assert inst['task_id'] == task
         assert '2→4' in inst['prompt']
         assert 'x.py' in inst['prompt']
+
+    def test_gated_proceeds_to_critic_attaches_coverage_summary(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """全覆蓋 → 派 critic；gate 把覆蓋摘要掛到回傳的 dispatch 上，
+        讓 /han:unit-test 迴圈每輪都拿得到，最後寫進人類報告。"""
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets':
+                                        [{'file_path': 'x.py', 'name': 'f',
+                                          'line_start': 1, 'line_end': 9}]})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}, {'from': 2, 'to': 4}],
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}]})
+
+        inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
+        assert inst['subagent_type'] == 'critic'
+        summary = '\n'.join(inst['coverage_summary'])
+        assert '2/2' in summary and 'x.py' in summary and '✓' in summary
 
     def test_gated_returns_blocked_at_retry_limit_not_waiting(
             self, mock_db_path, tmp_path, monkeypatch):
