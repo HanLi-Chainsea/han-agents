@@ -85,3 +85,118 @@ class TestRecipePersistsCoverageTargets:
             {'file_path': 'servers/x.py', 'name': 'bar', 'line_start': 30, 'line_end': 40},
             {'file_path': 'servers/x.py', 'name': 'baz', 'line_start': 45, 'line_end': 60},
         ]
+
+
+import textwrap
+
+import pytest
+
+
+def _coverage_importable():
+    try:
+        import importlib.util
+        return importlib.util.find_spec('coverage') is not None
+    except Exception:
+        return False
+
+
+def _write_fixture(root):
+    (root / 'sample.py').write_text(textwrap.dedent('''\
+        def classify(n):
+            if n > 0:
+                return "pos"
+            if n < 0:
+                return "neg"
+            return "zero"
+
+        def guarded(x):
+            if x is None:        # pragma: no cover
+                return "none"
+            return "val"
+    '''))
+    (root / 'test_sample.py').write_text(textwrap.dedent('''\
+        from sample import classify, guarded
+        def test_pos():
+            assert classify(5) == "pos"
+        def test_val():
+            assert guarded(1) == "val"
+    '''))
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestMeasureBranchCoverage:
+    def test_detects_missing_branches_in_target_range(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_sample.py'], targets)
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is False
+        pt = res['per_target'][0]
+        assert pt['name'] == 'classify'
+        assert len(pt['missing_branches']) >= 1
+        assert pt['n_total'] >= pt['n_covered'] + 1
+
+    def test_out_of_range_branches_not_attributed(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        targets = [{'file_path': 'sample.py', 'name': 'guarded',
+                    'line_start': 8, 'line_end': 11}]
+        res = measure_branch_coverage(str(tmp_path), ['test_sample.py'], targets)
+        assert res['tool_status'] == 'ok'
+        pt = res['per_target'][0]
+        for arc in pt['missing_branches']:
+            assert 8 <= arc['from'] <= 11
+        assert pt['missing_branches'] == []
+
+    def test_pytest_failure_is_tests_failed(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        (tmp_path / 'test_broken.py').write_text('def test_x():\n    assert False\n')
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_broken.py'], targets)
+        assert res['tool_status'] == 'tests_failed'
+        assert res['error']
+
+    def test_target_not_exercised_is_no_targets(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        (tmp_path / 'test_unrelated.py').write_text(
+            'def test_math():\n    assert 1 + 1 == 2\n')
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_unrelated.py'], targets)
+        assert res['tool_status'] == 'no_targets'
+        assert res['error']
+
+    def test_no_tests_collected_rc5_is_no_targets(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        (tmp_path / 'test_empty.py').write_text('# no tests here\nVALUE = 1\n')
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_empty.py'], targets)
+        assert res['tool_status'] == 'no_targets'
+        assert res['error']
+
+    def test_no_coverage_file_left_behind(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        measure_branch_coverage(str(tmp_path), ['test_sample.py'], targets)
+        leftovers = [p for p in os.listdir(tmp_path) if p.startswith('.coverage')]
+        assert leftovers == []
+
+
+class TestMeasureUnavailableWhenNotInstalled:
+    def test_missing_coverage_module_is_unavailable(self, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+        res = cov.measure_branch_coverage(str(tmp_path), ['test_x.py'],
+                                          [{'file_path': 'x.py', 'name': 'f',
+                                            'line_start': 1, 'line_end': 3}])
+        assert res['tool_status'] == 'unavailable'
+        assert 'coverage' in (res['error'] or '').lower()
