@@ -1554,7 +1554,7 @@ git commit -m "test: branch-coverage gate end-to-end verification"
 **3. Type consistency：**
 - `measure_branch_coverage(project_path, test_targets, coverage_targets)` 回傳 `tool_status ∈ {'ok','tests_failed','no_targets','unavailable'}`、`per_target[].missing_branches=[{'from','to'}]` —— Task 5 定義，Task 6/8 測試與 `format_missing_issues`/`run_coverage_gate` 消費的狀態分流一致 ✅
 - `coverage_targets` 元素 `{file_path,name,line_start,line_end}` —— Task 4 `_gaps_to_coverage_targets` 產出、Task 5/8 消費一致 ✅
-- `run_coverage_gate(...) -> {'verdict': 'rejected'|'proceed', 'warn'?, 'issues'?}`；`_gate_reject` 共用退件路徑（寫 critic_suggestions + finish_validation）—— Task 8 定義並由 `get_next_dispatch_gated` 消費一致 ✅
+- `run_coverage_gate(...) -> {'verdict': 'rejected'|'blocked'|'proceed', 'warn'?, 'issues'?, 'message'?, 'review_id'?}`；`_gate_reject` 共用退件路徑（寫 critic_suggestions + finish_validation），達 MAX_RETRIES 時回 `'blocked'`，`get_next_dispatch_gated` 轉 `action='blocked'`（human_review）—— Task 8 定義並由 `get_next_dispatch_gated` 消費一致 ✅
 - rejection context 資料流：`_gate_reject` 寫 `working_memory['critic_suggestions']`（字串）→ `_get_rejected_tasks` 讀為 `_rejection_context` → `get_next_dispatch` 注入 `_build_executor_prompt` → executor 重試 prompt 帶行號（Task 8 測試端到端 assert `'2→4' in inst['prompt']`）✅
 - `finish_validation(critic_task_id, original_task_id, approved=False, issues=...)` 對齊實際簽名（第一參數＝critic 任務 id）✅
 - critic dispatch 的 `original_task_id`（Task 7 新增）被 `get_next_dispatch_gated`（Task 8）讀取，名稱一致 ✅
