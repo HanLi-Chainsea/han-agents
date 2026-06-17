@@ -632,3 +632,48 @@ class TestGateFailClosedRouting:
         verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'rejected'
         assert get_task(task)['status'] == 'pending'
+
+
+class TestGateMetadataGuard:
+    """metadata['coverage_targets'] 型別防呆：壞掉的 metadata 不可被 `or []`
+    靜默當成非 coverage 任務而跳過 gate（隱性繞過＝假綠相鄰）。"""
+
+    def _make(self, cov_targets_value):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        meta = {} if cov_targets_value is _ABSENT else {'coverage_targets': cov_targets_value}
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True, metadata=meta)
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_absent_targets_proceeds_not_a_coverage_task(
+            self, mock_db_path, tmp_path):
+        import servers.facade as facade
+        task, critic_id = self._make(_ABSENT)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+
+    def test_malformed_string_targets_is_reject_not_silent_bypass(
+            self, mock_db_path, tmp_path):
+        import servers.facade as facade
+        from servers.tasks import get_task
+        task, critic_id = self._make('oops-not-a-list')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+
+    def test_non_dict_elements_is_reject(self, mock_db_path, tmp_path):
+        import servers.facade as facade
+        from servers.tasks import get_task
+        task, critic_id = self._make([1, 2, 3])
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+
+
+_ABSENT = object()

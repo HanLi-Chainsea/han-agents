@@ -1814,13 +1814,23 @@ def run_coverage_gate(critic_task_id: str,
     from servers import coverage as cov
 
     original = get_task(original_task_id)
-    metadata = (original or {}).get('metadata') or {}
-    coverage_targets = metadata.get('coverage_targets') or []
+    metadata = (original or {}).get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+    coverage_targets = metadata.get('coverage_targets')
     result_text = (original or {}).get('result') or ''
 
-    # 沒有結構化 target（非 unit_test recipe 建的任務）→ 不攔，照常派 critic
-    if not coverage_targets:
+    # key 不存在 / 空 → 非 unit_test recipe 任務或無 target → 不攔，照常派 critic
+    if coverage_targets is None or coverage_targets == []:
         return {'verdict': 'proceed', 'warn': None}
+
+    # key 存在但型別壞掉（非 list[dict]）→ 這是 coverage 任務但 metadata 損毀，
+    # 不可被 `or []` 靜默當成非 coverage 任務而跳過 gate（隱性繞過＝假綠）→ 確定性退件。
+    if (not isinstance(coverage_targets, list)
+            or not all(isinstance(t, dict) for t in coverage_targets)):
+        return _gate_reject(critic_task_id, original_task_id, [
+            f'分支覆蓋率 gate：coverage_targets metadata 型別異常'
+            f'（預期 list[dict]，得到 {type(coverage_targets).__name__}）。'])
 
     # coverage 套件缺失＝真正 infra → fail-open
     if not cov._coverage_available():
