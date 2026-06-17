@@ -4,13 +4,13 @@
 
 **Goal:** 讓 unit_test 派工迴圈在 executor 寫完測試後，用工具實際量測「本次任務 target 範圍內」的分支覆蓋率；有未覆蓋分支就以**具體行號**自動退回 executor 補測，不依賴 LLM 判讀。殺掉「覆蓋足夠與否靠人眼/LLM 判斷」的瓶頸。
 
-**Architecture:** 新增單一職責模組 `servers/coverage.py`（跑 `coverage run --branch`、用 AST 把分支歸因到 target 函式 scope）；`/han:unit-test` 的 dispatch 迴圈在 `get_next_dispatch` 回傳 critic dispatch 後、實際派 LLM critic 之前插入一道確定性 gate，未覆蓋時**改走既有 `finish_validation` 退件路由**（不另闢控制流）；資料層補 target 行範圍 metadata；playbook 補對應原則；對應測試。
+**Architecture:** 新增單一職責模組 `servers/coverage.py`（跑 `coverage run --branch`、用**行範圍**把分支歸因到 target 函式）；`/han:unit-test` 的 dispatch 迴圈在 `get_next_dispatch` 回傳 critic dispatch 後、實際派 LLM critic 之前插入一道確定性 gate，未覆蓋時**改走既有 `finish_validation` 退件路由**（不另闢控制流）；資料層補 target 行範圍 metadata；playbook 補對應原則；對應測試。
 
-**Tech Stack:** Python、`coverage.py`（`--branch`）、`ast`（scope 歸因）、pytest、HAN recipe+playbook+executor/critic 派工。
+**Tech Stack:** Python、`coverage.py`（`--branch`）、pytest、HAN recipe+playbook+executor/critic 派工。
 
 **Scope:** 單一語言（Python）。Java/JaCoCo 為 v2，本 spec 不含、抽象層不預建（YAGNI）。
 
-**審查狀態：** 經 dual-model gate（codex 後端權威 + gemini）審查後修訂。本版已納入兩者交叉驗證的 C1/C2 + M1–M6 + Minor，並驗證了所依賴的 facade 契約。
+**審查狀態：** 經 dual-model gate（codex 後端權威 + gemini）審查後修訂，再依使用者「不過度工程」指示精簡：保留載重的 C1（資料流）/C2（finish_validation 路由），砍掉 AST scope 歸因（改行範圍過濾）與零分支 executed 檢查，fail-state 收斂為兩條路。核心三件事：補 target 行範圍、`--branch` 量測、未覆蓋走 `finish_validation`。
 
 ---
 
@@ -38,39 +38,36 @@
 
 ```
 measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
-    'tool_status': 'ok' | 'not_installed' | 'pytest_failed'
-                 | 'source_missing' | 'report_failed',
-    'fully_covered': bool,            # 所有 coverage_targets scope 內無未覆蓋分支
-    'per_target': [ {                 # 逐 target
+    'tool_status': 'ok' | 'measure_failed',   # 量到資料 / 量不到（含未安裝、pytest 失敗、報告失敗、target 不在報告）
+    'fully_covered': bool,            # 所有 coverage_targets 行範圍內無未覆蓋分支
+    'per_target': [ {                 # 逐 target（tool_status=='ok' 時）
         'file_path', 'name', 'line_start', 'line_end',
-        'missing_branches': [{'from': int, 'to': int}],   # 已歸因到此 target scope
+        'missing_branches': [{'from': int, 'to': int}],   # src_line 落在此 target 行範圍內
         'n_total': int, 'n_covered': int,
     } ],
-    'error': str | None,
+    'error': str | None,              # measure_failed 時帶原因（未安裝 / pytest 失敗 / …）供報告標記
 }
 ```
 
 **機制：**
 1. **隔離資料檔（M5）：** 用 `tempfile.TemporaryDirectory()`；設 `COVERAGE_FILE=<tmp>/.coverage`（或 `coverage --data-file`），避免污染專案根與並行競態。
-2. **執行（M6）：** `subprocess.run([sys.executable, '-m', 'coverage', 'run', '--branch', '--data-file', DATA, '-m', 'pytest', *test_targets], cwd=project_path, env=..., timeout=...)`——**list argv、不走 shell**；`test_targets`/`project_path` 先 canonicalize 並限制在 project root 下；輸出截斷。
-3. `coverage json --data-file DATA -o <tmp>/cov.json`。
-4. **路徑正規化（Minor）：** 對 `files` 的 key 建 canonical map（resolve 相對/絕對、`./` 前綴），對應 target `file_path`；對應不到 → `tool_status='source_missing'`。
-5. **AST scope 歸因（M2）：** 用 `ast.parse` 取 target 函式的 `lineno/end_lineno`，並**排除其內巢狀 function/class/lambda 的 scope**；把 coverage 的 branch arc（`[src_line, dest]`）對應到「最內層 AST owner」後，**只留 owner 屬於此 target 的**。避免巢狀/decorator/多行 lambda/comprehension 誤算。
+2. **執行（M6）：** `subprocess.run([sys.executable, '-m', 'coverage', 'run', '--branch', '--data-file', DATA, '-m', 'pytest', *test_targets], cwd=project_path, env=..., timeout=...)`——**list argv、不走 shell**；`test_targets`/`project_path` 先 canonicalize 並限制在 project root 下；輸出截斷。coverage 未安裝 / pytest 非零退出 → `tool_status='measure_failed'`（帶 `error` 原因）。
+3. `coverage json --data-file DATA -o <tmp>/cov.json`；產製失敗 → `measure_failed`。
+4. **路徑正規化（Minor）：** 對 `files` 的 key 建 canonical map（resolve 相對/絕對、`./` 前綴），對應 target `file_path`；對應不到（target 沒被 import/執行）→ `measure_failed`。
+5. **行範圍歸因（精簡，取代 AST）：** 把 coverage 的 branch arc `[src_line, dest]`，凡 `src_line ∈ [line_start, line_end]` 即歸入此 target。**已知限制：** target 行範圍內的巢狀 function/lambda 分支也會被算入——這是**偏保守的過度涵蓋**（要求多測，不會漏算），對 v1 gate 可接受；行範圍內過度糾纏的檔案本就該先走 `/han:refactor`。AST 精確 scope 留待 v2 視需要再加。
 6. `fully_covered = (所有 target 的 missing_branches 皆空)`。
-7. **零分支但未執行（Minor）：** 若 target scope 內 0 分支，額外檢查該 target 至少有一行被 executed（用 `executed_lines`）；完全沒執行到 → 視為未覆蓋（`source_missing` 類，退件），避免無斷言/沒 import 的 target 以 trivial pass 溜過。
 
 **非侵入：** 全程 `python -m coverage` CLI + 隔離 data file，不寫 `.coveragerc`/`pyproject`/`setup.cfg`；專案已有 `.coveragerc` 則沿用、不覆寫。
 
 ### 2. `/han:unit-test` dispatch 迴圈：確定性 gate（走 finish_validation）
 
-迴圈每輪 `get_next_dispatch` 後判斷回傳：
+迴圈每輪 `get_next_dispatch` 後判斷回傳。只有**兩條路**（fail-state 不再細分）：
 - `subagent_type == 'critic'`：**先別派 critic**，跑 coverage bash 步驟（inline env 慣例）讀該原任務的 `coverage_targets` + executor 回報的 `test_targets`，呼叫 `measure_branch_coverage`：
-  - `tool_status=='ok' && !fully_covered` → 用回傳的 `critic_task_id` 呼叫 `finish_validation(critic_task_id, original_task_id, approved=False, issues=['servers/x.py:42→exit, 57→59 分支未覆蓋', ...])`。executor 自動被 resume 並帶具體行號；**不派 LLM critic、不費 token**。
-  - `tool_status=='ok' && fully_covered` → 照常派 LLM critic（質性：AAA/測行為/命名）。
-  - `tool_status=='pytest_failed'` → **hard reject**（`finish_validation(approved=False, issues=['測試執行失敗: ...'])`）。
-  - `tool_status=='source_missing'` → **reject**（target 沒被測試 import/執行）。
-  - `tool_status=='not_installed' | 'report_failed'` → **fail-open**：照常派 LLM critic，但 critic prompt 與收尾報告**大聲標記** `⚠️ 分支覆蓋率工具不可用（<原因>），本任務回退人工判讀`。
-- **無限退件防護（M3）：** 退件一律走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 轉 blocked + human-review（既有機制，免新增）。最後一輪的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
+  - **量到資料且有未覆蓋分支**（`tool_status=='ok' && !fully_covered`）→ 用回傳的 `critic_task_id` 呼叫 `finish_validation(critic_task_id, original_task_id, approved=False, issues=['servers/x.py:42→exit, 57→59 分支未覆蓋', ...])`。executor 自動被 resume 並帶具體行號；**不派 LLM critic、不費 token**。這是 gate 的唯一確定性退件路。
+  - **其餘一律 fail-open，照常派 LLM critic**：
+    - 量到資料且全覆蓋（`ok && fully_covered`）→ 派 LLM critic 做質性檢查（AAA/測行為/命名）。
+    - 量不到（`measure_failed`，含未安裝 / pytest 失敗 / 報告失敗 / target 不在報告）→ 一樣派 LLM critic，但 critic prompt 與收尾報告**大聲標記** `⚠️ 分支覆蓋率工具未量到（<error>），本任務回退人工逐分支核對`。**LLM critic 既有 checklist 本就要求「驗證測試實際被執行且通過」**——pytest 失敗、target 沒被測到都會在此被擋，不會被洗成 pass。
+- **無限退件防護：** 確定性退件走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 轉 blocked + human-review（既有機制，免新增）。最後一輪的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
 
 ### 3. `reference/playbooks/unit-test.md`
 
@@ -80,16 +77,15 @@ measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
 ### 4. `tests/`
 
 - `measure_branch_coverage` 對 fixtures：
-  - 基本：含 if/else + null 分支的 source + 只覆蓋部分分支的測試 → 抓到 target scope 內 missing_branches；
-  - **AST 歸因**：巢狀 function、decorator、多行 lambda、comprehension → 內層 scope 的分支**不**誤算進外層 target；
+  - 基本：含 if/else + null 分支的 source + 只覆蓋部分分支的測試 → 抓到 target 行範圍內 missing_branches；
+  - **行範圍過濾**：範圍外（其他函式）的 missing 分支**不**算進此 target；
+  - **行範圍保守涵蓋**：target 範圍內巢狀 function 的未覆蓋分支**會**被算入（記錄此為已知/刻意行為，非 bug）；
   - pragma 被尊重（標記分支不計 missing）；
-  - 行範圍過濾正確（範圍外 missing 不算進來）；
-  - **fail-state 分類**：coverage 未安裝→`not_installed`(fail-open)；pytest 失敗→`pytest_failed`(reject)；target 不在報告→`source_missing`(reject)；皆不拋例外；
-  - **零分支但未執行**的 target → 判未覆蓋；
+  - **fail-state 二分**：coverage 未安裝 / pytest 失敗 / target 不在報告 → 一律 `measure_failed`（帶 `error`），皆不拋例外；量到資料 → `ok`；
   - **非侵入**：跑完專案根**無 `.coverage*` 殘留**。
 - `test_targets` 歸因（M1）：既有測試已覆蓋的分支不被誤判未覆蓋（gate 的 `test_targets` 含該 source 既有測試 + 新測試）。
 - 資料流（C1）：`detect_coverage_gaps` 回傳含 `line_end`；`recipe_unit_tests` 把 `coverage_targets` 寫進 task metadata 並可讀回。
-- 指令 markdown 回歸測試：critic 分支先跑 coverage、未覆蓋走 `finish_validation(approved=False)`、全覆蓋才派 critic。
+- 指令 markdown 回歸測試：critic 分支先跑 coverage、未覆蓋走 `finish_validation(approved=False)`、其餘（全覆蓋或 measure_failed）才派 critic。
 
 ## 資料流（修訂）
 
@@ -98,37 +94,37 @@ recipe 建任務 → task.metadata.coverage_targets = [{file,name,line_start,lin
   → executor 寫測試、跑、結構化回報 test_targets
   → get_next_dispatch 回 critic dispatch（已 reserve critic_task_id）
   → [coverage gate] measure_branch_coverage(test_targets, coverage_targets)
-       ok & 未覆蓋 → finish_validation(critic_task_id, approved=False, issues=[行號])
+       ok & 未覆蓋 → finish_validation(critic_task_id, approved=False, issues=[行號])  ← 唯一確定性退件
                       → 既有 bookkeeping：rejection_count++ / MAX_RETRIES→blocked / 否則 resume_executor(帶行號)
-       ok & 全覆蓋 → 派 LLM critic（質性）→ finish_validation(approved)
-       pytest_failed / source_missing → finish_validation(approved=False, issues=[原因])
-       not_installed / report_failed → fail-open → 派 LLM critic（報告大聲標記）
+       其餘一律 fail-open → 派 LLM critic：
+            ok & 全覆蓋   → 質性檢查
+            measure_failed → 報告大聲標記，critic 既有 checklist 仍擋「測試未執行/未通過」
 ```
 
 ## 錯誤與邊界
 
 | 情境 | 行為 |
 |---|---|
-| coverage 套件未安裝 | `not_installed`，**fail-open** 回退 LLM，報告大聲標記 |
-| coverage json 產製失敗 | `report_failed`，fail-open，報告標記 |
-| 測試執行失敗 | `pytest_failed`，**hard reject**（不偽裝成工具不可用） |
-| target 不在覆蓋報告（沒被 import/執行） | `source_missing`，**reject** |
+| 量到資料 + target 有未覆蓋分支 | **確定性退件** `finish_validation(approved=False, issues=[行號])` |
+| 量到資料 + 全覆蓋 | 派 LLM critic 做質性檢查 |
+| coverage 未安裝 / json 產製失敗 / 測試執行失敗 / target 不在報告 | 一律 `measure_failed`，**fail-open** 派 LLM critic（報告大聲標記 `error`）；測試未執行/未通過由 critic 既有 checklist 擋 |
 | 防禦性/不可達分支 | 尊重 `# pragma: no cover`/`no branch`；executor 須說明理由 |
-| target 零分支 | 仍要求至少被 executed，否則判未覆蓋 |
 | 多任務並行 | 隔離 `COVERAGE_FILE`，無 `.coverage` 競態 |
 | 退件無限迴圈 | 走 `finish_validation` → `MAX_RETRIES` 自動 blocked + human-review |
 
 ## 安全（明文化，M6）
 
 - 在 project cwd 跑 pytest＝執行專案碼——**沿用 HAN executor 既有「已允許執行測試」的信任模型**；本 gate 不擴大信任邊界。
-- `subprocess.run([...])` list argv、**不走 shell**（無 command injection）；`project_path`/`source_file`/`test_targets` canonicalize 並限制在 project root 下；加 `timeout` 與輸出截斷。
+- `subprocess.run([...])` list argv、**不走 shell**（無 command injection）；`project_path`/`test_targets` canonicalize 並限制在 project root 下；加 `timeout` 與輸出截斷。
 
 ## 明確排除（YAGNI）
 
 - Java / JaCoCo（v2；屆時才引入 coverage adapter 抽象層）。
 - 全檔百分比門檻（只做 target-scoped 全覆蓋）。
 - 覆蓋率歷史趨勢 / 持久化 DB。
-- line / statement 覆蓋（只做 branch；零分支 target 僅做最小 executed 檢查）。
+- line / statement 覆蓋（只做 branch）。
+- AST 精確 scope 歸因（v1 用行範圍；巢狀誤含為可接受的保守過度涵蓋，v2 視需要再加）。
+- 零分支 target 的 executed 檢查（屬 statement 覆蓋範疇；無斷言測試由 critic 既有「不得空殼/恆真斷言」checklist 擋）。
 
 ## 護欄沿用
 
