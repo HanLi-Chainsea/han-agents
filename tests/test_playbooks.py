@@ -231,3 +231,29 @@ class TestUnitTestCommandEnvInlining:
         assert target_lines, "找不到帶 HAN_TARGET 的 python 啟動行"
         for ln in target_lines:
             assert re.search(r"HAN_TARGET='[^']*'", ln), f"HAN_TARGET 未以單引號包住：{ln}"
+
+
+class TestUnitTestCommandUsesGatedDispatch:
+    def _command_text(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(os.path.dirname(here), "commands", "han", "unit-test.md")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_loop_imports_gated_dispatch(self):
+        text = self._command_text()
+        assert "get_next_dispatch_gated" in text, "迴圈未改用 gated dispatch"
+
+    def test_gated_dispatch_block_inlines_project_env(self):
+        # gate 需要 project_path 真跑 coverage → 該 python 區塊必須 inline HAN_PROJECT_PATH
+        import re
+        for ln in self._command_text().splitlines():
+            if "get_next_dispatch_gated" in ln and "import" not in ln:
+                pass
+        starts = [ln for ln in self._command_text().splitlines()
+                  if "python3 - <<'PY'" in ln and "HAN_EPIC=" in ln]
+        assert starts, "找不到帶 HAN_EPIC 的派工迴圈 python 區塊"
+        for ln in starts:
+            prefix = ln.split("python3", 1)[0]
+            assert "HAN_PROJECT_PATH=" in prefix
+            assert "HAN_PROJECT=" in prefix

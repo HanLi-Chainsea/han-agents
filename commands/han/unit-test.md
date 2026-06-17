@@ -47,13 +47,13 @@ PY
 ```
 - 若 `task_count==0`／`EPIC` 為 None → 回報訊息後**停止**（沒有缺口或沒指定範圍）。
 
-3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 印出的同一個 epic_id 放進 `HAN_EPIC` 前綴，並 inline 重算其餘環境變數再執行：
+3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 印出的同一個 epic_id 放進 `HAN_EPIC` 前綴，並 inline 重算其餘環境變數再執行。**用 `get_next_dispatch_gated`**：當下一步是 critic 驗證時，它會先用 `coverage --branch` 量測本次 target 的分支覆蓋——有未覆蓋分支就直接走 `finish_validation` 退回 executor 補測（帶具體行號、不派 critic、不費 token）；全覆蓋或工具不可用才照常派 critic：
 ```bash
 HAN_EPIC="<epic_id>" HAN_PROJECT="$(basename "$(pwd)")" HAN_PROJECT_PATH="$(pwd)" python3 - <<'PY'
 import os, sys, json
 sys.path.insert(0, {{HAN_DIR}})
-from servers.facade import get_next_dispatch
-inst = get_next_dispatch(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
+from servers.facade import get_next_dispatch_gated
+inst = get_next_dispatch_gated(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
 print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','progress','message')}, ensure_ascii=False))
 print('PROMPT_START'); print(inst.get('prompt','')); print('PROMPT_END')
 PY
