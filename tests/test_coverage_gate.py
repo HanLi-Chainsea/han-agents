@@ -266,3 +266,169 @@ class TestCriticDispatchHasOriginalTaskId:
         inst = get_next_dispatch(epic, 'proj', str(tmp_path))
         assert inst['subagent_type'] == 'critic'
         assert inst['original_task_id'] == task
+
+
+class TestRunCoverageGate:
+    def _setup_done_task(self, cov_targets, result):
+        # 依賴測試方法已掛 mock_db_path fixture（隔離 DB）。
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_uncovered_rejects_and_writes_rejection_context(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+        from servers.tasks import get_task
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and '2→4' in wm
+
+    def test_tests_failed_is_deterministic_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import get_task
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'tests_failed', 'fully_covered': False,
+            'per_target': [], 'error': '測試未通過 (rc=1): assert False'})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+
+    def test_no_test_targets_is_deterministic_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done（沒有 marker）')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: [])
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert any('TEST_TARGETS' in i for i in verdict['issues'])
+
+    def test_fully_covered_proceeds_to_critic(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}]})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        assert verdict.get('warn') in (None, '')
+
+    def test_unavailable_proceeds_with_warning(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        assert '⚠️' in verdict['warn']
+
+    def test_uncovered_at_retry_limit_returns_blocked(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import get_task, update_task
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        update_task(task, rejection_count=facade.MAX_RETRIES - 1)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'blocked'
+        assert get_task(task)['status'] == 'blocked'
+
+
+class TestGetNextDispatchGated:
+    def test_gated_rejects_then_executor_prompt_carries_missing_arc(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets':
+                                        [{'file_path': 'x.py', 'name': 'f',
+                                          'line_start': 1, 'line_end': 9}]})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+
+        inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
+        assert inst['subagent_type'] == 'executor'
+        assert inst['task_id'] == task
+        assert '2→4' in inst['prompt']
+        assert 'x.py' in inst['prompt']
+
+    def test_gated_returns_blocked_at_retry_limit_not_waiting(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status, update_task
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets':
+                                        [{'file_path': 'x.py', 'name': 'f',
+                                          'line_start': 1, 'line_end': 9}]})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        update_task(task, rejection_count=facade.MAX_RETRIES - 1)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [{'from': 2, 'to': 4}],
+                            'n_total': 2, 'n_covered': 1}]})
+        inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
+        assert inst['action'] == 'blocked'
+        assert inst.get('subagent_type') != 'critic'

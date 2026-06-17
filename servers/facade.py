@@ -1771,6 +1771,130 @@ def get_next_dispatch(
     })
 
 
+def _gate_reject(critic_task_id: str, original_task_id: str,
+                 issues: List[str]) -> Dict:
+    """確定性退件。
+
+    關鍵：executor 重試 prompt 的 rejection context 來自 working_memory['critic_suggestions']
+    （見 _get_rejected_tasks），而 finish_validation **不寫**此鍵。故 gate 必須先自己寫，
+    行號才會出現在 executor 重試 prompt 裡。值為字串（直接被注入 prompt）。
+
+    重試上限：達 MAX_RETRIES 時 finish_validation 會把原任務設為 'blocked' 並回
+    status='blocked'/next_action='human_review'（servers/facade.py finish_validation 的
+    rejected 分支）。但 get_next_dispatch 的 blocked 偵測只看 get_task_progress(...).failed>0，
+    **抓不到 'blocked' 狀態** → 會誤判成 'waiting'（任務卡死、無人察覺）。故 gate 必須自己把
+    blocked 往上帶，讓 get_next_dispatch_gated 直接回 action='blocked'（指向 human_review）。
+    """
+    from servers.memory import set_working_memory
+    set_working_memory(original_task_id, 'critic_suggestions', '\n'.join(issues))
+    fv = finish_validation(critic_task_id, original_task_id, approved=False, issues=issues) or {}
+    if fv.get('status') == 'blocked':
+        return {'verdict': 'blocked', 'issues': issues,
+                'message': fv.get('message'), 'review_id': fv.get('review_id')}
+    return {'verdict': 'rejected', 'issues': issues}
+
+
+def run_coverage_gate(critic_task_id: str,
+                      original_task_id: str,
+                      project_name: str,
+                      project_path: str) -> Dict:
+    """對一個待派 critic 的任務跑分支覆蓋率 gate。
+
+    fail-state 分流（對齊「工具確認、非 LLM 宣稱」）：
+      - 有未覆蓋分支 / 測試失敗(tests_failed) / 沒測到(no_targets) / 推不出測試檔
+        → **確定性退件**（_gate_reject：寫 critic_suggestions + finish_validation），
+        回 {'verdict':'rejected'}；若該退件令原任務達 MAX_RETRIES，_gate_reject 改回
+        {'verdict':'blocked', ...}（上游轉 action='blocked' → human_review）。
+      - 全覆蓋 → {'verdict':'proceed', 'warn': None}。
+      - 真正 infra（coverage 未安裝 / unavailable）→ fail-open，回
+        {'verdict':'proceed', 'warn': <警示字串>}（上游把警示前置到 critic prompt）。
+    """
+    import sys
+    from servers.tasks import get_task
+    from servers import coverage as cov
+
+    original = get_task(original_task_id)
+    metadata = (original or {}).get('metadata') or {}
+    coverage_targets = metadata.get('coverage_targets') or []
+    result_text = (original or {}).get('result') or ''
+
+    # 沒有結構化 target（非 unit_test recipe 建的任務）→ 不攔，照常派 critic
+    if not coverage_targets:
+        return {'verdict': 'proceed', 'warn': None}
+
+    # coverage 套件缺失＝真正 infra → fail-open
+    if not cov._coverage_available():
+        return {'verdict': 'proceed',
+                'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
+
+    sys.stderr.write('… 量測分支覆蓋率中 …\n')  # UX：pytest 較久時別讓使用者以為當機
+
+    test_targets = cov.derive_test_targets(project_path, result_text, coverage_targets)
+    if not test_targets:
+        # 推不出測試檔 → 確定性退件，要求 executor 用 marker 回報
+        return _gate_reject(critic_task_id, original_task_id, [
+            '未能確認你寫的測試檔。請在回報中以**獨立一行** '
+            '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，gate 才能量測分支覆蓋。'])
+
+    res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
+    status = res['tool_status']
+
+    if status == 'ok':
+        if res['fully_covered']:
+            return {'verdict': 'proceed', 'warn': None}
+        issues = cov.format_missing_issues(res['per_target'])
+        issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
+        return _gate_reject(critic_task_id, original_task_id, issues)
+
+    if status in ('tests_failed', 'no_targets'):
+        # 工具判定失敗/沒測到 → 確定性退件，不交給 LLM 宣稱
+        return _gate_reject(critic_task_id, original_task_id,
+                            [f'分支覆蓋率 gate：{res.get("error")}'])
+
+    # status == 'unavailable' → 真正 infra 問題 → fail-open
+    return {'verdict': 'proceed',
+            'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
+
+
+def get_next_dispatch_gated(parent_id: str,
+                            project_name: str,
+                            project_path: str,
+                            trace_id: str = None) -> Dict:
+    """get_next_dispatch + 分支覆蓋率 gate。
+
+    底層派 critic 時先跑 gate：確定性退件 → finish_validation 已處理，重取下一個 dispatch
+    （會變成 executor 重試）；其餘照常回傳 critic（fail-open 時把警示前置到 prompt）。
+    其他 action（executor/done/blocked）原樣回傳。
+    防護：記住本次已跑過 gate 的 critic id，若同一 critic 又被派回（理應不會——
+    finish_validation 會把任務推進到 pending/execution）→ 直接回傳避免無限迴圈。
+    """
+    seen_critics = set()
+    while True:
+        inst = get_next_dispatch(parent_id, project_name, project_path, trace_id)
+        if inst.get('action') != 'dispatch' or inst.get('subagent_type') != 'critic':
+            return inst
+        critic_id = inst.get('task_id')
+        if critic_id in seen_critics:
+            return inst  # 防護：避免狀態未推進時的無限迴圈
+        seen_critics.add(critic_id)
+        verdict = run_coverage_gate(
+            critic_id, inst['original_task_id'], project_name, project_path)
+        if verdict['verdict'] == 'blocked':
+            # 達 MAX_RETRIES：finish_validation 已開 human_review。直接回 blocked，
+            # 不再 continue（否則 get_next_dispatch 的 blocked 偵測抓不到 'blocked' 狀態 → 誤回 waiting）。
+            return {
+                'action': 'blocked',
+                'progress': inst.get('progress'),
+                'message': verdict.get('message') or '任務已達最大驗證重試次數，需人工審查。',
+                'review_id': verdict.get('review_id'),
+            }
+        if verdict['verdict'] == 'rejected':
+            continue  # 退件已處理，迴圈重取 → executor 重試
+        if verdict.get('warn'):
+            inst['prompt'] = verdict['warn'] + '\n\n' + inst['prompt']
+        return inst
+
+
 def _record_dispatch_decision(
     trace_id: str,
     parent_id: str,
