@@ -46,3 +46,42 @@ class TestCreateSubtaskMetadata:
                              metadata={'coverage_targets': cov})
         task = get_task(tid)
         assert task['metadata']['coverage_targets'] == cov
+
+
+class TestRecipePersistsCoverageTargets:
+    def test_task_metadata_has_coverage_targets(self):
+        # 純函式單元：直接測「把 file_gaps 轉成 coverage_targets」的形狀
+        from servers.recipes import _gaps_to_coverage_targets
+        gaps = [
+            {'name': 'foo', 'file_path': 'servers/x.py', 'line_start': 10, 'line_end': 25},
+            {'name': 'bar', 'file_path': 'servers/x.py', 'line_start': 30, 'line_end': 40},
+        ]
+        targets = _gaps_to_coverage_targets(gaps)
+        assert targets == [
+            {'file_path': 'servers/x.py', 'name': 'foo', 'line_start': 10, 'line_end': 25},
+            {'file_path': 'servers/x.py', 'name': 'bar', 'line_start': 30, 'line_end': 40},
+        ]
+
+    def test_recipe_actually_passes_metadata_to_created_task(self, mock_db_path, monkeypatch):
+        # 整合測試（防假綠）：純函式對了不代表 recipe 真的把 metadata= 傳進 create_subtask。
+        import servers.drift as drift
+        import servers.project as project
+        fake_gaps = [
+            {'name': 'foo', 'file_path': 'servers/x.py', 'line_start': 10, 'line_end': 25, 'has_test': False},
+            {'name': 'bar', 'file_path': 'servers/x.py', 'line_start': 30, 'line_end': 40, 'has_test': False},
+            {'name': 'baz', 'file_path': 'servers/x.py', 'line_start': 45, 'line_end': 60, 'has_test': False},
+        ]
+        monkeypatch.setattr(drift, 'detect_coverage_gaps', lambda *a, **k: list(fake_gaps))
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        from servers.recipes import recipe_unit_tests
+        from servers.tasks import get_task
+        res = recipe_unit_tests('proj', '/tmp/proj', max_tasks=1)
+        task_id = res['stories'][0]['task_ids'][0]
+        meta = get_task(task_id)['metadata']
+        assert meta['coverage_targets'] == [
+            {'file_path': 'servers/x.py', 'name': 'foo', 'line_start': 10, 'line_end': 25},
+            {'file_path': 'servers/x.py', 'name': 'bar', 'line_start': 30, 'line_end': 40},
+            {'file_path': 'servers/x.py', 'name': 'baz', 'line_start': 45, 'line_end': 60},
+        ]
