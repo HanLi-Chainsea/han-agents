@@ -189,11 +189,9 @@ git commit -m "feat(drift): detect_coverage_gaps carries line_end (C1)"
 
 ```python
 class TestCreateSubtaskMetadata:
-    def test_metadata_persisted_and_readable(self, tmp_path, monkeypatch):
-        # 用獨立的 brain.db，不污染真實資料
-        import servers.db as dbmod
-        monkeypatch.setattr(dbmod, 'DB_PATH', str(tmp_path / 'brain.db'), raising=False)
-
+    def test_metadata_persisted_and_readable(self, mock_db_path):
+        # mock_db_path（tests/conftest.py）把 servers.BRAIN_DB 指向隔離測試 DB，
+        # 並已執行 tasks.metadata 欄遷移，故不污染真實 brain.db。
         from servers.tasks import create_task, create_subtask, get_task
         epic = create_task(project='proj', description='epic', task_level='epic')
         cov = [{'file_path': 'servers/x.py', 'name': 'foo',
@@ -204,7 +202,7 @@ class TestCreateSubtaskMetadata:
         assert task['metadata']['coverage_targets'] == cov
 ```
 
-> 註：若 `servers.db` 的 DB 路徑常數名稱不同，先 `grep -n "DB_PATH\|brain.db" servers/db.py` 確認並改用實際名稱；HAN 既有測試多用 fixture 指向暫存 DB，沿用同模式。
+> 註：DB 隔離一律用既有的 `mock_db_path` fixture（`tests/conftest.py`）——它 patch `servers.BRAIN_DB`、重置 `_db_initialized`、並補跑 `tasks.metadata` 等欄位遷移。**不要**用 `servers.db`（無此模組）。
 
 - [ ] **Step 2: 跑測試確認失敗**
 
@@ -307,6 +305,34 @@ class TestRecipePersistsCoverageTargets:
             {'file_path': 'servers/x.py', 'name': 'foo', 'line_start': 10, 'line_end': 25},
             {'file_path': 'servers/x.py', 'name': 'bar', 'line_start': 30, 'line_end': 40},
         ]
+
+    def test_recipe_actually_passes_metadata_to_created_task(self, mock_db_path, monkeypatch):
+        # 整合測試（防假綠）：純函式對了不代表 recipe 真的把 metadata= 傳進 create_subtask。
+        # monkeypatch 掉 gaps 來源與 ensure_project（避免真跑 sync / Code Graph），
+        # 用 get_task 直接讀回建出來的 task，斷言 metadata.coverage_targets 真的落地。
+        # 同時驗證：同檔 3 個 gaps 全進 metadata（不被 max_tasks 預算誤切）。
+        import servers.drift as drift
+        import servers.project as project
+        fake_gaps = [
+            {'name': 'foo', 'file_path': 'servers/x.py', 'line_start': 10, 'line_end': 25, 'has_test': False},
+            {'name': 'bar', 'file_path': 'servers/x.py', 'line_start': 30, 'line_end': 40, 'has_test': False},
+            {'name': 'baz', 'file_path': 'servers/x.py', 'line_start': 45, 'line_end': 60, 'has_test': False},
+        ]
+        monkeypatch.setattr(drift, 'detect_coverage_gaps', lambda *a, **k: list(fake_gaps))
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        from servers.recipes import recipe_unit_tests
+        from servers.tasks import get_task
+        # max_tasks=1：同檔所有 gaps 仍須全進該 task 的 metadata（remaining 預算不可切 gaps）
+        res = recipe_unit_tests('proj', '/tmp/proj', max_tasks=1)
+        task_id = res['stories'][0]['task_ids'][0]
+        meta = get_task(task_id)['metadata']
+        assert meta['coverage_targets'] == [
+            {'file_path': 'servers/x.py', 'name': 'foo', 'line_start': 10, 'line_end': 25},
+            {'file_path': 'servers/x.py', 'name': 'bar', 'line_start': 30, 'line_end': 40},
+            {'file_path': 'servers/x.py', 'name': 'baz', 'line_start': 45, 'line_end': 60},
+        ]
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
@@ -355,20 +381,19 @@ def _gaps_to_coverage_targets(file_gaps: List[Dict]) -> List[Dict]:
         )
 ```
 
-改成（取對應 batch 的 gaps、帶 metadata）：
+改成（帶 metadata；**移除 `[:remaining]` 切片**）：
 
 ```python
-        # Task: 每個檔案一個 executor task（batch 所有 gaps）
-        remaining = max_tasks - task_count
-        batch_gaps = file_gaps[:remaining]
-        batch_names = gap_names[:remaining]
-
+        # Task: 每個檔案一個 executor task（batch 該檔案「全部」gaps）
+        # 注意：remaining = max_tasks - task_count 是「任務數預算」，只用來決定要不要
+        # 再開下一個檔案的 task（迴圈頂部 if task_count >= max_tasks: break 已處理），
+        # 絕不可拿來切某一檔案的 gaps——一個檔案一個 task，其所有 gaps 都要進 metadata。
         task_desc = (
             f"Write unit tests for {file_path}. "
-            f"Test targets: {', '.join(batch_names[:5])}"
+            f"Test targets: {', '.join(gap_names[:5])}"
         )
-        if len(batch_names) > 5:
-            task_desc += f" and {len(batch_names) - 5} more"
+        if len(gap_names) > 5:
+            task_desc += f" and {len(gap_names) - 5} more"
         task_desc += f". Test tool: {test_tool}"
 
         task_id = create_subtask(
@@ -379,9 +404,11 @@ def _gaps_to_coverage_targets(file_gaps: List[Dict]) -> List[Dict]:
             task_level='task',
             epic_id=epic_id,
             story_id=story_id,
-            metadata={'coverage_targets': _gaps_to_coverage_targets(batch_gaps)},
+            metadata={'coverage_targets': _gaps_to_coverage_targets(file_gaps)},
         )
 ```
+
+> 註：原碼的 `remaining`/`batch_names` 變數一併移除（描述改用 `gap_names`，顯示仍只取前 5 個並以「and N more」收尾）。
 
 - [ ] **Step 4: 跑測試確認通過**
 
@@ -408,12 +435,9 @@ git commit -m "feat(recipes): persist coverage_targets into task metadata (C1)"
 在 `tests/test_coverage_gate.py` 末尾新增。測試會在暫存目錄寫一個含分支的 source + 只覆蓋部分分支的測試，真的跑量測：
 
 ```python
-import shutil
 import textwrap
 
 import pytest
-
-_HAS_COVERAGE = shutil.which('coverage') is not None or _coverage_importable()
 
 
 def _coverage_importable():
@@ -479,14 +503,29 @@ class TestMeasureBranchCoverage:
         # pragma 行的分支被尊重 → guarded 視為全覆蓋
         assert pt['missing_branches'] == []
 
-    def test_pytest_failure_is_measure_failed(self, tmp_path):
+    def test_pytest_failure_is_tests_failed(self, tmp_path):
+        # 測試「真的失敗」必須是確定性退件狀態（tests_failed），絕不可 fail-open。
+        # 這是本功能的核心：失敗由工具判定，不交給 LLM 宣稱。
         from servers.coverage import measure_branch_coverage
         _write_fixture(tmp_path)
         (tmp_path / 'test_broken.py').write_text('def test_x():\n    assert False\n')
         targets = [{'file_path': 'sample.py', 'name': 'classify',
                     'line_start': 1, 'line_end': 6}]
         res = measure_branch_coverage(str(tmp_path), ['test_broken.py'], targets)
-        assert res['tool_status'] == 'measure_failed'
+        assert res['tool_status'] == 'tests_failed'
+        assert res['error']
+
+    def test_target_not_exercised_is_no_targets(self, tmp_path):
+        # 測試全綠，但根本沒 import/執行到 target 檔 → no_targets（確定性退件）。
+        # 否則「沒測到卻過關」就是把覆蓋判斷讓給 LLM 的破口。
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        (tmp_path / 'test_unrelated.py').write_text(
+            'def test_math():\n    assert 1 + 1 == 2\n')
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_unrelated.py'], targets)
+        assert res['tool_status'] == 'no_targets'
         assert res['error']
 
     def test_no_coverage_file_left_behind(self, tmp_path):
@@ -499,15 +538,15 @@ class TestMeasureBranchCoverage:
         assert leftovers == []
 
 
-class TestMeasureFailOpenWhenNotInstalled:
-    def test_missing_coverage_module_returns_measure_failed(self, tmp_path, monkeypatch):
+class TestMeasureUnavailableWhenNotInstalled:
+    def test_missing_coverage_module_is_unavailable(self, tmp_path, monkeypatch):
+        # coverage 套件缺失＝真正 infra 問題 → unavailable（唯一該 fail-open 的類別）。
         import servers.coverage as cov
-        # 模擬 coverage 不存在：讓內部偵測回 False
         monkeypatch.setattr(cov, '_coverage_available', lambda: False)
         res = cov.measure_branch_coverage(str(tmp_path), ['test_x.py'],
                                           [{'file_path': 'x.py', 'name': 'f',
                                             'line_start': 1, 'line_end': 3}])
-        assert res['tool_status'] == 'measure_failed'
+        assert res['tool_status'] == 'unavailable'
         assert 'coverage' in (res['error'] or '').lower()
 ```
 
@@ -567,9 +606,17 @@ def _build_file_index(files: Dict, root: str) -> Dict[str, Dict]:
     return idx
 
 
-def _fail(error: str) -> Dict:
-    return {'tool_status': 'measure_failed', 'fully_covered': False,
-            'per_target': [], 'error': error}
+def _result(status: str, error: Optional[str] = None,
+            per_target: Optional[List[Dict]] = None,
+            fully_covered: bool = False) -> Dict:
+    return {'tool_status': status, 'fully_covered': fully_covered,
+            'per_target': per_target or [], 'error': error}
+
+
+def _valid_arc(arc) -> bool:
+    """防 coverage json 未來版本格式異動：只接受 [int, int] 形狀的 arc。"""
+    return (isinstance(arc, (list, tuple)) and len(arc) == 2
+            and isinstance(arc[0], int) and isinstance(arc[1], int))
 
 
 def measure_branch_coverage(project_path: str,
@@ -578,53 +625,84 @@ def measure_branch_coverage(project_path: str,
     """量測 coverage_targets 各函式行範圍內的分支覆蓋。
 
     Returns: {
-        'tool_status': 'ok' | 'measure_failed',
+        'tool_status': 'ok' | 'tests_failed' | 'no_targets' | 'unavailable',
         'fully_covered': bool,
         'per_target': [{'file_path','name','line_start','line_end',
                         'missing_branches':[{'from','to'}],'n_total','n_covered'}],
         'error': str | None,
     }
-    其中 measure_failed 涵蓋：coverage 未安裝 / pytest 失敗 / json 產製失敗 /
-    target 檔不在報告（沒被 import/執行）。皆 fail-open（由上游退回 LLM critic）。
+
+    fail-state 分流（對齊「工具確認、非 LLM 宣稱」的核心意圖）：
+      - 'ok'          測試全綠且 target 有被執行；fully_covered 再決定過/退。
+      - 'tests_failed' pytest 有測試失敗（rc==1）→ 上游**確定性退件**。
+      - 'no_targets'   無測試被收集（rc==5）或 target 檔不在報告（沒被 import/執行）
+                       → 上游**確定性退件**（要求補測/回報測試）。
+      - 'unavailable'  真正 infra 問題：coverage 未安裝、空 test_targets、pytest
+                       中斷/內部錯（rc∈{2,3,4}或逾時）、json 產製/解析失敗
+                       → 上游 **fail-open**（退回 LLM critic）。
+    只有 'unavailable' 才 fail-open；測試失敗與沒測到一律確定性退件，避免破口。
     """
     if not _coverage_available():
-        return _fail('coverage 套件未安裝')
+        return _result('unavailable', 'coverage 套件未安裝')
     if not test_targets:
-        return _fail('無可量測的 test_targets')
+        return _result('unavailable', '無可量測的 test_targets')
 
     root = os.path.realpath(project_path)
-    # 限制 test_targets 在 root 下
-    safe_tests = [t for t in (_canonical_in_root(root, t) for t in test_targets) if t]
+    # 限制 test_targets 在 root 下且實際存在
+    safe_tests = []
+    for t in test_targets:
+        canon = _canonical_in_root(root, t)
+        if canon and os.path.isfile(canon):
+            safe_tests.append(canon)
     if not safe_tests:
-        return _fail('test_targets 不在專案根目錄下或不存在')
+        return _result('unavailable', 'test_targets 不在專案根目錄下或不存在')
 
     with tempfile.TemporaryDirectory() as tmp:
         data_file = os.path.join(tmp, '.coverage')
         json_file = os.path.join(tmp, 'cov.json')
         env = dict(os.environ, COVERAGE_FILE=data_file)
-        run = subprocess.run(
-            [sys.executable, '-m', 'coverage', 'run', '--branch',
-             '--data-file', data_file, '-m', 'pytest', '-q', *safe_tests],
-            cwd=root, env=env, capture_output=True, text=True,
-            timeout=_TIMEOUT_SEC,
-        )
-        if run.returncode != 0:
-            tail = (run.stdout or '')[-500:] + (run.stderr or '')[-500:]
-            return _fail(f'pytest 執行失敗 (rc={run.returncode}): {tail.strip()[-400:]}')
+        try:
+            run = subprocess.run(
+                [sys.executable, '-m', 'coverage', 'run', '--branch',
+                 '--data-file', data_file, '-m', 'pytest', '-q', *safe_tests],
+                cwd=root, env=env, capture_output=True, text=True,
+                timeout=_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            return _result('unavailable', f'pytest 逾時（>{_TIMEOUT_SEC}s）')
 
-        rep = subprocess.run(
-            [sys.executable, '-m', 'coverage', 'json',
-             '--data-file', data_file, '-o', json_file],
-            cwd=root, env=env, capture_output=True, text=True,
-            timeout=_TIMEOUT_SEC,
-        )
+        rc = run.returncode
+        tail = ((run.stdout or '')[-500:] + (run.stderr or '')[-500:]).strip()[-400:]
+        # pytest exit codes: 0=全過, 1=有測試失敗, 5=未收集到測試, 2/3/4=中斷/內部/用法錯
+        if rc == 1:
+            return _result('tests_failed', f'測試未通過 (rc=1): {tail}')
+        if rc == 5:
+            return _result('no_targets', f'未收集到任何測試 (rc=5): {tail}')
+        if rc != 0:
+            return _result('unavailable', f'pytest 異常 (rc={rc}): {tail}')
+
+        try:
+            rep = subprocess.run(
+                [sys.executable, '-m', 'coverage', 'json',
+                 '--data-file', data_file, '-o', json_file],
+                cwd=root, env=env, capture_output=True, text=True,
+                timeout=_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            return _result('unavailable', 'coverage json 產製逾時')
         if rep.returncode != 0 or not os.path.exists(json_file):
-            return _fail(f'coverage json 產製失敗: {(rep.stderr or "")[-300:]}')
+            return _result('unavailable', f'coverage json 產製失敗: {(rep.stderr or "")[-300:]}')
 
-        with open(json_file, encoding='utf-8') as fh:
-            data = json.load(fh)
+        try:
+            with open(json_file, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (ValueError, OSError) as e:
+            return _result('unavailable', f'coverage json 解析失敗: {e}')
 
-    file_index = _build_file_index(data.get('files', {}), root)
+    if not isinstance(data, dict) or not isinstance(data.get('files'), dict):
+        return _result('unavailable', 'coverage json 格式非預期（缺 files dict）')
+
+    file_index = _build_file_index(data['files'], root)
 
     per_target = []
     for t in coverage_targets:
@@ -634,11 +712,11 @@ def measure_branch_coverage(project_path: str,
         canon = _canonical_in_root(root, fp)
         entry = file_index.get(canon) if canon else None
         if entry is None:
-            # target 檔不在報告：沒被任何測試 import/執行
-            return _fail(f'target 檔未被測試覆蓋執行: {fp}')
+            # target 檔不在報告：測試全綠卻沒 import/執行到它 → 確定性退件
+            return _result('no_targets', f'target 檔未被測試執行（未覆蓋）: {fp}')
         in_range = lambda arc: ls <= arc[0] <= le
-        missing = [a for a in entry.get('missing_branches', []) if in_range(a)]
-        executed = [a for a in entry.get('executed_branches', []) if in_range(a)]
+        missing = [a for a in entry.get('missing_branches', []) if _valid_arc(a) and in_range(a)]
+        executed = [a for a in entry.get('executed_branches', []) if _valid_arc(a) and in_range(a)]
         per_target.append({
             'file_path': fp, 'name': t.get('name'),
             'line_start': ls, 'line_end': le,
@@ -648,8 +726,7 @@ def measure_branch_coverage(project_path: str,
         })
 
     fully = all(not pt['missing_branches'] for pt in per_target)
-    return {'tool_status': 'ok', 'fully_covered': fully,
-            'per_target': per_target, 'error': None}
+    return _result('ok', None, per_target=per_target, fully_covered=fully)
 ```
 
 - [ ] **Step 4: 跑測試確認通過**
@@ -770,23 +847,33 @@ def derive_test_targets(project_path: str,
     if found:
         return sorted(found)
 
-    # 2. 後備：stem 啟發式
+    # 2. 後備：stem 啟發式（限縮——剪掉 build/dist/site-packages 等噪音目錄、設候選上限）
     stems = set()
     for t in coverage_targets:
         fp = t.get('file_path') or ''
-        stems.add(os.path.splitext(os.path.basename(fp))[0])
+        s = os.path.splitext(os.path.basename(fp))[0]
+        if s:
+            stems.add(s)
     wanted = set()
     for s in stems:
         wanted.add(f'test_{s}.py')
         wanted.add(f'{s}_test.py')
+    if not wanted:
+        return []
+    _PRUNE = {'.git', '.hg', '.svn', '.venv', 'venv', 'env', '__pycache__',
+              'node_modules', 'build', 'dist', '.tox', '.eggs', '.mypy_cache',
+              '.pytest_cache', 'site-packages'}
+    _MAX_FALLBACK = 50
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames
-                       if d not in ('.git', '.venv', 'venv', '__pycache__', 'node_modules')]
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE]
         for fn in filenames:
             if fn in wanted:
                 rel = os.path.relpath(os.path.join(dirpath, fn), root)
                 if rel not in found:
                     found.append(rel)
+                    if len(found) >= _MAX_FALLBACK:
+                        return sorted(found)
+    # 後備找不到 → 回空清單；由 run_coverage_gate 決定確定性退件（要求 executor 回報 TEST_TARGETS）
     return sorted(found)
 
 
@@ -830,10 +917,8 @@ git commit -m "feat(coverage): derive_test_targets + format_missing_issues"
 
 ```python
 class TestCriticDispatchHasOriginalTaskId:
-    def test_critic_dispatch_exposes_original_task_id(self, tmp_path, monkeypatch):
-        import servers.db as dbmod
-        monkeypatch.setattr(dbmod, 'DB_PATH', str(tmp_path / 'brain.db'), raising=False)
-
+    def test_critic_dispatch_exposes_original_task_id(self, mock_db_path, tmp_path):
+        # mock_db_path：隔離 DB；tmp_path：當 project_path 傳給 get_next_dispatch。
         from servers.tasks import create_task, create_subtask, update_task_status
         from servers.facade import get_next_dispatch
 
@@ -913,10 +998,10 @@ git commit -m "feat(facade): critic dispatch exposes original_task_id"
 
 ```python
 class TestRunCoverageGate:
-    def _setup_done_task(self, tmp_path, monkeypatch, cov_targets, result):
-        import servers.db as dbmod
-        monkeypatch.setattr(dbmod, 'DB_PATH', str(tmp_path / 'brain.db'), raising=False)
-        from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    def _setup_done_task(self, cov_targets, result):
+        # 依賴測試方法已掛 mock_db_path fixture（隔離 DB）。
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
         epic = create_task(project='proj', description='epic', task_level='epic')
         story = create_subtask(parent_id=epic, description='story', task_level='story',
                                requires_validation=False)
@@ -927,62 +1012,92 @@ class TestRunCoverageGate:
         critic = reserve_critic_task(task)
         return task, critic['id']
 
-    def test_uncovered_routes_to_finish_validation_reject(self, tmp_path, monkeypatch):
+    def test_uncovered_rejects_and_writes_rejection_context(
+            self, mock_db_path, tmp_path, monkeypatch):
         import servers.coverage as cov
         import servers.facade as facade
+        from servers.memory import get_working_memory
+        from servers.tasks import get_task
         targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
-        task, critic_id = self._setup_done_task(
-            tmp_path, monkeypatch, targets, 'done\nTEST_TARGETS: test_x.py')
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
         monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
         monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
             'tool_status': 'ok', 'fully_covered': False, 'error': None,
             'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
                             'missing_branches': [{'from': 2, 'to': 4}],
-                            'n_total': 2, 'n_covered': 1}],
-        })
+                            'n_total': 2, 'n_covered': 1}]})
         verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'rejected'
-        # 原任務應被 finish_validation 設回 pending（待重做）
+        # 原任務被 finish_validation 設回 pending（待重做）
+        assert get_task(task)['status'] == 'pending'
+        # Critical 2：行號必須寫進 working_memory['critic_suggestions']
+        #（_get_rejected_tasks 的唯一來源；finish_validation 不寫此鍵）
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and '2→4' in wm
+
+    def test_tests_failed_is_deterministic_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        # 測試真的失敗 → 確定性退件，絕不 fail-open（核心意圖：工具確認非 LLM 宣稱）
+        import servers.coverage as cov
+        import servers.facade as facade
         from servers.tasks import get_task
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'tests_failed', 'fully_covered': False,
+            'per_target': [], 'error': '測試未通過 (rc=1): assert False'})
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
         assert get_task(task)['status'] == 'pending'
 
-    def test_fully_covered_proceeds_to_critic(self, tmp_path, monkeypatch):
+    def test_no_test_targets_is_deterministic_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        # 推不出測試檔 → 退件要求回報 TEST_TARGETS（非 fail-open）
         import servers.coverage as cov
         import servers.facade as facade
         targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
-        task, critic_id = self._setup_done_task(
-            tmp_path, monkeypatch, targets, 'done\nTEST_TARGETS: test_x.py')
+        task, critic_id = self._setup_done_task(targets, 'done（沒有 marker）')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: [])
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert any('TEST_TARGETS' in i for i in verdict['issues'])
+
+    def test_fully_covered_proceeds_to_critic(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.facade as facade
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
         monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
         monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
             'tool_status': 'ok', 'fully_covered': True, 'error': None,
             'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
-                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}],
-        })
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}]})
         verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'proceed'
         assert verdict.get('warn') in (None, '')
 
-    def test_measure_failed_proceeds_with_warning(self, tmp_path, monkeypatch):
+    def test_unavailable_proceeds_with_warning(self, mock_db_path, tmp_path, monkeypatch):
+        # 唯一 fail-open 類別：coverage 套件缺失等真正 infra 問題
         import servers.coverage as cov
         import servers.facade as facade
         targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
-        task, critic_id = self._setup_done_task(
-            tmp_path, monkeypatch, targets, 'done (沒有 marker)')
-        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: [])
-        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
-            'tool_status': 'measure_failed', 'fully_covered': False,
-            'per_target': [], 'error': '無可量測的 test_targets'})
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
         verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'proceed'
         assert '⚠️' in verdict['warn']
 
 
 class TestGetNextDispatchGated:
-    def test_gated_loops_past_rejected_critic_to_executor(self, tmp_path, monkeypatch):
+    def test_gated_rejects_then_executor_prompt_carries_missing_arc(
+            self, mock_db_path, tmp_path, monkeypatch):
         import servers.coverage as cov
         import servers.facade as facade
-        import servers.db as dbmod
-        monkeypatch.setattr(dbmod, 'DB_PATH', str(tmp_path / 'brain.db'), raising=False)
         from servers.tasks import create_task, create_subtask, update_task_status
         epic = create_task(project='proj', description='epic', task_level='epic')
         story = create_subtask(parent_id=epic, description='story', task_level='story',
@@ -994,7 +1109,9 @@ class TestGetNextDispatchGated:
                                           'line_start': 1, 'line_end': 9}]})
         update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
 
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
         monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        # 注意：不 monkeypatch format_missing_issues —— 用真實格式化，確保 prompt 真的帶行號
         monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
             'tool_status': 'ok', 'fully_covered': False, 'error': None,
             'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
@@ -1002,9 +1119,13 @@ class TestGetNextDispatchGated:
                             'n_total': 2, 'n_covered': 1}]})
 
         inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
-        # gate 退件後，gated 應跳過 critic、回傳 executor 重試（帶 rejection_context）
+        # gate 退件後跳過 critic、回 executor 重試
         assert inst['subagent_type'] == 'executor'
         assert inst['task_id'] == task
+        # 關鍵（codex Critical 2）：未覆蓋行號真的進到 executor 重試 prompt，
+        # 不是只 assert subagent_type == executor
+        assert '2→4' in inst['prompt']
+        assert 'x.py' in inst['prompt']
 ```
 
 - [ ] **Step 2: 跑測試確認失敗**
@@ -1017,15 +1138,34 @@ Expected: FAIL — `module 'servers.facade' has no attribute 'run_coverage_gate'
 在 [servers/facade.py](../../../servers/facade.py) 的 `get_next_dispatch` 函式之後新增：
 
 ```python
+def _gate_reject(critic_task_id: str, original_task_id: str,
+                 issues: List[str]) -> Dict:
+    """確定性退件。
+
+    關鍵：executor 重試 prompt 的 rejection context 來自 working_memory['critic_suggestions']
+    （見 _get_rejected_tasks），而 finish_validation **不寫**此鍵。故 gate 必須先自己寫，
+    行號才會出現在 executor 重試 prompt 裡。值為字串（直接被注入 prompt）。
+    """
+    from servers.memory import set_working_memory
+    set_working_memory(original_task_id, 'critic_suggestions', '\n'.join(issues))
+    finish_validation(critic_task_id, original_task_id, approved=False, issues=issues)
+    return {'verdict': 'rejected', 'issues': issues}
+
+
 def run_coverage_gate(critic_task_id: str,
                       original_task_id: str,
                       project_name: str,
                       project_path: str) -> Dict:
     """對一個待派 critic 的任務跑分支覆蓋率 gate。
 
-    量到資料且有未覆蓋分支 → 走 finish_validation 退件，回 {'verdict':'rejected'}。
-    其餘（全覆蓋 / 量不到）→ fail-open，回 {'verdict':'proceed', 'warn': <str|None>}。
+    fail-state 分流（對齊「工具確認、非 LLM 宣稱」）：
+      - 有未覆蓋分支 / 測試失敗(tests_failed) / 沒測到(no_targets) / 推不出測試檔
+        → **確定性退件**（finish_validation + 寫 critic_suggestions），回 {'verdict':'rejected'}。
+      - 全覆蓋 → {'verdict':'proceed', 'warn': None}。
+      - 真正 infra（coverage 未安裝 / unavailable）→ fail-open，回
+        {'verdict':'proceed', 'warn': <警示字串>}（上游把警示前置到 critic prompt）。
     """
+    import sys
     from servers.tasks import get_task
     from servers import coverage as cov
 
@@ -1038,21 +1178,38 @@ def run_coverage_gate(critic_task_id: str,
     if not coverage_targets:
         return {'verdict': 'proceed', 'warn': None}
 
-    test_targets = cov.derive_test_targets(project_path, result_text, coverage_targets)
-    res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
+    # coverage 套件缺失＝真正 infra → fail-open
+    if not cov._coverage_available():
+        return {'verdict': 'proceed',
+                'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
 
-    if res['tool_status'] == 'ok' and not res['fully_covered']:
+    sys.stderr.write('… 量測分支覆蓋率中 …\n')  # UX：pytest 較久時別讓使用者以為當機
+
+    test_targets = cov.derive_test_targets(project_path, result_text, coverage_targets)
+    if not test_targets:
+        # 推不出測試檔 → 確定性退件，要求 executor 用 marker 回報
+        return _gate_reject(critic_task_id, original_task_id, [
+            '未能確認你寫的測試檔。請在回報中以**獨立一行** '
+            '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，gate 才能量測分支覆蓋。'])
+
+    res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
+    status = res['tool_status']
+
+    if status == 'ok':
+        if res['fully_covered']:
+            return {'verdict': 'proceed', 'warn': None}
         issues = cov.format_missing_issues(res['per_target'])
         issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
-        finish_validation(critic_task_id, original_task_id, approved=False, issues=issues)
-        return {'verdict': 'rejected', 'issues': issues}
+        return _gate_reject(critic_task_id, original_task_id, issues)
 
-    if res['tool_status'] != 'ok':
-        return {'verdict': 'proceed',
-                'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），"
-                        f"本任務回退人工逐分支核對。"}
+    if status in ('tests_failed', 'no_targets'):
+        # 工具判定失敗/沒測到 → 確定性退件，不交給 LLM 宣稱
+        return _gate_reject(critic_task_id, original_task_id,
+                            [f'分支覆蓋率 gate：{res.get("error")}'])
 
-    return {'verdict': 'proceed', 'warn': None}
+    # status == 'unavailable' → 真正 infra 問題 → fail-open
+    return {'verdict': 'proceed',
+            'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
 
 
 def get_next_dispatch_gated(parent_id: str,
@@ -1061,16 +1218,23 @@ def get_next_dispatch_gated(parent_id: str,
                             trace_id: str = None) -> Dict:
     """get_next_dispatch + 分支覆蓋率 gate。
 
-    底層派 critic 時先跑 gate：量到未覆蓋 → 已 finish_validation 退件，重取下一個
-    dispatch（會變成 executor 重試）；其餘照常回傳 critic（量不到時把警示前置到 prompt）。
+    底層派 critic 時先跑 gate：確定性退件 → finish_validation 已處理，重取下一個 dispatch
+    （會變成 executor 重試）；其餘照常回傳 critic（fail-open 時把警示前置到 prompt）。
     其他 action（executor/done/blocked）原樣回傳。
+    防護：記住本次已跑過 gate 的 critic id，若同一 critic 又被派回（理應不會——
+    finish_validation 會把任務推進到 pending/execution）→ 直接回傳避免無限迴圈。
     """
+    seen_critics = set()
     while True:
         inst = get_next_dispatch(parent_id, project_name, project_path, trace_id)
         if inst.get('action') != 'dispatch' or inst.get('subagent_type') != 'critic':
             return inst
+        critic_id = inst.get('task_id')
+        if critic_id in seen_critics:
+            return inst  # 防護：避免狀態未推進時的無限迴圈
+        seen_critics.add(critic_id)
         verdict = run_coverage_gate(
-            inst['task_id'], inst['original_task_id'], project_name, project_path)
+            critic_id, inst['original_task_id'], project_name, project_path)
         if verdict['verdict'] == 'rejected':
             continue  # 退件已處理，迴圈重取 → executor 重試
         if verdict.get('warn'):
@@ -1291,21 +1455,23 @@ git commit -m "test: branch-coverage gate end-to-end verification"
 ## Self-Review
 
 **1. Spec coverage（逐條對照 spec）：**
-- C1 資料層（line_end + coverage_targets metadata）→ Task 2/3/4 ✅
-- `servers/coverage.py` 量測（隔離 data file M5、list argv/timeout M6、路徑正規化、行範圍歸因、pragma 自動尊重）→ Task 5 ✅
-- 量測輔助（test_targets 推導、issue 格式化）→ Task 6 ✅
-- C2 gate 走 finish_validation（量到未覆蓋退件、其餘 fail-open）→ Task 7/8 ✅
+- C1 資料層（line_end + coverage_targets metadata）→ Task 2/3/4 ✅（Task 4 含整合測試，防「helper 對但 recipe 沒傳 metadata=」假綠）
+- `servers/coverage.py` 量測（隔離 data file、list argv/timeout、路徑正規化、行範圍歸因、pragma 自動尊重、json 格式 isinstance 防護）→ Task 5 ✅
+- 量測輔助（test_targets 推導 + 噪音目錄剪枝/候選上限、issue 格式化）→ Task 6 ✅
+- C2 gate 走 finish_validation：**確定性退件**（未覆蓋 / tests_failed / no_targets / 推不出測試檔），**僅 unavailable 才 fail-open**；退件時 gate 自寫 `critic_suggestions` 讓行號進到 executor 重試 prompt → Task 7/8 ✅
 - 指令迴圈改用 gated dispatch → Task 9 ✅
 - playbook executor/critic 原則 → Task 10 ✅
-- 測試（量測 fixtures、行範圍過濾、fail-state 二分、無 .coverage 殘留、資料流、markdown 回歸）→ 散落 Task 2–10，Task 11 總驗 ✅
-- 護欄（非侵入：不寫 .coveragerc/pyproject/build.gradle；值走環境變數）→ coverage.py 用隔離暫存、指令沿用 inline env 慣例 ✅
+- 測試（量測 fixtures、行範圍過濾、**fail-state 四分**、無 .coverage 殘留、rejection context 真進 prompt、資料流、markdown 回歸）→ 散落 Task 2–10，Task 11 總驗 ✅
+- 護欄（非侵入：不寫 .coveragerc/pyproject/build.gradle；值走環境變數；DB 測試一律用 mock_db_path fixture，不污染 brain.db）→ coverage.py 用隔離暫存、指令沿用 inline env 慣例 ✅
 - YAGNI 排除（Java、百分比門檻、AST、零分支 executed 檢查）→ 計畫未實作，符合 ✅
 
-**2. Placeholder scan：** 各步驟均含完整程式碼與確切指令／預期輸出；無 TBD/TODO。Task 3、7、10 標註了「先 grep 確認既有名稱／結構」的前置查核（因 DB 常數名、階層 API、playbook 標題需對齊現況），非 placeholder 而是對齊現有碼的必要步驟。
+**2. Placeholder scan：** 各步驟均含完整程式碼與確切指令／預期輸出；無 TBD/TODO。Task 3、7、10 標註了「先 grep 確認既有名稱／結構」的前置查核（因階層 API、playbook 標題需對齊現況），非 placeholder 而是對齊現有碼的必要步驟。
 
 **3. Type consistency：**
-- `measure_branch_coverage(project_path, test_targets, coverage_targets)` 回傳 `tool_status ∈ {'ok','measure_failed'}`、`per_target[].missing_branches=[{'from','to'}]` —— Task 5 定義，Task 6/8 測試與 `format_missing_issues`/`run_coverage_gate` 消費形狀一致 ✅
+- `measure_branch_coverage(project_path, test_targets, coverage_targets)` 回傳 `tool_status ∈ {'ok','tests_failed','no_targets','unavailable'}`、`per_target[].missing_branches=[{'from','to'}]` —— Task 5 定義，Task 6/8 測試與 `format_missing_issues`/`run_coverage_gate` 消費的狀態分流一致 ✅
 - `coverage_targets` 元素 `{file_path,name,line_start,line_end}` —— Task 4 `_gaps_to_coverage_targets` 產出、Task 5/8 消費一致 ✅
-- `run_coverage_gate(...) -> {'verdict': 'rejected'|'proceed', 'warn'?, 'issues'?}` —— Task 8 定義並由 `get_next_dispatch_gated` 消費一致 ✅
+- `run_coverage_gate(...) -> {'verdict': 'rejected'|'proceed', 'warn'?, 'issues'?}`；`_gate_reject` 共用退件路徑（寫 critic_suggestions + finish_validation）—— Task 8 定義並由 `get_next_dispatch_gated` 消費一致 ✅
+- rejection context 資料流：`_gate_reject` 寫 `working_memory['critic_suggestions']`（字串）→ `_get_rejected_tasks` 讀為 `_rejection_context` → `get_next_dispatch` 注入 `_build_executor_prompt` → executor 重試 prompt 帶行號（Task 8 測試端到端 assert `'2→4' in inst['prompt']`）✅
 - `finish_validation(critic_task_id, original_task_id, approved=False, issues=...)` 對齊實際簽名（第一參數＝critic 任務 id）✅
 - critic dispatch 的 `original_task_id`（Task 7 新增）被 `get_next_dispatch_gated`（Task 8）讀取，名稱一致 ✅
+- DB 隔離：所有觸及 DB 的測試用 `mock_db_path` fixture（patch `servers.BRAIN_DB`）；無 `servers.db`（不存在）依賴 ✅

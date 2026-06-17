@@ -10,7 +10,7 @@
 
 **Scope:** 單一語言（Python）。Java/JaCoCo 為 v2，本 spec 不含、抽象層不預建（YAGNI）。
 
-**審查狀態：** 經 dual-model gate（codex 後端權威 + gemini）審查後修訂，再依使用者「不過度工程」指示精簡：保留載重的 C1（資料流）/C2（finish_validation 路由），砍掉 AST scope 歸因（改行範圍過濾）與零分支 executed 檢查，fail-state 收斂為兩條路。核心三件事：補 target 行範圍、`--branch` 量測、未覆蓋走 `finish_validation`。
+**審查狀態：** 經 dual-model gate（codex 後端權威 + gemini）審查後修訂，再依使用者「不過度工程」指示精簡：保留載重的 C1（資料流）/C2（finish_validation 路由），砍掉 AST scope 歸因（改行範圍過濾）與零分支 executed 檢查。**fail-state 分流（後續 codex 計畫審查修正）：** 早先曾把 fail-state 收斂成「ok / measure_failed(fail-open)」兩條，但那會把「pytest 失敗」「target 沒被測到」洗進 LLM critic 判讀——違反使用者「工具確認、非 LLM 宣稱」的核心意圖。故改回四態 `ok / tests_failed / no_targets / unavailable`：**只有 `unavailable`（coverage 未安裝等真正 infra）才 fail-open**；測試失敗與沒測到一律**確定性退件**。核心三件事不變：補 target 行範圍、`--branch` 量測、未覆蓋／失敗走 `finish_validation`。
 
 ---
 
@@ -38,22 +38,26 @@
 
 ```
 measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
-    'tool_status': 'ok' | 'measure_failed',   # 量到資料 / 量不到（含未安裝、pytest 失敗、報告失敗、target 不在報告）
+    'tool_status': 'ok' | 'tests_failed' | 'no_targets' | 'unavailable',
+    #   ok          測試全綠且 target 有被執行
+    #   tests_failed pytest 有測試失敗（rc==1）           → 上游確定性退件
+    #   no_targets   無測試被收集（rc==5）或 target 不在報告 → 上游確定性退件
+    #   unavailable  coverage 未安裝 / 空 test_targets / pytest 中斷/內部錯(rc 2,3,4)/逾時 / json 失敗 → 上游 fail-open
     'fully_covered': bool,            # 所有 coverage_targets 行範圍內無未覆蓋分支
     'per_target': [ {                 # 逐 target（tool_status=='ok' 時）
         'file_path', 'name', 'line_start', 'line_end',
         'missing_branches': [{'from': int, 'to': int}],   # src_line 落在此 target 行範圍內
         'n_total': int, 'n_covered': int,
     } ],
-    'error': str | None,              # measure_failed 時帶原因（未安裝 / pytest 失敗 / …）供報告標記
+    'error': str | None,              # 非 ok 時帶原因供退件 issue / 報告標記
 }
 ```
 
 **機制：**
 1. **隔離資料檔（M5）：** 用 `tempfile.TemporaryDirectory()`；設 `COVERAGE_FILE=<tmp>/.coverage`（或 `coverage --data-file`），避免污染專案根與並行競態。
-2. **執行（M6）：** `subprocess.run([sys.executable, '-m', 'coverage', 'run', '--branch', '--data-file', DATA, '-m', 'pytest', *test_targets], cwd=project_path, env=..., timeout=...)`——**list argv、不走 shell**；`test_targets`/`project_path` 先 canonicalize 並限制在 project root 下；輸出截斷。coverage 未安裝 / pytest 非零退出 → `tool_status='measure_failed'`（帶 `error` 原因）。
-3. `coverage json --data-file DATA -o <tmp>/cov.json`；產製失敗 → `measure_failed`。
-4. **路徑正規化（Minor）：** 對 `files` 的 key 建 canonical map（resolve 相對/絕對、`./` 前綴），對應 target `file_path`；對應不到（target 沒被 import/執行）→ `measure_failed`。
+2. **執行（M6）：** `subprocess.run([sys.executable, '-m', 'coverage', 'run', '--branch', '--data-file', DATA, '-m', 'pytest', *test_targets], cwd=project_path, env=..., timeout=...)`——**list argv、不走 shell**；`test_targets`/`project_path` 先 canonicalize、限制在 project root 下且須實際存在；輸出截斷。**依 pytest 退出碼分流**：`rc==1`（有測試失敗）→ `tests_failed`；`rc==5`（未收集到測試）→ `no_targets`；`rc∈{2,3,4}` 或逾時 → `unavailable`；coverage 未安裝 / 空 test_targets → `unavailable`。
+3. `coverage json --data-file DATA -o <tmp>/cov.json`；產製或解析失敗 → `unavailable`。json 須為 `dict` 且含 `files` dict（isinstance 防護未來格式異動），arc 只接受 `[int,int]` 形狀。
+4. **路徑正規化（Minor）：** 對 `files` 的 key 建 canonical map（resolve 相對/絕對、`./` 前綴），對應 target `file_path`；對應不到（target 沒被 import/執行＝沒測到）→ `no_targets`（確定性退件，非 fail-open）。
 5. **行範圍歸因（精簡，取代 AST）：** 把 coverage 的 branch arc `[src_line, dest]`，凡 `src_line ∈ [line_start, line_end]` 即歸入此 target。**已知限制：** target 行範圍內的巢狀 function/lambda 分支也會被算入——這是**偏保守的過度涵蓋**（要求多測，不會漏算），對 v1 gate 可接受；行範圍內過度糾纏的檔案本就該先走 `/han:refactor`。AST 精確 scope 留待 v2 視需要再加。
 6. `fully_covered = (所有 target 的 missing_branches 皆空)`。
 
@@ -61,13 +65,17 @@ measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
 
 ### 2. `/han:unit-test` dispatch 迴圈：確定性 gate（走 finish_validation）
 
-迴圈每輪 `get_next_dispatch` 後判斷回傳。只有**兩條路**（fail-state 不再細分）：
-- `subagent_type == 'critic'`：**先別派 critic**，跑 coverage bash 步驟（inline env 慣例）讀該原任務的 `coverage_targets` + executor 回報的 `test_targets`，呼叫 `measure_branch_coverage`：
-  - **量到資料且有未覆蓋分支**（`tool_status=='ok' && !fully_covered`）→ 用回傳的 `critic_task_id` 呼叫 `finish_validation(critic_task_id, original_task_id, approved=False, issues=['servers/x.py:42→exit, 57→59 分支未覆蓋', ...])`。executor 自動被 resume 並帶具體行號；**不派 LLM critic、不費 token**。這是 gate 的唯一確定性退件路。
-  - **其餘一律 fail-open，照常派 LLM critic**：
-    - 量到資料且全覆蓋（`ok && fully_covered`）→ 派 LLM critic 做質性檢查（AAA/測行為/命名）。
-    - 量不到（`measure_failed`，含未安裝 / pytest 失敗 / 報告失敗 / target 不在報告）→ 一樣派 LLM critic，但 critic prompt 與收尾報告**大聲標記** `⚠️ 分支覆蓋率工具未量到（<error>），本任務回退人工逐分支核對`。**LLM critic 既有 checklist 本就要求「驗證測試實際被執行且通過」**——pytest 失敗、target 沒被測到都會在此被擋，不會被洗成 pass。
-- **無限退件防護：** 確定性退件走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 轉 blocked + human-review（既有機制，免新增）。最後一輪的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
+迴圈每輪 `get_next_dispatch` 後判斷回傳。`subagent_type == 'critic'` 時**先別派 critic**，讀該原任務的 `coverage_targets` + executor 回報的 `test_targets`，呼叫 `measure_branch_coverage`，依結果分流（**確定性退件**為主，僅一類 fail-open）：
+
+- **確定性退件**（走 `finish_validation(critic_task_id, original_task_id, approved=False, issues=[...])`，executor 自動 resume 帶具體行號，**不派 LLM critic、不費 token**）：
+  - 量到且有未覆蓋分支（`ok && !fully_covered`）→ issues 帶 `servers/x.py 函式 f (L1-9)：分支未覆蓋 2→4 …`。
+  - `tests_failed`（pytest 有測試失敗）→ issues 帶失敗摘要。**測試失敗由工具判定退件，不交給 LLM 宣稱。**
+  - `no_targets`（沒收集到測試 / target 沒被執行）→ issues 要求補測或回報測試。
+  - 推不出 `test_targets`（executor 沒用 `TEST_TARGETS:` marker 且 stem 後備找不到）→ issues 要求用 marker 明確回報測試檔。
+  - **關鍵實作細節：** executor 重試 prompt 的 rejection context 來自 `working_memory['critic_suggestions']`（見 `_get_rejected_tasks`），而 `finish_validation` **不寫**此鍵。故 gate 退件時必須先 `set_working_memory(original_task_id, 'critic_suggestions', <issues 字串>)`，行號才會進到 executor 重試 prompt。
+- **全覆蓋**（`ok && fully_covered`）→ 照常派 LLM critic 做質性檢查（AAA/測行為/命名）。
+- **唯一 fail-open**（`unavailable`：coverage 未安裝 / pytest 中斷/內部錯 / json 失敗）→ 派 LLM critic，但 critic prompt 與收尾報告**大聲標記** `⚠️ 分支覆蓋率工具未量到（<error>），本任務回退人工逐分支核對`；LLM critic 既有 checklist 仍要求驗證測試實際執行。
+- **無限退件防護：** 確定性退件走 `finish_validation` → 自動計入 `rejection_count`，達 `MAX_RETRIES` 轉 blocked + human-review（既有機制，免新增）。gate 迴圈另記已處理的 critic id，避免狀態未推進時的無限迴圈。未覆蓋退件的 issues 附帶提示：「若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並註明理由」。
 
 ### 3. `reference/playbooks/unit-test.md`
 
@@ -81,11 +89,12 @@ measure_branch_coverage(project_path, test_targets, coverage_targets) -> {
   - **行範圍過濾**：範圍外（其他函式）的 missing 分支**不**算進此 target；
   - **行範圍保守涵蓋**：target 範圍內巢狀 function 的未覆蓋分支**會**被算入（記錄此為已知/刻意行為，非 bug）；
   - pragma 被尊重（標記分支不計 missing）；
-  - **fail-state 二分**：coverage 未安裝 / pytest 失敗 / target 不在報告 → 一律 `measure_failed`（帶 `error`），皆不拋例外；量到資料 → `ok`；
+  - **fail-state 四分**：pytest 測試失敗 → `tests_failed`；target 不在報告/未收集到測試 → `no_targets`；coverage 未安裝 → `unavailable`；量到資料 → `ok`，皆不拋例外；
+  - **退件資料流**：gate 退件時 `working_memory['critic_suggestions']` 被寫入，且未覆蓋行號真的出現在 executor 重試 prompt（端到端 assert，非只 assert subagent_type）；
   - **非侵入**：跑完專案根**無 `.coverage*` 殘留**。
 - `test_targets` 歸因（M1）：既有測試已覆蓋的分支不被誤判未覆蓋（gate 的 `test_targets` 含該 source 既有測試 + 新測試）。
 - 資料流（C1）：`detect_coverage_gaps` 回傳含 `line_end`；`recipe_unit_tests` 把 `coverage_targets` 寫進 task metadata 並可讀回。
-- 指令 markdown 回歸測試：critic 分支先跑 coverage、未覆蓋走 `finish_validation(approved=False)`、其餘（全覆蓋或 measure_failed）才派 critic。
+- 指令 markdown 回歸測試：迴圈改用 `get_next_dispatch_gated`；critic 分支先跑 coverage、未覆蓋／失敗走 `finish_validation(approved=False)`、僅全覆蓋或 `unavailable` 才派 critic。
 
 ## 資料流（修訂）
 
@@ -94,20 +103,23 @@ recipe 建任務 → task.metadata.coverage_targets = [{file,name,line_start,lin
   → executor 寫測試、跑、結構化回報 test_targets
   → get_next_dispatch 回 critic dispatch（已 reserve critic_task_id）
   → [coverage gate] measure_branch_coverage(test_targets, coverage_targets)
-       ok & 未覆蓋 → finish_validation(critic_task_id, approved=False, issues=[行號])  ← 唯一確定性退件
-                      → 既有 bookkeeping：rejection_count++ / MAX_RETRIES→blocked / 否則 resume_executor(帶行號)
-       其餘一律 fail-open → 派 LLM critic：
-            ok & 全覆蓋   → 質性檢查
-            measure_failed → 報告大聲標記，critic 既有 checklist 仍擋「測試未執行/未通過」
+       ok & 未覆蓋 / tests_failed / no_targets / 推不出測試檔
+            → set_working_memory(critic_suggestions=[行號/原因])  ← 行號進 executor 重試 prompt 的關鍵
+            → finish_validation(critic_task_id, approved=False, issues=[...])  ← 確定性退件
+            → 既有 bookkeeping：rejection_count++ / MAX_RETRIES→blocked / 否則 resume_executor(帶行號)
+       ok & 全覆蓋        → 派 LLM critic 做質性檢查
+       unavailable        → fail-open，派 LLM critic（報告大聲標記 error）
 ```
 
 ## 錯誤與邊界
 
 | 情境 | 行為 |
 |---|---|
-| 量到資料 + target 有未覆蓋分支 | **確定性退件** `finish_validation(approved=False, issues=[行號])` |
+| 量到資料 + target 有未覆蓋分支 | **確定性退件** `set_working_memory(critic_suggestions)` + `finish_validation(approved=False, issues=[行號])` |
 | 量到資料 + 全覆蓋 | 派 LLM critic 做質性檢查 |
-| coverage 未安裝 / json 產製失敗 / 測試執行失敗 / target 不在報告 | 一律 `measure_failed`，**fail-open** 派 LLM critic（報告大聲標記 `error`）；測試未執行/未通過由 critic 既有 checklist 擋 |
+| pytest 測試失敗（`tests_failed`） | **確定性退件**（工具判定，非 LLM 宣稱）；issues 帶失敗摘要 |
+| target 不在報告 / 未收集到測試 / 推不出測試檔（`no_targets`） | **確定性退件**；issues 要求補測或用 `TEST_TARGETS:` marker 回報測試檔 |
+| coverage 未安裝 / json 產製失敗 / pytest 中斷·內部錯 / 逾時（`unavailable`） | **fail-open** 派 LLM critic（報告大聲標記 `error`）——唯一 fail-open 類別 |
 | 防禦性/不可達分支 | 尊重 `# pragma: no cover`/`no branch`；executor 須說明理由 |
 | 多任務並行 | 隔離 `COVERAGE_FILE`，無 `.coverage` 競態 |
 | 退件無限迴圈 | 走 `finish_validation` → `MAX_RETRIES` 自動 blocked + human-review |
