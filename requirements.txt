@@ -4,3 +4,4 @@
 # Optional: Enhanced code extraction via Tree-sitter AST parsing
 # Install with: pip install -r requirements-ast.txt
 # Or auto-installed on first use
+coverage>=7.0
