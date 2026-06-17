@@ -150,6 +150,24 @@ class TestMeasureBranchCoverage:
             assert 8 <= arc['from'] <= 11
         assert pt['missing_branches'] == []
 
+    def test_covered_branches_populated_and_range_filtered(self, tmp_path):
+        """已覆蓋的 arc 要被保留下來（給逐條 ✓ 列示用），且同樣只取行範圍內的、
+        數量與 n_covered 一致——這是逐條列示能成立的資料前提。"""
+        from servers.coverage import measure_branch_coverage
+        _write_fixture(tmp_path)
+        targets = [{'file_path': 'sample.py', 'name': 'classify',
+                    'line_start': 1, 'line_end': 6}]
+        res = measure_branch_coverage(str(tmp_path), ['test_sample.py'], targets)
+        pt = res['per_target'][0]
+        assert pt['covered_branches'], 'classify(5) 至少走到一條分支，應有已覆蓋 arc'
+        assert len(pt['covered_branches']) == pt['n_covered']  # 數量一致不對不上就是 bug
+        for arc in pt['covered_branches']:
+            assert 1 <= arc['from'] <= 6                       # 只取目標行範圍內
+        # covered 與 missing 不重疊（同一條 arc 不會又算覆蓋又算未覆蓋）
+        cov_set = {(a['from'], a['to']) for a in pt['covered_branches']}
+        miss_set = {(a['from'], a['to']) for a in pt['missing_branches']}
+        assert cov_set.isdisjoint(miss_set)
+
     def test_pytest_failure_is_tests_failed(self, tmp_path):
         from servers.coverage import measure_branch_coverage
         _write_fixture(tmp_path)
@@ -727,6 +745,65 @@ class TestFormatCoverageSummary:
         assert '✅' in out
         assert out.count('✓') == 4        # 4 條全部列出且標已覆蓋
         assert '✗' not in out
+
+    def test_multiple_targets_each_get_own_block(self):
+        """多個 target → 各自一個標頭區塊，分支歸屬不串台。"""
+        from servers.coverage import format_coverage_summary
+        per_target = [
+            {'file_path': 'a.py', 'name': 'f', 'line_start': 1, 'line_end': 3,
+             'covered_branches': [{'from': 2, 'to': 3}], 'missing_branches': [],
+             'n_total': 1, 'n_covered': 1},
+            {'file_path': 'b.py', 'name': 'g', 'line_start': 1, 'line_end': 3,
+             'covered_branches': [], 'missing_branches': [{'from': 2, 'to': 9}],
+             'n_total': 1, 'n_covered': 0},
+        ]
+        lines = format_coverage_summary(per_target)
+        heads = [ln for ln in lines if ln.startswith('📊')]
+        assert len(heads) == 2
+        assert 'a.py::f' in heads[0] and '✅' in heads[0]
+        assert 'b.py::g' in heads[1] and '❌' in heads[1]
+        # a 的覆蓋 arc 不會跑到 b 的區塊
+        b_idx = lines.index(heads[1])
+        assert all('2→3' not in ln for ln in lines[b_idx:])
+
+    def test_missing_covered_branches_key_degrades_gracefully(self):
+        """per_target 不帶 covered_branches（gate monkeypatch / 舊資料）→ 不爆，
+        只列未覆蓋 ✗，不會憑空捏造 ✓。"""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                       'missing_branches': [{'from': 2, 'to': 4}],
+                       'n_total': 2, 'n_covered': 1}]  # 無 covered_branches 鍵
+        out = '\n'.join(format_coverage_summary(per_target))
+        assert '1/2' in out and 'L2→4' in out and '✗' in out
+        assert '✓' not in out
+
+    def test_branchless_target_shows_zero_with_no_branch_lines(self):
+        """無分支函式：0/0、標 ✅、不列任何分支行（不該出現 ✓/✗）。"""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'x.py', 'name': 'noop', 'line_start': 1, 'line_end': 2,
+                       'covered_branches': [], 'missing_branches': [],
+                       'n_total': 0, 'n_covered': 0}]
+        lines = format_coverage_summary(per_target)
+        assert len(lines) == 1                 # 只有標頭，無分支行
+        assert '0/0' in lines[0] and '✅' in lines[0]
+        assert '✓' not in lines[0] and '✗' not in lines[0]
+
+    def test_branches_listed_in_line_order(self):
+        """分支不論覆蓋與否，一律依行號排序，方便對照原始碼由上而下核對。"""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                       'covered_branches': [{'from': 4, 'to': 5}],
+                       'missing_branches': [{'from': 2, 'to': 4}, {'from': 4, 'to': 6}],
+                       'n_total': 3, 'n_covered': 1}]
+        branch_lines = [ln for ln in format_coverage_summary(per_target)
+                        if not ln.startswith('📊')]
+        froms = [int(ln.split('L')[1].split('→')[0]) for ln in branch_lines]
+        assert froms == sorted(froms)          # 2,4,4… 由小到大
+        assert branch_lines[0].endswith('L2→4') and '✗' in branch_lines[0]
+
+    def test_empty_per_target_returns_no_lines(self):
+        from servers.coverage import format_coverage_summary
+        assert format_coverage_summary([]) == []
 
 
 class TestGateEmitsHumanVisibleCoverage:
