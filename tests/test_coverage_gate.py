@@ -432,3 +432,173 @@ class TestGetNextDispatchGated:
         inst = facade.get_next_dispatch_gated(epic, 'proj', str(tmp_path))
         assert inst['action'] == 'blocked'
         assert inst.get('subagent_type') != 'critic'
+
+
+# ── Fail-closed 強化（codex 審查：杜絕假綠）─────────────────────────────
+
+
+class TestMeasureFailClosedHardening:
+    """量測層：非法 target 行範圍、測試執行錯誤、coverage json 格式異動
+    都必須回可辨識的失敗狀態，絕不可退化成『單行/空覆蓋 → 假綠』。"""
+
+    def test_line_end_none_is_invalid_targets_not_single_line(self, tmp_path):
+        # 不需 coverage：入口先驗 target，非法即回傳（不進子行程）。
+        from servers.coverage import measure_branch_coverage
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 5, 'line_end': None}]
+        res = measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'invalid_targets'
+        assert res['fully_covered'] is False
+
+    def test_line_end_zero_is_invalid_targets(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 5, 'line_end': 0}]
+        res = measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'invalid_targets'
+
+    def test_line_end_before_line_start_is_invalid_targets(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 9, 'line_end': 3}]
+        res = measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'invalid_targets'
+
+    def test_bool_line_start_is_invalid_targets(self, tmp_path):
+        # True/False 是 int 子類，但顯非合法行號 → 必須擋下。
+        from servers.coverage import measure_branch_coverage
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': True, 'line_end': 5}]
+        res = measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'invalid_targets'
+
+    def test_pytest_timeout_is_test_run_error(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        (tmp_path / 'test_x.py').write_text('def test_x(): pass\n')
+
+        def boom(*a, **k):
+            raise sp.TimeoutExpired(cmd='pytest', timeout=1)
+        monkeypatch.setattr(cov.subprocess, 'run', boom)
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 6}]
+        res = cov.measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'test_run_error'
+
+    def test_pytest_rc2_is_test_run_error_not_unavailable(self, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        (tmp_path / 'test_x.py').write_text('def test_x(): pass\n')
+
+        class FakeRun:
+            returncode = 2
+            stdout = 'usage error'
+            stderr = ''
+        monkeypatch.setattr(cov.subprocess, 'run', lambda *a, **k: FakeRun())
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 6}]
+        res = cov.measure_branch_coverage(str(tmp_path), ['test_x.py'], targets)
+        assert res['tool_status'] == 'test_run_error'
+
+    def test_malformed_branch_arrays_is_schema_error(self, tmp_path):
+        from servers.coverage import _attribute_targets
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, 'x.py'))
+        file_index = {canon: {'missing_branches': [[2, 'bad']],
+                              'executed_branches': []}}
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_non_list_branch_field_is_schema_error(self, tmp_path):
+        from servers.coverage import _attribute_targets
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, 'x.py'))
+        file_index = {canon: {'missing_branches': None, 'executed_branches': []}}
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+
+    def test_wellformed_branches_attribute_ok(self, tmp_path):
+        from servers.coverage import _attribute_targets
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, 'x.py'))
+        file_index = {canon: {'missing_branches': [[2, 4]],
+                              'executed_branches': [[2, 3]]}}
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is False
+        pt = res['per_target'][0]
+        assert pt['missing_branches'] == [{'from': 2, 'to': 4}]
+        assert pt['n_total'] == 2 and pt['n_covered'] == 1
+
+
+class TestSanitize:
+    def test_strips_ansi_and_control_keeps_text_and_newline(self):
+        from servers.coverage import _sanitize
+        raw = '\x1b[31mFAIL\x1b[0m\x00\x07 line\n\tok'
+        out = _sanitize(raw)
+        assert '\x1b' not in out and '\x00' not in out and '\x07' not in out
+        assert 'FAIL' in out and 'line' in out and 'ok' in out
+        assert '\n' in out
+
+    def test_empty_is_empty(self):
+        from servers.coverage import _sanitize
+        assert _sanitize('') == ''
+        assert _sanitize(None) == ''
+
+
+class TestGateFailClosedRouting:
+    """gate 路由：唯一允許 fail-open 的是 coverage 套件缺失；
+    其餘任何非 ok（test_run_error / invalid_targets / schema_error）一律確定性退件。"""
+
+    def _setup(self, monkeypatch, status):
+        import servers.coverage as cov
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        critic = reserve_critic_task(task)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': status, 'fully_covered': False,
+            'per_target': [], 'error': f'模擬 {status}'})
+        return task, critic['id']
+
+    def test_test_run_error_is_reject(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.facade as facade
+        from servers.tasks import get_task
+        task, critic_id = self._setup(monkeypatch, 'test_run_error')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+
+    def test_invalid_targets_is_reject(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.facade as facade
+        from servers.tasks import get_task
+        task, critic_id = self._setup(monkeypatch, 'invalid_targets')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'
+
+    def test_schema_error_is_reject(self, mock_db_path, tmp_path, monkeypatch):
+        import servers.facade as facade
+        from servers.tasks import get_task
+        task, critic_id = self._setup(monkeypatch, 'schema_error')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+        assert get_task(task)['status'] == 'pending'

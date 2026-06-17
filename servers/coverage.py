@@ -9,12 +9,49 @@ branch arc 歸因到本次 target 函式。非侵入：隔離 data file、不寫
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from typing import Dict, List, Optional
 
 _TIMEOUT_SEC = 300
+
+# 終端機跳脫序列（ANSI/CSI）。pytest 輸出可能含色碼；落進退件 prompt 前先剝除。
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def _sanitize(text: Optional[str], limit: int = 400) -> str:
+    """清掉 ANSI 跳脫與控制字元（保留 \\n\\t），截長度。
+
+    為什麼：pytest stdout/stderr 會被當成退件理由寫進 working_memory['critic_suggestions']，
+    再注入 executor 重試 prompt。剝除控制字元可縮小亂碼/注入面，且不影響可讀性。
+    """
+    if not text:
+        return ''
+    text = _ANSI_RE.sub('', text)
+    text = ''.join(c for c in text
+                   if c in ('\n', '\t') or (ord(c) >= 32 and ord(c) != 127))
+    return text.strip()[-limit:]
+
+
+def _invalid_targets(coverage_targets: List[Dict]) -> Optional[str]:
+    """回傳第一個不合法 target 的描述；全合法回 None。
+
+    每個 target 必須有正整數 line_start、line_end 且 line_end >= line_start
+    （bool 不算合法行號）。不合法 → 上游確定性退件，**絕不**讓 `None`/`0` 退化成
+    單行範圍而把整段未覆蓋分支假裝成全覆蓋（codex 審查的假綠破口）。
+    """
+    for t in coverage_targets:
+        ls = t.get('line_start')
+        le = t.get('line_end')
+        fp = t.get('file_path') or '?'
+        for label, v in (('line_start', ls), ('line_end', le)):
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                return f"{fp}: {label} 必須為正整數（得到 {ls!r}/{le!r}）"
+        if le < ls:
+            return f"{fp}: line_end({le}) < line_start({ls})"
+    return None
 
 
 def _coverage_available() -> bool:
@@ -63,17 +100,28 @@ def measure_branch_coverage(project_path: str,
     """量測 coverage_targets 各函式行範圍內的分支覆蓋。
 
     Returns: {
-        'tool_status': 'ok' | 'tests_failed' | 'no_targets' | 'unavailable',
+        'tool_status': 'ok' | 'tests_failed' | 'no_targets'
+                       | 'invalid_targets' | 'test_run_error'
+                       | 'schema_error' | 'unavailable',
         'fully_covered': bool,
         'per_target': [{'file_path','name','line_start','line_end',
                         'missing_branches':[{'from','to'}],'n_total','n_covered'}],
         'error': str | None,
     }
+
+    狀態分流原則（對齊「工具確認、非 LLM 宣稱」）：除 `unavailable`（coverage 套件
+    缺失＝真正 infra，上游 fail-open）外，所有非 `ok` 狀態都代表「無法工具確認全覆蓋」，
+    上游一律確定性退件（fail-closed）。
     """
+    # target 行範圍非法 → 確定性失敗（先於任何子行程；不依賴 coverage 安裝）。
+    bad = _invalid_targets(coverage_targets)
+    if bad:
+        return _result('invalid_targets', f'coverage target 行範圍不合法：{bad}')
     if not _coverage_available():
         return _result('unavailable', 'coverage 套件未安裝')
     if not test_targets:
-        return _result('unavailable', '無可量測的 test_targets')
+        # 沒有可跑的測試＝無法確認覆蓋 → fail-closed（gate 已先擋空 derive，這是防呆）。
+        return _result('test_run_error', '無可量測的 test_targets')
 
     root = os.path.realpath(project_path)
     safe_tests = []
@@ -82,7 +130,8 @@ def measure_branch_coverage(project_path: str,
         if canon and os.path.isfile(canon):
             safe_tests.append(canon)
     if not safe_tests:
-        return _result('unavailable', 'test_targets 不在專案根目錄下或不存在')
+        # 宣告的測試檔不存在/不在根目錄 → 跑不了＝無法確認 → fail-closed。
+        return _result('test_run_error', 'test_targets 不在專案根目錄下或不存在')
 
     with tempfile.TemporaryDirectory() as tmp:
         data_file = os.path.join(tmp, '.coverage')
@@ -96,17 +145,19 @@ def measure_branch_coverage(project_path: str,
                 timeout=_TIMEOUT_SEC,
             )
         except subprocess.TimeoutExpired:
-            return _result('unavailable', f'pytest 逾時（>{_TIMEOUT_SEC}s）')
+            # 逾時＝沒跑完＝無法確認覆蓋 → fail-closed（非 infra fail-open）。
+            return _result('test_run_error', f'pytest 逾時（>{_TIMEOUT_SEC}s）')
 
         rc = run.returncode
-        tail = ((run.stdout or '')[-500:] + (run.stderr or '')[-500:]).strip()[-400:]
+        tail = _sanitize((run.stdout or '')[-500:] + (run.stderr or '')[-500:])
         # pytest exit codes: 0=全過, 1=有測試失敗, 5=未收集到測試, 2/3/4=中斷/內部/用法錯
         if rc == 1:
             return _result('tests_failed', f'測試未通過 (rc=1): {tail}')
         if rc == 5:
             return _result('no_targets', f'未收集到任何測試 (rc=5): {tail}')
         if rc != 0:
-            return _result('unavailable', f'pytest 異常 (rc={rc}): {tail}')
+            # rc 2/3/4：pytest 中斷/內部錯/用法錯 → 沒有可信覆蓋結果 → fail-closed。
+            return _result('test_run_error', f'pytest 異常 (rc={rc}): {tail}')
 
         try:
             rep = subprocess.run(
@@ -116,33 +167,55 @@ def measure_branch_coverage(project_path: str,
                 timeout=_TIMEOUT_SEC,
             )
         except subprocess.TimeoutExpired:
-            return _result('unavailable', 'coverage json 產製逾時')
+            return _result('test_run_error', 'coverage json 產製逾時')
         if rep.returncode != 0 or not os.path.exists(json_file):
-            return _result('unavailable', f'coverage json 產製失敗: {(rep.stderr or "")[-300:]}')
+            return _result('test_run_error',
+                           f'coverage json 產製失敗: {_sanitize((rep.stderr or "")[-300:])}')
 
         try:
             with open(json_file, encoding='utf-8') as fh:
                 data = json.load(fh)
         except (ValueError, OSError) as e:
-            return _result('unavailable', f'coverage json 解析失敗: {e}')
+            return _result('test_run_error', f'coverage json 解析失敗: {_sanitize(str(e))}')
 
     if not isinstance(data, dict) or not isinstance(data.get('files'), dict):
-        return _result('unavailable', 'coverage json 格式非預期（缺 files dict）')
+        return _result('schema_error', 'coverage json 格式非預期（缺 files dict）')
 
     file_index = _build_file_index(data['files'], root)
+    return _attribute_targets(file_index, coverage_targets, root)
 
+
+def _attribute_targets(file_index: Dict[str, Dict],
+                       coverage_targets: List[Dict],
+                       root: str) -> Dict:
+    """把 branch arc 依「行範圍」歸因到各 target，回 _result(...)。
+
+    前置條件：coverage_targets 行範圍已由 _invalid_targets 驗過（line_start/line_end
+    為正整數且 le>=ls），故此處直接取用、不再用 `or` 退化。
+
+    防護（codex 審查）：coverage json 的 branch 欄位若非 `[[int,int], ...]`（版本格式
+    異動、欄位缺漏），**不可**靜默過濾成空集合而誤判全覆蓋——回 'schema_error' 確定性退件。
+    """
     per_target = []
     for t in coverage_targets:
         fp = t.get('file_path') or ''
-        ls = t.get('line_start') or 0
-        le = t.get('line_end') or ls
+        ls = t['line_start']
+        le = t['line_end']
         canon = _canonical_in_root(root, fp)
         entry = file_index.get(canon) if canon else None
         if entry is None:
             return _result('no_targets', f'target 檔未被測試執行（未覆蓋）: {fp}')
+        mb = entry.get('missing_branches', [])
+        eb = entry.get('executed_branches', [])
+        if (not isinstance(mb, list) or not isinstance(eb, list)
+                or not all(_valid_arc(a) for a in mb)
+                or not all(_valid_arc(a) for a in eb)):
+            return _result('schema_error',
+                           f'coverage json 分支格式非預期（{fp}）：'
+                           'missing/executed_branches 應為 [[int,int], ...]')
         in_range = lambda arc: ls <= arc[0] <= le
-        missing = [a for a in entry.get('missing_branches', []) if _valid_arc(a) and in_range(a)]
-        executed = [a for a in entry.get('executed_branches', []) if _valid_arc(a) and in_range(a)]
+        missing = [a for a in mb if in_range(a)]
+        executed = [a for a in eb if in_range(a)]
         per_target.append({
             'file_path': fp, 'name': t.get('name'),
             'line_start': ls, 'line_end': le,
@@ -155,9 +228,8 @@ def measure_branch_coverage(project_path: str,
     return _result('ok', None, per_target=per_target, fully_covered=fully)
 
 
-import re as _re
-
-_MARKER_RE = _re.compile(r'^\s*TEST_TARGETS:\s*(.+)$', _re.MULTILINE)
+_MARKER_RE = re.compile(r'^\s*TEST_TARGETS:\s*(.+)$', re.MULTILINE)
+_MAX_TEST_TARGETS = 50  # marker 與後備啟發式共用的測試檔上限
 
 
 def _is_test_path(path: str) -> bool:
@@ -177,9 +249,9 @@ def derive_test_targets(project_path: str,
     root = os.path.realpath(project_path)
     found: List[str] = []
 
-    # 1. marker
+    # 1. marker（同樣設上限，避免異常巨量 marker 撐爆 pytest 命令列）
     for m in _MARKER_RE.findall(executor_result or ''):
-        for raw in _re.split(r'[,\s]+', m.strip()):
+        for raw in re.split(r'[,\s]+', m.strip()):
             if not raw:
                 continue
             canon = _canonical_in_root(root, raw)
@@ -187,6 +259,10 @@ def derive_test_targets(project_path: str,
                 rel = os.path.relpath(canon, root)
                 if rel not in found:
                     found.append(rel)
+                    if len(found) >= _MAX_TEST_TARGETS:
+                        break
+        if len(found) >= _MAX_TEST_TARGETS:
+            break
     if found:
         return sorted(found)
 
@@ -206,7 +282,7 @@ def derive_test_targets(project_path: str,
     _PRUNE = {'.git', '.hg', '.svn', '.venv', 'venv', 'env', '__pycache__',
               'node_modules', 'build', 'dist', '.tox', '.eggs', '.mypy_cache',
               '.pytest_cache', 'site-packages'}
-    _MAX_FALLBACK = 50
+    _MAX_FALLBACK = _MAX_TEST_TARGETS
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _PRUNE]
         for fn in filenames:

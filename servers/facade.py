@@ -1846,14 +1846,17 @@ def run_coverage_gate(critic_task_id: str,
         issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
         return _gate_reject(critic_task_id, original_task_id, issues)
 
-    if status in ('tests_failed', 'no_targets'):
-        # 工具判定失敗/沒測到 → 確定性退件，不交給 LLM 宣稱
-        return _gate_reject(critic_task_id, original_task_id,
-                            [f'分支覆蓋率 gate：{res.get("error")}'])
+    # 唯一 fail-open：coverage 套件缺失（真正 infra；measure 回 'unavailable'）。
+    # 此時回退人工逐分支核對（playbook critic checklist 已涵蓋）。
+    if status == 'unavailable':
+        return {'verdict': 'proceed',
+                'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
 
-    # status == 'unavailable' → 真正 infra 問題 → fail-open
-    return {'verdict': 'proceed',
-            'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
+    # 其餘任何非 ok（tests_failed / no_targets / invalid_targets / test_run_error /
+    # schema_error）＝「工具無法確認全覆蓋」→ 一律確定性退件（fail-closed），
+    # 絕不 fail-open 把未驗證的覆蓋交給 LLM 宣稱。
+    return _gate_reject(critic_task_id, original_task_id,
+                        [f'分支覆蓋率 gate（{status}）：{res.get("error")}'])
 
 
 def get_next_dispatch_gated(parent_id: str,
