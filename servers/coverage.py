@@ -225,6 +225,7 @@ def _attribute_targets(file_index: Dict[str, Dict],
             'file_path': fp, 'name': t.get('name'),
             'line_start': ls, 'line_end': le,
             'missing_branches': [{'from': a[0], 'to': a[1]} for a in missing],
+            'covered_branches': [{'from': a[0], 'to': a[1]} for a in executed],
             'n_total': len(missing) + len(executed),
             'n_covered': len(executed),
         })
@@ -302,22 +303,33 @@ def derive_test_targets(project_path: str,
 
 
 def format_coverage_summary(per_target: List[Dict]) -> List[str]:
-    """人類可見的分支覆蓋率摘要：每個 target 一行。
+    """人類可見的分支覆蓋率摘要：每個 target 列出**每一條分支**（✓/✗）。
 
-    讓跑 /han:unit-test 的人「看得到」實際覆蓋數字（不論通過或缺口），不是只給
-    gate/executor 內部用。格式：
-      📊 分支覆蓋 <file>::<name> n/總數 ✅            （全覆蓋）
-      📊 分支覆蓋 <file>::<name> n/總數 ❌ 未覆蓋 L2→4, L4→5  （有缺口）
+    讓跑 /han:unit-test 的人不只看到「率」，還能逐條核對邏輯：總共有幾條分支、
+    哪幾條走到（✓）、哪幾條沒走到（✗）。格式：
+      📊 分支覆蓋 <file>::<name> 1/4（共 4 條分支）❌
+         ✓ L2→3
+         ✗ L2→4
+         ✗ L4→5
+         ✗ L4→6
+    全覆蓋時標頭結尾為 ✅、所有分支皆 ✓。
+    covered_branches 用 .get 取（缺欄位時降級為只列未覆蓋），讓不帶該欄位的
+    舊資料/測試樁不致爆掉。
     """
     lines = []
     for pt in per_target:
         n_cov, n_tot = pt['n_covered'], pt['n_total']
-        head = f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} {n_cov}/{n_tot}"
-        if pt['missing_branches']:
-            arcs = ', '.join(f"L{a['from']}→{a['to']}" for a in pt['missing_branches'])
-            lines.append(f"{head} ❌ 未覆蓋 {arcs}")
-        else:
-            lines.append(f"{head} ✅")
+        mark = '✅' if not pt['missing_branches'] else '❌'
+        lines.append(
+            f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} "
+            f"{n_cov}/{n_tot}（共 {n_tot} 條分支）{mark}"
+        )
+        # 逐條列出：已覆蓋 ✓ 在前、未覆蓋 ✗ 在後，並依行號排序便於對照原始碼。
+        branches = [(a, True) for a in pt.get('covered_branches', [])]
+        branches += [(a, False) for a in pt['missing_branches']]
+        branches.sort(key=lambda x: (x[0]['from'], x[0]['to']))
+        for arc, covered in branches:
+            lines.append(f"   {'✓' if covered else '✗'} L{arc['from']}→{arc['to']}")
     return lines
 
 

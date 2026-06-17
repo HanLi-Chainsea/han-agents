@@ -635,30 +635,47 @@ class TestGateFailClosedRouting:
 
 
 class TestFormatCoverageSummary:
-    """人類可見的覆蓋率摘要：每個 target 一行，含 n/總數 與通過/缺口標記。"""
+    """人類可見的覆蓋率摘要：每個 target 列出**每一條分支**（✓/✗），人好核對邏輯。"""
 
-    def test_partial_coverage_shows_number_and_missing_arcs(self):
+    def test_lists_every_branch_with_covered_and_missing_marks(self):
         from servers.coverage import format_coverage_summary
         per_target = [{'file_path': 'calc.py', 'name': 'classify',
                        'line_start': 1, 'line_end': 5,
-                       'missing_branches': [{'from': 2, 'to': 4}, {'from': 4, 'to': 5}],
-                       'n_total': 4, 'n_covered': 2}]
-        lines = format_coverage_summary(per_target)
-        assert len(lines) == 1
-        s = lines[0]
-        assert 'calc.py' in s and 'classify' in s
-        assert '2/4' in s          # 覆蓋數字看得到
-        assert '❌' in s            # 有缺口標記
-        assert '2→4' in s          # 未覆蓋分支行號看得到
+                       'covered_branches': [{'from': 2, 'to': 3}],
+                       'missing_branches': [{'from': 2, 'to': 4},
+                                            {'from': 4, 'to': 5},
+                                            {'from': 4, 'to': 6}],
+                       'n_total': 4, 'n_covered': 1}]
+        out = '\n'.join(format_coverage_summary(per_target))
+        # 標頭：覆蓋數字 + 總分支數
+        assert 'calc.py' in out and 'classify' in out
+        assert '1/4' in out
+        assert '4' in out and '分支' in out      # 列出有多少分支
+        assert '❌' in out
+        # 每一條分支都要列出來（覆蓋的 + 未覆蓋的），各自有 ✓ / ✗ 記號
+        assert '✓' in out and '✗' in out
+        for arc in ('2→3', '2→4', '4→5', '4→6'):
+            assert arc in out
+        # 已覆蓋的 2→3 標 ✓，未覆蓋的標 ✗
+        covered_line = [ln for ln in format_coverage_summary(per_target) if '2→3' in ln][0]
+        missing_line = [ln for ln in format_coverage_summary(per_target) if '2→4' in ln][0]
+        assert '✓' in covered_line
+        assert '✗' in missing_line
 
-    def test_full_coverage_shows_pass_mark(self):
+    def test_full_coverage_lists_all_branches_as_covered(self):
         from servers.coverage import format_coverage_summary
         per_target = [{'file_path': 'calc.py', 'name': 'classify',
                        'line_start': 1, 'line_end': 5,
+                       'covered_branches': [{'from': 2, 'to': 3},
+                                            {'from': 2, 'to': 4},
+                                            {'from': 4, 'to': 5},
+                                            {'from': 4, 'to': 6}],
                        'missing_branches': [], 'n_total': 4, 'n_covered': 4}]
-        lines = format_coverage_summary(per_target)
-        assert '4/4' in lines[0]
-        assert '✅' in lines[0]
+        out = '\n'.join(format_coverage_summary(per_target))
+        assert '4/4' in out
+        assert '✅' in out
+        assert out.count('✓') == 4        # 4 條全部列出且標已覆蓋
+        assert '✗' not in out
 
 
 class TestGateEmitsHumanVisibleCoverage:
