@@ -153,3 +153,82 @@ def measure_branch_coverage(project_path: str,
 
     fully = all(not pt['missing_branches'] for pt in per_target)
     return _result('ok', None, per_target=per_target, fully_covered=fully)
+
+
+import re as _re
+
+_MARKER_RE = _re.compile(r'^\s*TEST_TARGETS:\s*(.+)$', _re.MULTILINE)
+
+
+def _is_test_path(path: str) -> bool:
+    from servers.recipes import is_test_file
+    return is_test_file(path)
+
+
+def derive_test_targets(project_path: str,
+                        executor_result: Optional[str],
+                        coverage_targets: List[Dict]) -> List[str]:
+    """決定要餵給 coverage 的測試檔（相對專案根）。
+
+    1. 優先：從 executor 輸出解析 `TEST_TARGETS:` marker（逗號/空白分隔）。
+    2. 後備：用各 coverage_target 的檔名 stem，找 test_<stem>.py / <stem>_test.py。
+    只保留「存在且為測試命名」的路徑。回傳去重排序後的相對路徑清單（可能為空）。
+    """
+    root = os.path.realpath(project_path)
+    found: List[str] = []
+
+    # 1. marker
+    for m in _MARKER_RE.findall(executor_result or ''):
+        for raw in _re.split(r'[,\s]+', m.strip()):
+            if not raw:
+                continue
+            canon = _canonical_in_root(root, raw)
+            if canon and os.path.isfile(canon) and _is_test_path(raw):
+                rel = os.path.relpath(canon, root)
+                if rel not in found:
+                    found.append(rel)
+    if found:
+        return sorted(found)
+
+    # 2. 後備：stem 啟發式（限縮——剪掉 build/dist/site-packages 等噪音目錄、設候選上限）
+    stems = set()
+    for t in coverage_targets:
+        fp = t.get('file_path') or ''
+        s = os.path.splitext(os.path.basename(fp))[0]
+        if s:
+            stems.add(s)
+    wanted = set()
+    for s in stems:
+        wanted.add(f'test_{s}.py')
+        wanted.add(f'{s}_test.py')
+    if not wanted:
+        return []
+    _PRUNE = {'.git', '.hg', '.svn', '.venv', 'venv', 'env', '__pycache__',
+              'node_modules', 'build', 'dist', '.tox', '.eggs', '.mypy_cache',
+              '.pytest_cache', 'site-packages'}
+    _MAX_FALLBACK = 50
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _PRUNE]
+        for fn in filenames:
+            if fn in wanted:
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                if rel not in found:
+                    found.append(rel)
+                    if len(found) >= _MAX_FALLBACK:
+                        return sorted(found)
+    # 後備找不到 → 回空清單；由 run_coverage_gate 決定確定性退件（要求 executor 回報 TEST_TARGETS）
+    return sorted(found)
+
+
+def format_missing_issues(per_target: List[Dict]) -> List[str]:
+    """把有未覆蓋分支的 target 轉成人類可讀 issue 字串（給 finish_validation）。"""
+    issues = []
+    for pt in per_target:
+        if not pt['missing_branches']:
+            continue
+        arcs = ', '.join(f"{a['from']}→{a['to']}" for a in pt['missing_branches'])
+        issues.append(
+            f"{pt['file_path']} 函式 {pt['name']} (L{pt['line_start']}-{pt['line_end']})："
+            f"分支未覆蓋 {arcs}（{len(pt['missing_branches'])} 條未覆蓋 / 共 {pt['n_total']} 條）"
+        )
+    return issues

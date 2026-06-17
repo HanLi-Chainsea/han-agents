@@ -200,3 +200,51 @@ class TestMeasureUnavailableWhenNotInstalled:
                                             'line_start': 1, 'line_end': 3}])
         assert res['tool_status'] == 'unavailable'
         assert 'coverage' in (res['error'] or '').lower()
+
+
+class TestDeriveTestTargets:
+    def test_parses_marker_from_executor_result(self, tmp_path):
+        from servers.coverage import derive_test_targets
+        (tmp_path / 'test_a.py').write_text('def test_a(): pass\n')
+        (tmp_path / 'test_b.py').write_text('def test_b(): pass\n')
+        result = "做完了。\nTEST_TARGETS: test_a.py, test_b.py\n其他說明。"
+        got = derive_test_targets(str(tmp_path), result, [])
+        assert got == ['test_a.py', 'test_b.py']
+
+    def test_marker_paths_must_exist_and_be_tests(self, tmp_path):
+        from servers.coverage import derive_test_targets
+        (tmp_path / 'test_a.py').write_text('def test_a(): pass\n')
+        result = "TEST_TARGETS: test_a.py, not_a_test.py, missing_test.py"
+        got = derive_test_targets(str(tmp_path), result, [])
+        # not_a_test.py 非測試命名；missing_test.py 不存在 → 都剔除
+        assert got == ['test_a.py']
+
+    def test_heuristic_fallback_by_stem(self, tmp_path):
+        from servers.coverage import derive_test_targets
+        srcdir = tmp_path / 'servers'
+        srcdir.mkdir()
+        (srcdir / 'memory.py').write_text('def f(): pass\n')
+        tdir = tmp_path / 'tests'
+        tdir.mkdir()
+        (tdir / 'test_memory.py').write_text('def test_f(): pass\n')
+        # 無 marker → 用 coverage_targets 的檔名 stem 找 test_memory.py
+        got = derive_test_targets(str(tmp_path), "沒有 marker",
+                                  [{'file_path': 'servers/memory.py', 'name': 'f',
+                                    'line_start': 1, 'line_end': 1}])
+        assert any(p.endswith('test_memory.py') for p in got)
+
+
+class TestFormatMissingIssues:
+    def test_human_readable_issue_lines(self):
+        from servers.coverage import format_missing_issues
+        per_target = [{
+            'file_path': 'servers/x.py', 'name': 'classify',
+            'line_start': 1, 'line_end': 6,
+            'missing_branches': [{'from': 2, 'to': 4}, {'from': 4, 'to': 5}],
+            'n_total': 4, 'n_covered': 2,
+        }]
+        issues = format_missing_issues(per_target)
+        assert len(issues) == 1
+        assert 'servers/x.py' in issues[0]
+        assert 'classify' in issues[0]
+        assert '2→4' in issues[0] and '4→5' in issues[0]
