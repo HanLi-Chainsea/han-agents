@@ -145,7 +145,8 @@ def create_subtask(parent_id: str, description: str,
                    requires_validation: bool = True,
                    task_level: str = 'task',
                    epic_id: str = None,
-                   story_id: str = None) -> str:
+                   story_id: str = None,
+                   metadata: Dict = None) -> str:
     """建立子任務
 
     Args:
@@ -178,12 +179,15 @@ def create_subtask(parent_id: str, description: str,
                 story_id = parent_id if parent_level == 'story' else row[3]
 
         task_id = str(uuid.uuid4())[:8]
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         cursor.execute('''
             INSERT INTO tasks (id, parent_id, project, description, assigned_agent,
-                             priority, requires_validation, task_level, epic_id, story_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             priority, requires_validation, task_level, epic_id, story_id,
+                             metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (task_id, parent_id, project, description, assigned_agent, priority,
-              1 if requires_validation else 0, task_level, epic_id, story_id))
+              1 if requires_validation else 0, task_level, epic_id, story_id,
+              metadata_json))
 
         if depends_on:
             for dep_id in depends_on:

@@ -47,21 +47,22 @@ PY
 ```
 - 若 `task_count==0`／`EPIC` 為 None → 回報訊息後**停止**（沒有缺口或沒指定範圍）。
 
-3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 印出的同一個 epic_id 放進 `HAN_EPIC` 前綴，並 inline 重算其餘環境變數再執行：
+3. 驅動派工迴圈（重複，直到 `action != 'dispatch'`）。每一輪都把步驟 2 印出的同一個 epic_id 放進 `HAN_EPIC` 前綴，並 inline 重算其餘環境變數再執行。**用 `get_next_dispatch_gated`**：當下一步是 critic 驗證時，它會先用 `coverage --branch` 量測本次 target 的分支覆蓋——有未覆蓋分支就直接走 `finish_validation` 退回 executor 補測（帶具體行號、不派 critic、不費 token）；全覆蓋或工具不可用才照常派 critic：
 ```bash
 HAN_EPIC="<epic_id>" HAN_PROJECT="$(basename "$(pwd)")" HAN_PROJECT_PATH="$(pwd)" python3 - <<'PY'
 import os, sys, json
 sys.path.insert(0, {{HAN_DIR}})
-from servers.facade import get_next_dispatch
-inst = get_next_dispatch(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
-print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','progress','message')}, ensure_ascii=False))
+from servers.facade import get_next_dispatch_gated
+inst = get_next_dispatch_gated(os.environ['HAN_EPIC'], os.environ['HAN_PROJECT'], os.environ['HAN_PROJECT_PATH'])
+print(json.dumps({k: inst.get(k) for k in ('action','subagent_type','task_id','progress','message','coverage_summary')}, ensure_ascii=False))
 print('PROMPT_START'); print(inst.get('prompt','')); print('PROMPT_END')
 PY
 ```
 - `action == 'dispatch'`：用 **Agent 工具**（Claude Code 派工工具，舊稱 Task）派發，`subagent_type` 用回傳值、`prompt` 用 `PROMPT_START`…`PROMPT_END` 之間的內容。子代理完成後再次 dispatch。
 - `action == 'done'`：完成；`blocked`/`waiting`：回報 `message` 並停止。
+- `coverage_summary`（若非 null）：某個 target 通過分支覆蓋率 gate 時帶回的逐條分支摘要（每條分支 ✓ 已覆蓋／✗ 未覆蓋、含「共 N 條分支」）。**逐輪收集起來**，收尾報告要原樣列出，讓人核對邏輯。
 
-4. 收尾回報：建立了幾個任務、寫了哪些測試檔、執行 pass/fail 摘要。
+4. 收尾回報：建立了幾個任務、寫了哪些測試檔、執行 pass/fail 摘要。**並附上「分支覆蓋率」區塊**：把迴圈中收集到的所有 `coverage_summary` 行原樣列出（每個 target 的 n/總數 與逐條分支 ✓/✗），這是工具實測值、非宣稱，供人逐條核對。
 
 ## 重要
 - 一定要**跑完 dispatch 迴圈**讓 executor 真的寫測試、critic 真的驗證——不要只建任務就回報。

@@ -47,6 +47,16 @@ run_recipe(name, **kwargs) -> Dict
 """
 
 
+def _gaps_to_coverage_targets(file_gaps: List[Dict]) -> List[Dict]:
+    """把同一檔案的 coverage gaps 轉成 gate 用的結構化 target 清單。"""
+    return [{
+        'file_path': g.get('file_path'),
+        'name': g.get('name'),
+        'line_start': g.get('line_start'),
+        'line_end': g.get('line_end'),
+    } for g in file_gaps]
+
+
 def recipe_unit_tests(
     project_name: str,
     project_path: str,
@@ -150,16 +160,16 @@ def recipe_unit_tests(
             'gap_count': len(file_gaps),
         }
 
-        # Task: 每個檔案一個 executor task（batch 所有 gaps）
-        remaining = max_tasks - task_count
-        batch_names = gap_names[:remaining]
-
+        # Task: 每個檔案一個 executor task（batch 該檔案所有 gaps）
+        # 注意：per-file gaps 不可被 remaining(任務數預算) 切片——
+        # remaining 是 task-count 預算，迴圈頂的 `task_count >= max_tasks: break`
+        # 已負責任務數上限；切 per-file gaps 會漏掉同檔案的覆蓋目標。
         task_desc = (
             f"Write unit tests for {file_path}. "
-            f"Test targets: {', '.join(batch_names[:5])}"
+            f"Test targets: {', '.join(gap_names[:5])}"
         )
-        if len(batch_names) > 5:
-            task_desc += f" and {len(batch_names) - 5} more"
+        if len(gap_names) > 5:
+            task_desc += f" and {len(gap_names) - 5} more"
         task_desc += f". Test tool: {test_tool}"
 
         task_id = create_subtask(
@@ -170,6 +180,7 @@ def recipe_unit_tests(
             task_level='task',
             epic_id=epic_id,
             story_id=story_id,
+            metadata={'coverage_targets': _gaps_to_coverage_targets(file_gaps)},
         )
 
         story_info['task_ids'].append(task_id)
