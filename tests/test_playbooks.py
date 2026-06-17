@@ -257,3 +257,21 @@ class TestUnitTestCommandUsesGatedDispatch:
             prefix = ln.split("python3", 1)[0]
             assert "HAN_PROJECT_PATH=" in prefix
             assert "HAN_PROJECT=" in prefix
+
+
+class TestUnitTestPlaybookBranchCoverage:
+    def _pb(self):
+        from servers.playbooks import load_playbooks
+        return load_playbooks(force_reload=True)["unit_test"]
+
+    def test_executor_requires_every_branch_and_reports_test_targets(self):
+        ep = self._pb().executor_principles
+        assert "分支" in ep
+        assert "TEST_TARGETS" in ep          # 結構化回報 marker
+        assert "pragma" in ep.lower()         # 不可達分支說明
+
+    def test_critic_notes_tool_enforced_coverage(self):
+        cc = self._pb().critic_checklist
+        assert "分支" in cc
+        # 工具不可用時 critic 要手動核對
+        assert "工具" in cc

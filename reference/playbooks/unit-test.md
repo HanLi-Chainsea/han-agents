@@ -17,6 +17,9 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
   2. 若需改 root `build.gradle`（或 `build.gradle.kts`、`gradle.properties`、`settings.gradle`），**必須停止並標記人工確認**，不要自行修改；
   3. **不得為了讓測試通過而改變專案目標 JDK 版本**（`sourceCompatibility`/`targetCompatibility`/`toolchain`/`languageVersion`）。
   > 為什麼：上雲時 JDK/Gradle 版本是固定的；若為了本地測試過而改版本，等於把「上雲能不能跑」變成未知數——本地綠燈不代表雲端可跑。寧可回報受阻，也不要動版本。
+- **分支全覆蓋（工具強制）**：本次 target 函式的每一條分支（含 if/else、null/None 路徑、early return、except）都必須被測試走到。上游會用 `coverage --branch` 量測，未覆蓋的分支會帶**具體行號**自動退件。
+- **結構化回報測試檔**：完成後在回報中**獨立一行**列出本次新增/相關的測試檔路徑，格式固定：`TEST_TARGETS: tests/test_x.py, tests/test_y.py`（相對專案根、逗號分隔）。這是覆蓋率 gate 用來決定要跑哪些測試的依據。
+- **不可達分支**：確認為真正不可達/防禦性的分支，用 `# pragma: no cover`（或 `# pragma: no branch`）標記，並在回報**說明理由**；gate 會尊重 pragma、不計入未覆蓋。
 
 ## Critic Checklist
 - [ ] 測試有實際被執行且全數通過（executor 須附執行輸出，否則 REJECT）
@@ -27,3 +30,4 @@ match: ["unit test", "單元測試", "write tests for", "寫測試", "撰寫測�
 - [ ] 斷言有意義且每測只驗一件事；命名表達行為與預期
 - [ ] **未擅自修改 `build.gradle`/`build.gradle.kts`/`gradle.properties`/`settings.gradle`**；若有 diff 必須是人工確認過的（否則 REJECT）
 - [ ] **未變更專案目標 JDK 版本**（sourceCompatibility/targetCompatibility/toolchain）以求測試通過（違反即 REJECT，因破壞上雲版本一致性）
+- [ ] **分支覆蓋（上游已工具強制）**：本次 target 的分支覆蓋已由 `coverage --branch` 在派你之前強制；你拿到此任務代表已全覆蓋或工具不可用。**若 prompt 開頭標記「分支覆蓋率工具未量到」，你必須手動逐分支核對**（含 null/None 路徑——一條 null 分支即一條分支），未覆蓋則 REJECT。
