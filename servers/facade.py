@@ -1850,6 +1850,10 @@ def run_coverage_gate(critic_task_id: str,
     status = res['tool_status']
 
     if status == 'ok':
+        # 人類可見：每個 target 的實際覆蓋數字都印到 stderr（通過/缺口都印），
+        # 讓跑 /han:unit-test 的人「看得到覆蓋率」，不再靜默通過。
+        for line in cov.format_coverage_summary(res['per_target']):
+            sys.stderr.write(line + '\n')
         if res['fully_covered']:
             return {'verdict': 'proceed', 'warn': None}
         issues = cov.format_missing_issues(res['per_target'])

@@ -634,6 +634,62 @@ class TestGateFailClosedRouting:
         assert get_task(task)['status'] == 'pending'
 
 
+class TestFormatCoverageSummary:
+    """人類可見的覆蓋率摘要：每個 target 一行，含 n/總數 與通過/缺口標記。"""
+
+    def test_partial_coverage_shows_number_and_missing_arcs(self):
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'classify',
+                       'line_start': 1, 'line_end': 5,
+                       'missing_branches': [{'from': 2, 'to': 4}, {'from': 4, 'to': 5}],
+                       'n_total': 4, 'n_covered': 2}]
+        lines = format_coverage_summary(per_target)
+        assert len(lines) == 1
+        s = lines[0]
+        assert 'calc.py' in s and 'classify' in s
+        assert '2/4' in s          # 覆蓋數字看得到
+        assert '❌' in s            # 有缺口標記
+        assert '2→4' in s          # 未覆蓋分支行號看得到
+
+    def test_full_coverage_shows_pass_mark(self):
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'classify',
+                       'line_start': 1, 'line_end': 5,
+                       'missing_branches': [], 'n_total': 4, 'n_covered': 4}]
+        lines = format_coverage_summary(per_target)
+        assert '4/4' in lines[0]
+        assert '✅' in lines[0]
+
+
+class TestGateEmitsHumanVisibleCoverage:
+    def test_gate_writes_coverage_number_to_stderr(
+            self, mock_db_path, tmp_path, monkeypatch, capsys):
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        targets = [{'file_path': 'x.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        critic = reserve_critic_task(task)
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9,
+                            'missing_branches': [], 'n_total': 3, 'n_covered': 3}]})
+        facade.run_coverage_gate(critic['id'], task, 'proj', str(tmp_path))
+        err = capsys.readouterr().err
+        # 全覆蓋也要讓人看到數字（不再靜默通過）
+        assert '3/3' in err
+
+
 class TestGateMetadataGuard:
     """metadata['coverage_targets'] 型別防呆：壞掉的 metadata 不可被 `or []`
     靜默當成非 coverage 任務而跳過 gate（隱性繞過＝假綠相鄰）。"""

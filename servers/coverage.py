@@ -301,6 +301,26 @@ def derive_test_targets(project_path: str,
     return sorted(found)
 
 
+def format_coverage_summary(per_target: List[Dict]) -> List[str]:
+    """人類可見的分支覆蓋率摘要：每個 target 一行。
+
+    讓跑 /han:unit-test 的人「看得到」實際覆蓋數字（不論通過或缺口），不是只給
+    gate/executor 內部用。格式：
+      📊 分支覆蓋 <file>::<name> n/總數 ✅            （全覆蓋）
+      📊 分支覆蓋 <file>::<name> n/總數 ❌ 未覆蓋 L2→4, L4→5  （有缺口）
+    """
+    lines = []
+    for pt in per_target:
+        n_cov, n_tot = pt['n_covered'], pt['n_total']
+        head = f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} {n_cov}/{n_tot}"
+        if pt['missing_branches']:
+            arcs = ', '.join(f"L{a['from']}→{a['to']}" for a in pt['missing_branches'])
+            lines.append(f"{head} ❌ 未覆蓋 {arcs}")
+        else:
+            lines.append(f"{head} ✅")
+    return lines
+
+
 def format_missing_issues(per_target: List[Dict]) -> List[str]:
     """把有未覆蓋分支的 target 轉成人類可讀 issue 字串（給 finish_validation）。"""
     issues = []
