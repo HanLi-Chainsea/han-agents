@@ -9,6 +9,7 @@ Policy is intentionally separate from the branch-coverage gate
 """
 
 import glob
+import sys
 import os
 import subprocess
 import tempfile
@@ -17,10 +18,8 @@ from typing import Dict, List, Optional
 # Use defusedxml to prevent XXE/billion-laughs attacks; fall back to stdlib.
 try:
     from defusedxml.ElementTree import parse as ET_parse
-    from defusedxml.ElementTree import fromstring as ET_fromstring
 except ImportError:
     from xml.etree.ElementTree import parse as ET_parse  # type: ignore[assignment]
-    from xml.etree.ElementTree import fromstring as ET_fromstring  # type: ignore[assignment]
 
 _GRADLE_TIMEOUT_SEC = 600
 _PYTEST_TIMEOUT_SEC = 300
@@ -93,13 +92,16 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
         return _ran_false("No parseable <testsuite> elements found in XML files")
 
     passed = (failures == 0) and (errors == 0) and (total > 0)
+    error_msg = None
+    if parse_errors:
+        error_msg = "Parse warnings: " + "; ".join(parse_errors)
     return {
         "ran": True,
         "total": total,
         "failures": failures,
         "errors": errors,
         "passed": passed,
-        "error": None,
+        "error": error_msg,
     }
 
 
@@ -264,7 +266,7 @@ def _run_python(
     with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
         xml_out = tmp.name
 
-    cmd = ["pytest"] + files + [f"--junitxml={xml_out}", "-q"]
+    cmd = [sys.executable, "-m", "pytest"] + files + [f"--junitxml={xml_out}", "-q"]
     if test_filters:
         cmd += list(test_filters)
 

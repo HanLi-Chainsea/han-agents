@@ -157,3 +157,22 @@ class TestParseJunitResults:
 
         assert res["ran"] is True   # we parsed the file, but…
         assert res["passed"] is False  # total==0 prevents passed
+
+    def test_mixed_valid_and_corrupt_files_surfaces_warning(self, tmp_path):
+        """Valid + corrupt file: passed=True (valid suite clean) but error warns of bad file."""
+        # Valid XML with clean result
+        p_valid = _write_xml(tmp_path, "valid.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="Clean" tests="2" failures="0" errors="0" skipped="0"/>
+        """)
+        # Non-existent file
+        p_bad = str(tmp_path / "nonexistent.xml")
+
+        from servers.integration_gate import parse_junit_results
+        res = parse_junit_results([p_valid, p_bad])
+
+        # Valid suite is clean, so passed should be True
+        assert res["passed"] is True
+        # But we should have a warning about the bad file
+        assert res["error"] is not None
+        assert "nonexistent.xml" in res["error"]
