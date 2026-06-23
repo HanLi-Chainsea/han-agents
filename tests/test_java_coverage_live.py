@@ -6,7 +6,7 @@ fresh tmp_path directory, runs Gradle with the JaCoCo init-script, and
 asserts that partial branch coverage is correctly detected.
 
 Run with:
-  pytest tests/test_java_coverage_live.py -q -m slow
+  HAN_RUN_JAVA_LIVE=1 pytest tests/test_java_coverage_live.py -q
 """
 
 import os
@@ -18,6 +18,9 @@ pytestmark = pytest.mark.slow
 
 
 def test_live_java_branch_measure(tmp_path):
+    import os
+    if not os.environ.get("HAN_RUN_JAVA_LIVE"):
+        pytest.skip("set HAN_RUN_JAVA_LIVE=1 to run the Gradle live test")
     if not shutil.which("java"):
         pytest.skip("no java")
     src = "/tmp/jacoco-spike"
@@ -46,3 +49,4 @@ def test_live_java_branch_measure(tmp_path):
     assert len(res["per_target"]) == 1
     pt = res["per_target"][0]
     assert pt["n_covered"] >= 1, f"expected at least 1 covered branch, got {pt['n_covered']}"
+    assert pt["n_total"] >= 2, f"expected real branch measurement, got n_total={pt['n_total']}"

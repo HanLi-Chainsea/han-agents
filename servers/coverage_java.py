@@ -17,6 +17,7 @@ JACOCO_CLI = os.path.join(_JDIR, 'jacococli.jar')
 JACOCO_INIT = os.path.join(_JDIR, 'jacoco-init.gradle')
 
 _TIMEOUT_SEC = 600
+_REPORT_TIMEOUT_SEC = 60
 
 
 def _result(status: str, error: Optional[str] = None,
@@ -193,7 +194,8 @@ def measure_branch_coverage_java(
         test_targets: Unused for Java (kept for API parity with Python backend).
         coverage_targets: List of {'file_path', 'name', 'line_start', 'line_end'}.
         gradle_module: Optional sub-module name (e.g. 'app' -> ':app:test').
-        test_filters: Optional list of test class/method filters passed via --tests.
+        test_filters: Operative scoping parameter — list of test class/method filters
+            passed via --tests to restrict which tests Gradle executes.
 
     Returns same contract as servers/coverage.py::measure_branch_coverage:
         {'tool_status': 'ok'|'tests_failed'|'no_targets'|'test_run_error'|
@@ -262,42 +264,19 @@ def measure_branch_coverage_java(
 
         rc = run.returncode
 
-        # Detect test failures vs other errors by inspecting exit code.
-        # Gradle exits 1 when tests fail, but it may also exit 1 for config
-        # errors. Use the presence of "BUILD FAILED" + test failure markers.
-        stdout = run.stdout or ''
-        stderr = run.stderr or ''
-        combined = stdout + stderr
-
         if rc != 0:
-            # Check if it's specifically tests failing vs a build/config error
-            tests_failed_markers = (
-                'tests were run' in combined.lower()
-                or 'test results:' in combined.lower()
-                or 'failures:' in combined.lower()
-                or 'test execution' in combined.lower()
-                or 'classifytest' in combined.lower()
-                or ': FAILED' in combined
-                or 'tests failed' in combined.lower()
-            )
-            # If exec file exists, tests ran but may have partially failed
+            combined = (run.stdout or '') + (run.stderr or '')
             exec_exists = os.path.isfile(exec_file)
-
-            if tests_failed_markers and not exec_exists:
+            if exec_exists:
+                # Tests ran but some failed — fail-closed: never green-light
                 return _result('tests_failed',
                                f'Gradle test task failed (rc={rc}): '
-                               + (combined[-400:]))
-            elif not exec_exists:
-                # Non-test error (build failure, config error, etc.)
-                return _result('test_run_error',
-                               f'Gradle build failed (rc={rc}): '
-                               + (combined[-400:]))
-            # If exec_file exists despite non-zero rc, tests ran but some failed
-            # We still proceed to generate coverage for what ran, but report tests_failed
-            # Actually for fail-closed: if rc != 0, treat as tests_failed
-            return _result('tests_failed',
-                           f'Gradle test task failed (rc={rc}): '
-                           + (combined[-400:]))
+                               + combined[-400:])
+            else:
+                # No exec produced — could be build error or test failure before exec write
+                return _result('tests_failed',
+                               f'Gradle test task failed (rc={rc}): '
+                               + combined[-400:])
 
         # Check that exec file was produced
         if not os.path.isfile(exec_file):
@@ -325,11 +304,11 @@ def measure_branch_coverage_java(
                 cwd=project_path,
                 capture_output=True,
                 text=True,
-                timeout=_TIMEOUT_SEC,
+                timeout=_REPORT_TIMEOUT_SEC,
             )
         except subprocess.TimeoutExpired:
             return _result('test_run_error',
-                           f'jacococli report timed out (>{_TIMEOUT_SEC}s)')
+                           f'jacococli report timed out (>{_REPORT_TIMEOUT_SEC}s)')
         except Exception as e:
             return _result('test_run_error', f'Failed to launch jacococli: {e}')
 
