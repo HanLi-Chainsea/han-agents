@@ -1,0 +1,7 @@
+def agent = System.getProperty('han.jacoco.agent')
+def exec  = System.getProperty('han.jacoco.exec')
+allprojects {
+    tasks.withType(Test).configureEach {
+        jvmArgs "-javaagent:${agent}=destfile=${exec},append=false,output=file,dumponexit=true"
+    }
+}
