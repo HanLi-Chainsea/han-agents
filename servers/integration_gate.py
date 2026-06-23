@@ -212,10 +212,11 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
 
         # ---- Pattern 2 & 3: Mockito.mock/spy call or bare mock/spy call ----
         # Matches: mock(OrderRepository.class) or Mockito.mock(OrderRepository.class)
-        # Also spy variants.
+        # Also mock(com.aile.OrderRepository.class) (FQN) and mock(..., extra args)
+        # Allows optional fully-qualified prefix and drops closing ) anchor.
         call_pattern = re.compile(
-            r"\b(?:Mockito\.)?(?:mock|spy)\s*\(\s*"
-            + re.escape(simple) + r"\s*\.class\s*\)",
+            r"\b(?:Mockito\.)?(?:mock|spy)\s*\(\s*(?:[A-Za-z0-9_]+\.)*"
+            + re.escape(simple) + r"\s*\.class",
         )
         if call_pattern.search(test_source):
             mocked.add(collab)

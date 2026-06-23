@@ -275,3 +275,42 @@ class TestDetectMockedCollaborators:
             source, ["com.aile.OrderRepository"], "java"
         )
         assert result == ["com.aile.OrderRepository"]
+
+    def test_java_fqn_in_mock_call_detected(self):
+        """mock(com.aile.OrderRepository.class) with FQN → flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                OrderRepository r = mock(com.aile.OrderRepository.class);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_mock_with_extra_args_detected(self):
+        """Mockito.mock(OrderRepository.class, RETURNS_DEEP_STUBS) with extra args → flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                var r = Mockito.mock(OrderRepository.class, RETURNS_DEEP_STUBS);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_new_collaborator_not_flagged_after_fix(self):
+        """new OrderRepository() is NOT flagged — only .class patterns are."""
+        source = textwrap.dedent("""\
+            class Test {
+                OrderRepository r = new OrderRepository();
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == []
