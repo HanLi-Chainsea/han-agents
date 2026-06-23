@@ -176,3 +176,102 @@ class TestParseJunitResults:
         # But we should have a warning about the bad file
         assert res["error"] is not None
         assert "nonexistent.xml" in res["error"]
+
+
+# ---------------------------------------------------------------------------
+# detect_mocked_collaborators — L2 static mock-smell scanner
+# ---------------------------------------------------------------------------
+
+class TestDetectMockedCollaborators:
+    """TDD tests written BEFORE implementation of detect_mocked_collaborators."""
+
+    def test_java_mockbean_collaborator_detected(self):
+        """@MockBean followed by field of type OrderRepository → flagged."""
+        source = textwrap.dedent("""\
+            @SpringBootTest
+            class OrderServiceTest {
+
+                @MockBean
+                private OrderRepository repo;
+
+                @Autowired
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_mockito_mock_call_detected(self):
+        """mock(OrderRepository.class) → flagged."""
+        source = textwrap.dedent("""\
+            class OrderServiceTest {
+                OrderRepository r = mock(OrderRepository.class);
+                OrderService svc = new OrderService(r);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_real_bean_not_flagged(self):
+        """@Autowired and new() are real wiring — should not be flagged."""
+        source = textwrap.dedent("""\
+            @SpringBootTest
+            class OrderServiceTest {
+                @Autowired
+                private OrderRepository repo;
+
+                OrderService svc = new OrderService();
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == []
+
+    def test_java_injectmocks_is_not_a_mocked_collaborator(self):
+        """@InjectMocks marks the SUT, not a mock — must NOT flag it."""
+        source = textwrap.dedent("""\
+            class OrderServiceTest {
+                @InjectMocks
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderService"], "java"
+        )
+        assert result == []
+
+    def test_python_patch_target_detected(self):
+        """@patch('app.svc.OrderRepository') → flagged by full collaborator name."""
+        source = textwrap.dedent("""\
+            @patch('app.svc.OrderRepository')
+            def test_something(mock_repo):
+                svc = OrderService(mock_repo)
+                svc.process()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["app.svc.OrderRepository"], "python"
+        )
+        assert result == ["app.svc.OrderRepository"]
+
+    def test_simple_name_matching(self):
+        """Collaborator 'com.aile.OrderRepository' matches mock(OrderRepository.class)."""
+        source = textwrap.dedent("""\
+            class Test {
+                OrderRepository r = mock(OrderRepository.class);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["com.aile.OrderRepository"], "java"
+        )
+        assert result == ["com.aile.OrderRepository"]

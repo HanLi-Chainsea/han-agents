@@ -1,14 +1,17 @@
-"""Integration-gate L1: deterministic run + pass via native result XML.
+"""Integration-gate: L1 deterministic run + pass via native result XML,
+and L2 static mock-smell detection on boundary collaborators.
 
-Two public entry points:
-  parse_junit_results(xml_paths)        — pure parser, no subprocess
-  run_tests(project_path, stack, ...)   — runs tests, parses XML, fail-closed
+Public entry points:
+  parse_junit_results(xml_paths)                          — pure parser, no subprocess
+  run_tests(project_path, stack, ...)                     — runs tests, parses XML, fail-closed
+  detect_mocked_collaborators(test_source, collaborators, stack)  — L2 static scanner
 
 Policy is intentionally separate from the branch-coverage gate
 (servers/coverage_java.py) so each gate can evolve independently.
 """
 
 import glob
+import re
 import sys
 import os
 import subprocess
@@ -125,6 +128,154 @@ def _ran_false(error: str) -> Dict:
         "passed": False,
         "error": error,
     }
+
+
+# ---------------------------------------------------------------------------
+# L2: Static mock-smell detector
+# ---------------------------------------------------------------------------
+
+def detect_mocked_collaborators(
+    test_source: str,
+    collaborators: List[str],
+    stack: str,
+) -> List[str]:
+    """Return the subset of *collaborators* that *test_source* mocks out.
+
+    Detection is purely static (regex on source text) — no execution required.
+    Fail-closed: when a collaborator is clearly mocked, flag it even if the
+    intent is ambiguous.  Do NOT flag real wiring (@Autowired, new C(), import).
+
+    Args:
+        test_source:    Full text of the test source file.
+        collaborators:  List of collaborator identifiers (fully-qualified or
+                        simple type names, e.g. 'com.aile.OrderRepository' or
+                        'OrderRepository').
+        stack:          Technology stack string; 'java'/'gradle'/'maven' routes
+                        to Java patterns; 'python'/'pytest' to Python patterns.
+
+    Returns:
+        Ordered list of collaborators (preserving input order) that were found
+        to be mocked in *test_source*.
+    """
+    stack_lower = stack.lower()
+    if any(s in stack_lower for s in ("java", "gradle", "maven")):
+        return _detect_java(test_source, collaborators)
+    elif any(s in stack_lower for s in ("python", "pytest")):
+        return _detect_python(test_source, collaborators)
+    else:
+        # Unknown stack — conservative: scan both patterns
+        java_hits = set(_detect_java(test_source, collaborators))
+        python_hits = set(_detect_python(test_source, collaborators))
+        combined = java_hits | python_hits
+        return [c for c in collaborators if c in combined]
+
+
+def _simple_name(collaborator: str) -> str:
+    """Return the simple type name: last segment after '.' or '/'."""
+    return collaborator.replace("/", ".").rsplit(".", 1)[-1]
+
+
+def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
+    """Detect Java mock constructs for the given collaborators.
+
+    Patterns checked (fail-closed — @SpyBean/spy counts as mocked):
+      1. @MockBean / @MockitoBean / @Mock / @SpyBean annotation followed
+         within ~2 lines by a field declaration whose declared type is C.
+         @InjectMocks is explicitly excluded (marks the SUT, not a mock).
+      2. Mockito.mock(C.class) or mock(C.class) call.
+      3. Mockito.spy(C.class) or spy(C.class) call.
+    """
+    mocked: set = set()
+
+    for collab in collaborators:
+        simple = _simple_name(collab)
+
+        # ---- Pattern 1: annotation + field declaration ----
+        # Match @MockBean / @MockitoBean / @Mock / @SpyBean (but NOT @InjectMocks)
+        # followed by optional whitespace/lines then a field whose type is the
+        # simple name.  We allow up to ~2 lines between annotation and field.
+        #
+        # Strategy: find each mock annotation block, then check if `simple`
+        # appears as a type in the next ~2 lines of text.
+
+        # Regex: annotation keyword, then up to 200 chars (non-greedy) including
+        # newlines, then the type name as a word boundary.
+        annotation_pattern = re.compile(
+            r"@(?:MockBean|MockitoBean|Mock|SpyBean)\b"   # annotation
+            r"(?:[^@\n]*\n){0,3}"                         # up to 3 intervening lines
+            r"[^\n]*\b" + re.escape(simple) + r"\b",     # type name in field line
+            re.MULTILINE,
+        )
+        if annotation_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 2 & 3: Mockito.mock/spy call or bare mock/spy call ----
+        # Matches: mock(OrderRepository.class) or Mockito.mock(OrderRepository.class)
+        # Also spy variants.
+        call_pattern = re.compile(
+            r"\b(?:Mockito\.)?(?:mock|spy)\s*\(\s*"
+            + re.escape(simple) + r"\s*\.class\s*\)",
+        )
+        if call_pattern.search(test_source):
+            mocked.add(collab)
+
+    return [c for c in collaborators if c in mocked]
+
+
+def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
+    """Detect Python mock constructs for the given collaborators.
+
+    Patterns checked:
+      1. patch('...C') / patch("...C") where C is the simple name or full name
+         appearing as the last segment of the dotted path inside the patch string.
+         This covers @patch(...), mock.patch(...), unittest.mock.patch(...).
+      2. C = MagicMock() / C = Mock() where C is the simple name.
+    """
+    mocked: set = set()
+
+    for collab in collaborators:
+        simple = _simple_name(collab)
+
+        # ---- Pattern 1: patch('...C') where the string ends with .C or is C ----
+        # Matches both full dotted path and simple name at end of path.
+        # We look for the collaborator name (full or simple) as the last
+        # segment inside a patch string literal.
+        # e.g.  patch('app.svc.OrderRepository')   → simple name at end
+        #        patch('OrderRepository')            → simple name
+        #        @patch('a.b.OrderRepository')
+
+        # Build pattern that matches the collaborator appearing as the last
+        # segment (or whole path) in a patch()/patch.object() string.
+        patch_pattern = re.compile(
+            r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?patch\s*\(\s*['"]"""
+            r"""(?:[A-Za-z0-9_.]*\.)?"""   # optional dotted prefix
+            + re.escape(simple)             # the simple name
+            + r"""['"]""",                  # closing quote
+        )
+        if patch_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # Also match the full collaborator path literally inside patch string
+        if collab != simple:
+            full_patch_pattern = re.compile(
+                r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?patch\s*\(\s*['"]"""
+                + re.escape(collab)
+                + r"""['"]""",
+            )
+            if full_patch_pattern.search(test_source):
+                mocked.add(collab)
+                continue
+
+        # ---- Pattern 2: C = MagicMock() or C = Mock() ----
+        assign_pattern = re.compile(
+            r"\b" + re.escape(simple) + r"\s*=\s*(?:MagicMock|Mock)\s*\(",
+        )
+        if assign_pattern.search(test_source):
+            mocked.add(collab)
+
+    return [c for c in collaborators if c in mocked]
 
 
 # ---------------------------------------------------------------------------
