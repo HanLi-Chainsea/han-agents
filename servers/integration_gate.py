@@ -5,6 +5,7 @@ Public entry points:
   parse_junit_results(xml_paths)                          — pure parser, no subprocess
   run_tests(project_path, stack, ...)                     — runs tests, parses XML, fail-closed
   detect_mocked_collaborators(test_source, collaborators, stack)  — L2 static scanner
+  boundaries_for_target(project_name, target_files)       — B3: boundary extraction from Code Graph
 
 Policy is intentionally separate from the branch-coverage gate
 (servers/coverage_java.py) so each gate can evolve independently.
@@ -17,6 +18,8 @@ import os
 import subprocess
 import tempfile
 from typing import Dict, List, Optional
+
+import servers.code_graph as cg
 
 # Use defusedxml to prevent XXE/billion-laughs attacks; fall back to stdlib.
 try:
@@ -277,6 +280,104 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
             mocked.add(collab)
 
     return [c for c in collaborators if c in mocked]
+
+
+# ---------------------------------------------------------------------------
+# B3: Boundary extraction from Code Graph
+# ---------------------------------------------------------------------------
+
+# Edge kinds that represent runtime collaboration (injects/call family).
+# imports, extends, implements are structural-only; drop them (design hard req).
+_INJECT_KINDS = frozenset({"injects"})
+_CALL_KINDS = frozenset({"calls", "call", "invokes"})
+_KEEP_KINDS = _INJECT_KINDS | _CALL_KINDS
+
+
+def boundaries_for_target(
+    project_name: str,
+    target_files: List[str],
+) -> List[Dict]:
+    """Extract integration boundaries for the given target source files.
+
+    An integration boundary is an outgoing injects/call edge from a node
+    defined in one of *target_files* to a node defined in a different file.
+
+    Args:
+        project_name:  The project name used to look up the Code Graph.
+        target_files:  List of file paths (as stored in code_graph) that
+                       define the caller side of the boundary.
+
+    Returns:
+        Deduplicated list of boundary dicts:
+            {
+              'caller':      str  — FQN of the calling node
+              'callee':      str  — FQN of the called/injected node
+              'callee_file': str  — file_path of the callee node
+              'edge':        str  — 'injects' or 'calls'
+            }
+        Returns [] when the project has no graph or no nodes match.
+    """
+    if not target_files:
+        return []
+
+    # Step 1: collect all nodes whose file_path is in target_files.
+    # Build a lookup: node_id -> node dict for caller-side nodes.
+    caller_nodes: Dict[str, Dict] = {}
+    for file_path in target_files:
+        nodes = cg.get_code_nodes(project_name, file_path=file_path)
+        for node in nodes:
+            caller_nodes[node["id"]] = node
+
+    if not caller_nodes:
+        return []
+
+    # Step 2: fetch all nodes in the project to allow callee resolution by id.
+    # get_code_nodes has a limit; for boundary extraction we only need the
+    # callee nodes that appear in edges, so build a lazy id->node index.
+    all_nodes_list = cg.get_code_nodes(project_name)
+    all_nodes_by_id: Dict[str, Dict] = {n["id"]: n for n in all_nodes_list}
+
+    # Step 3+4: for each caller node, get outgoing edges, keep injects/call
+    # kinds, resolve callee, build boundary dict.
+    seen: set = set()
+    boundaries: List[Dict] = []
+
+    for node_id, caller_node in caller_nodes.items():
+        edges = cg.get_code_edges(project_name, from_id=node_id)
+        for edge in edges:
+            edge_kind_lower = edge.get("kind", "").lower()
+            if edge_kind_lower not in _KEEP_KINDS:
+                continue  # drop imports, extends, implements, etc.
+
+            callee_id = edge.get("to_id")
+            if not callee_id:
+                continue
+
+            callee_node = all_nodes_by_id.get(callee_id)
+            if not callee_node:
+                # callee not in our index (external / outside limit) — skip
+                continue
+
+            caller_fqn = caller_node.get("name", caller_node["id"])
+            callee_fqn = callee_node.get("name", callee_node["id"])
+            callee_file = callee_node.get("file_path", "")
+
+            # Map edge kind to canonical label
+            edge_label = "injects" if edge_kind_lower in _INJECT_KINDS else "calls"
+
+            key = (caller_fqn, callee_fqn, edge_label)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            boundaries.append({
+                "caller": caller_fqn,
+                "callee": callee_fqn,
+                "callee_file": callee_file,
+                "edge": edge_label,
+            })
+
+    return boundaries
 
 
 # ---------------------------------------------------------------------------

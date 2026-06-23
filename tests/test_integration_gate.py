@@ -314,3 +314,171 @@ class TestDetectMockedCollaborators:
             source, ["OrderRepository"], "java"
         )
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# boundaries_for_target — B3: boundary extraction from Code Graph
+# ---------------------------------------------------------------------------
+
+class TestBoundariesForTarget:
+    """TDD tests for boundaries_for_target — written BEFORE implementation."""
+
+    def test_boundaries_keep_injects_drop_imports(self, monkeypatch):
+        """injects edge kept; imports and extends edges dropped.
+
+        Monkeypatch code_graph so no real DB is hit.
+        """
+        import servers.integration_gate as ig
+        import servers.code_graph as cg
+
+        caller_node = {
+            "id": "node-1",
+            "kind": "class",
+            "name": "com.example.OrderService",
+            "file_path": "src/main/java/OrderService.java",
+        }
+        callee_node = {
+            "id": "node-2",
+            "kind": "class",
+            "name": "com.example.OrderRepository",
+            "file_path": "src/main/java/OrderRepository.java",
+        }
+
+        monkeypatch.setattr(
+            cg,
+            "get_code_nodes",
+            lambda project, kind=None, file_path=None, limit=100: (
+                [caller_node] if file_path == "src/main/java/OrderService.java" else []
+            ),
+        )
+
+        mixed_edges = [
+            {"from_id": "node-1", "to_id": "node-2", "kind": "injects",
+             "line_number": 10, "confidence": 1.0},
+            {"from_id": "node-1", "to_id": "node-3", "kind": "imports",
+             "line_number": 1,  "confidence": 1.0},
+            {"from_id": "node-1", "to_id": "node-4", "kind": "extends",
+             "line_number": 5,  "confidence": 1.0},
+        ]
+        callee_nodes_by_id = {"node-2": callee_node}
+
+        def fake_get_edges(project, from_id=None, to_id=None, kind=None, limit=100):
+            if from_id == "node-1":
+                return mixed_edges
+            return []
+
+        def fake_get_nodes_by_id(project, kind=None, file_path=None, limit=100):
+            # Called for callee lookup — file_path will be None, kind None
+            # We use the callee_nodes_by_id dict instead via to_id
+            return []
+
+        monkeypatch.setattr(cg, "get_code_edges", fake_get_edges)
+
+        # Patch the callee-node lookup: integration_gate calls get_code_nodes
+        # filtered by file_path to find callee nodes; we need to intercept the
+        # lookup of a single node by id. The implementation resolves callee via
+        # another get_code_nodes call; patch at module level.
+        original_get_nodes = cg.get_code_nodes
+
+        def patched_get_nodes(project, kind=None, file_path=None, limit=100):
+            if file_path == "src/main/java/OrderService.java":
+                return [caller_node]
+            # callee lookup: the implementation must resolve node-2
+            # We'll intercept using the from_id logic below
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", patched_get_nodes)
+
+        # We also need the callee resolution. Provide a helper that returns
+        # callee_node when asked for node-2. The implementation does a second
+        # get_code_nodes filtered differently — but if it uses get_code_edges
+        # to_id resolution, we can supply via a side-channel.
+        # Strategy: patch get_code_nodes to also handle the callee case.
+        # Since real implementation may call get_code_nodes(project) and filter,
+        # return all known nodes when no filter applied.
+        def full_get_nodes(project, kind=None, file_path=None, limit=100):
+            if file_path == "src/main/java/OrderService.java":
+                return [caller_node]
+            if file_path is None and kind is None:
+                return [caller_node, callee_node]
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", full_get_nodes)
+
+        from servers.integration_gate import boundaries_for_target
+        result = boundaries_for_target(
+            "test-project",
+            ["src/main/java/OrderService.java"],
+        )
+
+        assert len(result) == 1, f"Expected 1 boundary, got {result}"
+        b = result[0]
+        assert b["caller"] == "com.example.OrderService"
+        assert b["callee"] == "com.example.OrderRepository"
+        assert b["callee_file"] == "src/main/java/OrderRepository.java"
+        assert b["edge"] == "injects"
+
+    def test_boundaries_calls_edge_mapped(self, monkeypatch):
+        """calls edge → boundary dict with edge='calls'."""
+        import servers.integration_gate as ig
+        import servers.code_graph as cg
+
+        caller_node = {
+            "id": "node-A",
+            "kind": "function",
+            "name": "app.service.process",
+            "file_path": "app/service.py",
+        }
+        callee_node = {
+            "id": "node-B",
+            "kind": "function",
+            "name": "app.repo.find_all",
+            "file_path": "app/repo.py",
+        }
+
+        def fake_get_nodes(project, kind=None, file_path=None, limit=100):
+            if file_path == "app/service.py":
+                return [caller_node]
+            if file_path is None and kind is None:
+                return [caller_node, callee_node]
+            return []
+
+        def fake_get_edges(project, from_id=None, to_id=None, kind=None, limit=100):
+            if from_id == "node-A":
+                return [{"from_id": "node-A", "to_id": "node-B", "kind": "calls",
+                         "line_number": 20, "confidence": 1.0}]
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", fake_get_nodes)
+        monkeypatch.setattr(cg, "get_code_edges", fake_get_edges)
+
+        from servers.integration_gate import boundaries_for_target
+        result = boundaries_for_target("test-project", ["app/service.py"])
+
+        assert len(result) == 1
+        b = result[0]
+        assert b["caller"] == "app.service.process"
+        assert b["callee"] == "app.repo.find_all"
+        assert b["callee_file"] == "app/repo.py"
+        assert b["edge"] == "calls"
+
+    def test_no_nodes_returns_empty(self, monkeypatch):
+        """No nodes in target files → empty list returned (not an error)."""
+        import servers.integration_gate as ig
+        import servers.code_graph as cg
+
+        monkeypatch.setattr(
+            cg,
+            "get_code_nodes",
+            lambda project, kind=None, file_path=None, limit=100: [],
+        )
+        monkeypatch.setattr(
+            cg,
+            "get_code_edges",
+            lambda project, from_id=None, to_id=None, kind=None, limit=100: [],
+        )
+
+        from servers.integration_gate import boundaries_for_target
+        result = boundaries_for_target("test-project", ["nonexistent/file.py"])
+
+        assert result == []
