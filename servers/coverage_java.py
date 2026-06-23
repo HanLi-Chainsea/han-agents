@@ -33,8 +33,14 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
 
     Returns:
         {'tool_status', 'fully_covered', 'per_target', 'error'}
-        tool_status: 'ok' | 'schema_error' | 'no_targets' | 'test_run_error'
+        tool_status: 'ok' | 'schema_error' | 'no_targets' | 'invalid_targets' | 'test_run_error'
     """
+    # Validate targets — mirror the Python backend guard (DRY, fail-closed)
+    from servers.coverage import _invalid_targets
+    bad = _invalid_targets(coverage_targets)
+    if bad:
+        return _result('invalid_targets', bad)
+
     # Validate targets
     if not coverage_targets:
         return _result('no_targets', 'No coverage targets provided')
@@ -42,7 +48,7 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
     try:
         tree = ET_parse(xml_path)
         root = tree.getroot()
-    except (FileNotFoundError, Exception) as e:
+    except Exception as e:
         return _result('test_run_error', f'Failed to parse JaCoCo XML: {e}')
 
     # Build a map: source filename -> sourcefile element
