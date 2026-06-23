@@ -175,6 +175,52 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
     return _result('ok', None, per_target=per_target, fully_covered=fully_covered)
 
 
+# ── Stack-adaptive backend selection ──────────────────────────────────────────
+
+_JAVA_TOOLS = frozenset({'gradle', 'maven'})
+_JAVA_LANGS = frozenset({'java', 'kotlin'})
+_PYTHON_TOOLS = frozenset({'pytest', 'unittest'})
+_PYTHON_LANGS = frozenset({'python'})
+
+
+def select_backend(tech_stack: dict) -> str:
+    """Choose coverage backend based on the project's tech_stack.
+
+    Args:
+        tech_stack: Dict from ensure_project(...)['tech_stack'], e.g.
+                    {'test_tool': 'gradle', 'primary_language': 'java', ...}
+
+    Returns:
+        'java'    — gradle/maven test_tool, or java/kotlin primary_language
+        'python'  — pytest/unittest test_tool, or python primary_language
+        'unknown' — no recognisable indicator found
+
+    Precedence: test_tool is checked first; primary_language is the tiebreaker.
+    The check is case-insensitive.
+    """
+    if not isinstance(tech_stack, dict):
+        return 'unknown'
+
+    tool = (tech_stack.get('test_tool') or '').lower().strip()
+    lang = (tech_stack.get('primary_language') or '').lower().strip()
+
+    # test_tool wins — check it first
+    if tool in _JAVA_TOOLS:
+        return 'java'
+    if tool in _PYTHON_TOOLS:
+        return 'python'
+
+    # Fall back to primary language
+    if lang in _JAVA_LANGS:
+        return 'java'
+    if lang in _PYTHON_LANGS:
+        return 'python'
+
+    return 'unknown'
+
+
+# ── Java branch-coverage measurement ──────────────────────────────────────────
+
 def measure_branch_coverage_java(
     project_path: str,
     test_targets: List[str],

@@ -878,3 +878,196 @@ class TestGateMetadataGuard:
 
 
 _ABSENT = object()
+
+
+# ── Stack-adaptive dispatch (Task A4) ─────────────────────────────────────────
+
+
+class TestSelectBackend:
+    """select_backend 純函式：從 tech_stack dict 判斷要用哪個後端。"""
+
+    def test_gradle_test_tool_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'gradle'}) == 'java'
+
+    def test_maven_test_tool_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'maven'}) == 'java'
+
+    def test_gradle_mixed_case_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'Gradle'}) == 'java'
+
+    def test_java_language_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'primary_language': 'java'}) == 'java'
+
+    def test_kotlin_language_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'primary_language': 'kotlin'}) == 'java'
+
+    def test_pytest_test_tool_maps_to_python(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'pytest'}) == 'python'
+
+    def test_unittest_test_tool_maps_to_python(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'unittest'}) == 'python'
+
+    def test_python_language_maps_to_python(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'primary_language': 'python'}) == 'python'
+
+    def test_empty_dict_maps_to_unknown(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({}) == 'unknown'
+
+    def test_none_values_map_to_unknown(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': None, 'primary_language': None}) == 'unknown'
+
+    def test_unrecognized_tool_maps_to_unknown(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'cargo'}) == 'unknown'
+
+    def test_test_tool_takes_priority_over_language(self):
+        # gradle test_tool with python language → java (test_tool wins)
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'gradle', 'primary_language': 'python'}) == 'java'
+
+
+class TestStackDispatch:
+    """Gate 路由：java tech_stack 路由到 measure_branch_coverage_java；
+    python tech_stack 路由到 coverage.measure_branch_coverage。
+    兩個後端都需要被 monkeypatch 並驗證只有其中一個被呼叫。"""
+
+    def _setup_done_task(self, cov_targets, result):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def _fake_ok_result(self):
+        return {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'x.py', 'name': 'f',
+                            'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}],
+                            'missing_branches': [], 'n_total': 1, 'n_covered': 1}],
+        }
+
+    def test_java_stack_routes_to_java_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+
+        # Patch ensure_project to return a java tech stack
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'gradle'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+
+        java_calls = []
+        python_calls = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            java_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        def fake_python(project_path, test_targets, coverage_targets):
+            python_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_python)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(java_calls) == 1, 'Java backend must be called exactly once'
+        assert len(python_calls) == 0, 'Python backend must NOT be called for java stack'
+
+    def test_python_stack_routes_to_python_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+
+        # Patch ensure_project to return a python tech stack
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+
+        java_calls = []
+        python_calls = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            java_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        def fake_python(project_path, test_targets, coverage_targets):
+            python_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_python)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(python_calls) == 1, 'Python backend must be called exactly once'
+        assert len(java_calls) == 0, 'Java backend must NOT be called for python stack'
+
+    def test_unknown_stack_routes_to_python_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Unknown stack falls back to Python (safe default, preserves backward compat)."""
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+
+        # Patch ensure_project to return an unknown tech stack
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': None}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+
+        java_calls = []
+        python_calls = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            java_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        def fake_python(project_path, test_targets, coverage_targets):
+            python_calls.append((project_path, test_targets, coverage_targets))
+            return self._fake_ok_result()
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_python)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(python_calls) == 1, 'Unknown stack must fall back to Python backend'
+        assert len(java_calls) == 0, 'Java backend must NOT be called for unknown stack'

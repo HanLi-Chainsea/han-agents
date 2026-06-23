@@ -1846,7 +1846,20 @@ def run_coverage_gate(critic_task_id: str,
             '未能確認你寫的測試檔。請在回報中以**獨立一行** '
             '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，gate 才能量測分支覆蓋。'])
 
-    res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
+    # ── Stack-adaptive backend selection ───────────────────────────────────────
+    # Resolve tech_stack from the project record (same approach as recipes.py).
+    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
+    from servers import coverage_java as cov_java
+    from servers import project as _proj
+    _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
+    _backend = cov_java.select_backend(_ts)
+
+    if _backend == 'java':
+        res = cov_java.measure_branch_coverage_java(
+            project_path, test_targets, coverage_targets)
+    else:
+        # 'python' or 'unknown' → existing Python backend (safe default)
+        res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
     status = res['tool_status']
 
     if status == 'ok':
