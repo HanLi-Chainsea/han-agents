@@ -179,7 +179,7 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
                     f"Suite '{name}': skipped ({sk}) > tests ({t}) — inconsistent"
                 )
                 continue  # This suite does not count as clean
-            
+
             total += t
             failures += f
             errors += e
@@ -295,6 +295,44 @@ def _simple_name(collaborator: str) -> str:
     return collaborator.replace("/", ".").rsplit(".", 1)[-1]
 
 
+def _owning_type_from_file(callee_file: str) -> str:
+    """Derive the owning type name from a callee file path.
+
+    Returns the file basename without extension.  This lets calls-edge boundaries
+    whose callee is a bare method name (e.g. 'save') also check the owning class
+    (e.g. 'OrderRepository' from 'src/main/java/repo/OrderRepository.java').
+
+    Examples:
+        'src/main/java/repo/OrderRepository.java' -> 'OrderRepository'
+        'src/repo/order_repository.py'            -> 'order_repository'
+        ''                                        -> ''
+    """
+    if not callee_file:
+        return ''
+    basename = os.path.basename(callee_file)
+    name, _ext = os.path.splitext(basename)
+    return name
+
+
+def _candidate_collaborators(callee: str, callee_file: str) -> List[str]:
+    """Build the candidate collaborator name set for a single boundary.
+
+    For a calls-edge boundary the callee may be a bare method name (e.g. 'save')
+    while the real test mock targets the owning class ('OrderRepository').  By
+    adding the file-basename-derived type name we catch both patterns.
+
+    For injects-edge boundaries the callee is already the type name and the
+    file basename matches it, so both candidates are identical (deduplicated).
+
+    Returns a deduplicated list preserving callee as the first entry.
+    """
+    candidates: List[str] = [callee]
+    owning = _owning_type_from_file(callee_file)
+    if owning and owning not in candidates:
+        candidates.append(owning)
+    return candidates
+
+
 def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
     """Detect Java mock constructs for the given collaborators.
 
@@ -391,10 +429,46 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
     """
     mocked: set = set()
 
+    # H2: Collect all patch aliases defined in this source file.
+    # Patterns recognized:
+    #   from unittest.mock import patch as <alias>
+    #   from unittest.mock import (..., patch as <alias>, ...)
+    #   import unittest.mock as <m>  ->  <m>.patch is treated as an alias
+    _patch_aliases: List[str] = []
+
+    # Single-alias: from unittest.mock import patch as <alias>
+    for _m in re.finditer(
+        r'from\s+unittest\.mock\s+import\b[^\n]*?\bpatch\s+as\s+(\w+)',
+        test_source,
+    ):
+        _alias = _m.group(1)
+        if _alias not in _patch_aliases:
+            _patch_aliases.append(_alias)
+
+    # Parenthesised multi-import:
+    # from unittest.mock import (MagicMock, patch as p, ...)
+    for _m in re.finditer(
+        r'from\s+unittest\.mock\s+import\s*\([^)]*?\bpatch\s+as\s+(\w+)[^)]*?\)',
+        test_source,
+        re.DOTALL,
+    ):
+        _alias = _m.group(1)
+        if _alias not in _patch_aliases:
+            _patch_aliases.append(_alias)
+
+    # Module alias: import unittest.mock as <m>  ->  add '<m>.patch' as an alias form
+    # We track the module alias so we can match '<m>.patch(...)' calls.
+    _mock_module_aliases: List[str] = []
+    for _m in re.finditer(
+        r'import\s+unittest\.mock\s+as\s+(\w+)',
+        test_source,
+    ):
+        _mock_module_aliases.append(_m.group(1))
+
     for collab in collaborators:
         simple = _simple_name(collab)
 
-        # ---- Pattern 1a: patch('...') where C appears as a DOTTED PATH SEGMENT ----
+        # ---- Pattern 1a: patch('...') where C appears as a DOTTED PATH SEGMENT ----('...') where C appears as a DOTTED PATH SEGMENT ----
         # C's simple name must appear as (^|.)C(.|$) within the quoted string.
         # This catches: patch('app.repo.OrderRepository.find_all') where C=OrderRepository
         # as well as the final-segment case patch('app.svc.OrderRepository').
@@ -418,6 +492,29 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
         if patch_segment_pattern2.search(test_source):
             mocked.add(collab)
             continue
+
+        # H2: Also check aliased patch calls: @p("...C...") where p is an alias for patch
+        # Conservative: only aliases explicitly imported from unittest.mock.
+        if _patch_aliases or _mock_module_aliases:
+            _alias_matched = False
+            # Build an alternation regex for alias names
+            _all_aliases = list(_patch_aliases)
+            for _mod in _mock_module_aliases:
+                _all_aliases.append(_mod + r'\.patch')
+            if _all_aliases:
+                _alias_alt = '|'.join(re.escape(a) for a in _all_aliases)
+                _alias_patch_pattern = re.compile(
+                    r"(?:@|\b)(?:" + _alias_alt + r")\s*\(\s*['\"]"
+                    r"(?:[A-Za-z0-9_]+\.)*"
+                    + re.escape(simple)
+                    + r"(?:\.[A-Za-z0-9_]+)*"
+                    + r"['\"]",
+                )
+                if _alias_patch_pattern.search(test_source):
+                    _alias_matched = True
+            if _alias_matched:
+                mocked.add(collab)
+                continue
 
         # Also match the full collaborator path literally inside patch string
         if collab != simple:

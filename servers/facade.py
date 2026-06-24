@@ -2129,10 +2129,22 @@ def run_integration_gate(critic_task_id: str,
     # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
     # Read each DERIVED test file and check whether boundary collaborators are mocked.
     # Fail-closed: if test_files non-empty but zero files readable → reject.
+    #
+    # H1 fix: for calls-edge boundaries the callee may be a bare method name (e.g.
+    # 'save') while the real test mocks the OWNING TYPE (@MockBean OrderRepository).
+    # Build a per-boundary candidate set: {callee simple name, owning type from file}.
+    # Flag the boundary if ANY candidate is detected as mocked.
     all_mocked: List[str] = []
-    collaborators = [b.get('callee', '') for b in boundaries if b.get('callee')]
     files_read = 0
 
+    # Pre-compute candidate sets per boundary to avoid repeated work.
+    _boundary_candidates = [
+        ig._candidate_collaborators(b.get('callee', ''), b.get('callee_file', ''))
+        for b in boundaries
+    ]
+
+    # Read each test file once; check all boundaries against the source.
+    _test_sources: List[str] = []
     for tf in test_files:
         # test_files may be relative or absolute; try project_path-relative first
         tf_path = tf if os.path.isabs(tf) else os.path.join(project_path, tf)
@@ -2144,15 +2156,26 @@ def run_integration_gate(critic_task_id: str,
         except OSError:
             continue
         files_read += 1
-        mocked = ig.detect_mocked_collaborators(test_source, collaborators, stack)
-        for m in mocked:
-            if m not in all_mocked:
-                all_mocked.append(m)
+        _test_sources.append(test_source)
 
     # Fail-closed: non-empty test_files but zero readable → cannot verify → reject
     if test_files and files_read == 0:
         return _gate_reject(critic_task_id, original_task_id, [
             '整合測試 gate：無法讀取任何測試原始碼以驗證未 mock 邊界（test_files 路徑不可讀）'])
+
+    # Check each boundary: flag if ANY candidate is mocked in ANY test source.
+    for _b, _candidates in zip(boundaries, _boundary_candidates):
+        _callee = _b.get('callee', '')
+        if not _callee or not _candidates:
+            continue
+        _boundary_mocked = False
+        for _src in _test_sources:
+            _hits = ig.detect_mocked_collaborators(_src, _candidates, stack)
+            if _hits:
+                _boundary_mocked = True
+                break
+        if _boundary_mocked and _callee not in all_mocked:
+            all_mocked.append(_callee)
 
     if all_mocked:
         issues = [f'fake integration: {m} is mocked' for m in all_mocked]

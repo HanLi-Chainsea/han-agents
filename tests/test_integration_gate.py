@@ -2786,11 +2786,11 @@ class TestIntegrationGateG1bNormalization:
             'ran': True, 'passed': True, 'total': 3,
             'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
 
-        # L2: with padded collaborator name in ORIGINAL boundary,
-        # L2 might fail to detect the mock (false green).
-        # After normalization in facade, L2 gets clean "OrderRepository" and detects it.
-        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
-                            lambda src, collabs, stack: ['OrderRepository' if 'OrderRepository' in collabs else ''])
+        # H3 fix: Use the REAL detect_mocked_collaborators (no monkeypatch of the scanner).
+        # This proves that after stripping, padded callee=" OrderRepository " is normalized
+        # to "OrderRepository" and the real regex correctly matches "@MockBean OrderRepository".
+        # (Previously the monkeypatch returned ['\''] on no-match, which is truthy and
+        # always forces a reject regardless of normalization — not a real proof.)
 
         # make test file readable
         test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'OrderServiceTest.java'
@@ -2809,3 +2809,251 @@ class TestIntegrationGateG1bNormalization:
         # → verdict should be rejected
         assert verdict['verdict'] in ('rejected', 'blocked'), (
             f"Expected rejected/blocked (mock detected after normalization), got {verdict['verdict']}")
+
+
+# ===========================================================================
+# D8 H1: calls-edge owning-type detection (TDD)
+# ===========================================================================
+
+class TestH1CallsEdgeOwningTypeDetection:
+    """H1: calls-edge boundaries whose callee is a bare method name (e.g. 'save')
+    must also check the owning TYPE derived from callee_file.
+
+    Real tests mock the owning class (@MockBean OrderRepository), not the method
+    name.  Without this fix the gate proceeds when the owning class is mocked
+    (false-green for the entire call-edge category).
+    """
+
+    def test_owning_type_from_file_java(self):
+        """_owning_type_from_file extracts basename-without-extension for Java."""
+        from servers.integration_gate import _owning_type_from_file
+        assert _owning_type_from_file(
+            'src/main/java/repo/OrderRepository.java') == 'OrderRepository'
+        assert _owning_type_from_file(
+            'com/example/order/OrderService.java') == 'OrderService'
+
+    def test_owning_type_from_file_python(self):
+        """_owning_type_from_file extracts basename-without-extension for Python."""
+        from servers.integration_gate import _owning_type_from_file
+        assert _owning_type_from_file('src/repo/order_repository.py') == 'order_repository'
+        assert _owning_type_from_file('') == ''
+
+    def test_candidate_collaborators_calls_edge(self):
+        """_candidate_collaborators returns [callee, owning_type] for calls-edge."""
+        from servers.integration_gate import _candidate_collaborators
+        cands = _candidate_collaborators('save', 'src/main/java/repo/OrderRepository.java')
+        assert 'save' in cands
+        assert 'OrderRepository' in cands
+        assert len(cands) == 2
+
+    def test_candidate_collaborators_injects_edge_deduped(self):
+        """_candidate_collaborators deduplicates when callee == owning type."""
+        from servers.integration_gate import _candidate_collaborators
+        # injects edge: callee IS the type name, file basename matches
+        cands = _candidate_collaborators(
+            'OrderRepository', 'src/main/java/repo/OrderRepository.java')
+        # Should not duplicate: both would resolve to 'OrderRepository'
+        assert cands.count('OrderRepository') == 1
+
+    def test_calls_edge_owning_type_mocked_rejected(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """H1 regression: calls-edge boundary with callee='save' and
+        callee_file='src/main/java/repo/OrderRepository.java'; test source
+        mocks @MockBean OrderRepository -> verdict must be 'rejected'.
+
+        Previously this was a false-green because L2 only checked 'save'.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        # calls-edge: callee is the METHOD name, not the type
+        boundary = {
+            'caller': 'OrderService.placeOrder',
+            'callee': 'save',
+            'callee_file': 'src/main/java/repo/OrderRepository.java',
+            'edge': 'calls',
+        }
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(
+            parent_id=story,
+            description='write integration tests',
+            requires_validation=True,
+            metadata={
+                'integration_boundaries': [boundary],
+                'test_files': ['src/test/java/com/example/OrderServiceIT.java'],
+                'stack': 'java',
+            })
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+
+        # L1 passes
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 1,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        # Test file MOCKS the owning TYPE (OrderRepository), NOT the method 'save'
+        test_file = (tmp_path / 'src' / 'test' / 'java' / 'com' / 'example'
+                     / 'OrderServiceIT.java')
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text(
+            '@SpringBootTest\n'
+            'class OrderServiceIT {\n'
+            '    @MockBean\n'
+            '    private OrderRepository repo;\n'
+            '\n'
+            '    @Autowired\n'
+            '    private OrderService svc;\n'
+            '}\n'
+        )
+
+        verdict = facade.run_integration_gate(
+            critic['id'], task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            "H1: calls-edge with mocked owning type must be rejected, "
+            "got " + repr(verdict['verdict']))
+
+        # Rejection message must be set
+        from servers.memory import get_working_memory
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm, "Rejection context must be set, got: " + repr(wm)
+
+    def test_calls_edge_real_collaborator_not_rejected(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """H1 inverse: calls-edge where neither callee nor owning type is mocked
+        -> verdict proceed (no false positive)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        boundary = {
+            'caller': 'OrderService.placeOrder',
+            'callee': 'save',
+            'callee_file': 'src/main/java/repo/OrderRepository.java',
+            'edge': 'calls',
+        }
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(
+            parent_id=story,
+            description='write integration tests',
+            requires_validation=True,
+            metadata={
+                'integration_boundaries': [boundary],
+                'test_files': ['src/test/java/com/example/OrderServiceIT.java'],
+                'stack': 'java',
+            })
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 1,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        # Test file does NOT mock OrderRepository (real integration)
+        test_file = (tmp_path / 'src' / 'test' / 'java' / 'com' / 'example'
+                     / 'OrderServiceIT.java')
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text(
+            '@SpringBootTest\n'
+            'class OrderServiceIT {\n'
+            '    @Autowired\n'
+            '    private OrderRepository repo;\n'
+            '\n'
+            '    @Autowired\n'
+            '    private OrderService svc;\n'
+            '}\n'
+        )
+
+        import servers.coverage as cov
+        import servers.project as proj_mod
+        monkeypatch.setattr(proj_mod, 'ensure_project',
+                            lambda *a, **kw: {'tech_stack': {'test_tool': 'pytest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+
+        verdict = facade.run_integration_gate(
+            critic['id'], task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed', (
+            "H1: real integration (no mock) must proceed, got "
+            + repr(verdict['verdict']))
+
+
+# ===========================================================================
+# D8 H2: Python aliased patch import detection (TDD)
+# ===========================================================================
+
+class TestH2PythonAliasedPatchImport:
+    """H2: detect_mocked_collaborators must detect patch aliases.
+
+    from unittest.mock import patch as p
+    @p("app.repo.OrderRepository.find_all")
+
+    Previously this bypassed L2 (literal 'patch' was not found).
+    """
+
+    def test_aliased_patch_single_import_detected(self):
+        """from unittest.mock import patch as p  ->  @p("...OrderRepository...") detected."""
+        from servers.integration_gate import detect_mocked_collaborators
+        source = (
+            "from unittest.mock import patch as p\n"
+            "@p('app.repo.OrderRepository.find_all')\n"
+            "def test_something(mock_find):\n"
+            "    svc = OrderService()\n"
+            "    result = svc.process()\n"
+        )
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            "H2: aliased @p patch must flag collaborator, got " + repr(result))
+
+    def test_aliased_patch_not_detected_when_no_alias_import(self):
+        """Without alias import, @p(...) must NOT flag (conservative).
+
+        '@p(...)' with no 'from unittest.mock import patch as p' is not
+        recognized as a patch -- prevents false positives from unrelated decorators.
+        """
+        from servers.integration_gate import detect_mocked_collaborators
+        source = (
+            "from some_library import p\n"
+            "@p('app.repo.OrderRepository')\n"
+            "def test_something():\n"
+            "    pass\n"
+        )
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        # 'p' from some_library is not recognized -- must not flag
+        assert result == [], (
+            "H2: @p from unrecognized import must NOT flag, got " + repr(result))
+
+    def test_aliased_patch_parenthesised_multi_import(self):
+        """from unittest.mock import (MagicMock, patch as p) -> @p detected."""
+        from servers.integration_gate import detect_mocked_collaborators
+        source = (
+            "from unittest.mock import (MagicMock, patch as p)\n"
+            "@p('app.repo.OrderRepository')\n"
+            "def test_it(mock_repo):\n"
+            "    pass\n"
+        )
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            "H2: parenthesised multi-import patch alias must detect, got " + repr(result))
+
+    def test_real_patch_still_detected_with_alias_present(self):
+        """Standard @patch still works even when alias import is also present."""
+        from servers.integration_gate import detect_mocked_collaborators
+        source = (
+            "from unittest.mock import patch as p, patch\n"
+            "@patch('app.repo.OrderRepository')\n"
+            "def test_it(mock_repo):\n"
+            "    pass\n"
+        )
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            "H2: standard @patch must still work alongside alias, got " + repr(result))
