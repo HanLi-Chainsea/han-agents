@@ -1889,6 +1889,94 @@ def run_coverage_gate(critic_task_id: str,
                         [f'分支覆蓋率 gate（{status}）：{res.get("error")}'])
 
 
+
+def run_integration_gate(critic_task_id: str,
+                         original_task_id: str,
+                         project_name: str,
+                         project_path: str) -> Dict:
+    """Integration gate: L1 (run+pass) and L2 (mock-smell) are HARD gates;
+    L3 (branch coverage per boundary) is ADVISORY — never changes verdict.
+
+    Returns the same verdict contract as run_coverage_gate:
+        {'verdict': 'proceed' | 'rejected' | 'blocked',
+         'warn':    str | None,
+         'coverage_summary': list[str]}   # present when verdict='proceed'
+
+    Policy:
+      - metadata.integration_boundaries absent/empty → not an integration task → proceed.
+      - L1: run_tests(...) passes=False → _gate_reject (fail-closed).
+      - L2: any boundary collaborator mocked → _gate_reject naming the collaborator.
+      - L3: classify each boundary (verified-real / not-observed / not-measurable);
+            result is advisory, never modifies verdict.
+    """
+    from servers.tasks import get_task
+    import servers.integration_gate as ig
+    import servers.project as proj_mod
+
+    original = get_task(original_task_id)
+    metadata = (original or {}).get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    boundaries = metadata.get('integration_boundaries')
+
+    # Not an integration task (no boundaries declared) → pass-through, no gating.
+    if not boundaries:
+        return {'verdict': 'proceed', 'warn': None}
+
+    test_files = metadata.get('test_files') or []
+    stack = metadata.get('stack') or 'python'
+
+    # ── L1: Run tests — hard gate ──────────────────────────────────────────────
+    l1 = ig.run_tests(project_path, stack, py_test_files=test_files)
+    if not l1.get('passed'):
+        error_detail = l1.get('error') or f"failures={l1.get('failures')}, errors={l1.get('errors')}"
+        return _gate_reject(critic_task_id, original_task_id, [
+            f'Integration gate L1: tests did not pass — {error_detail}'])
+
+    l1_total = l1.get('total', 0)
+
+    # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
+    # Read each test file and check whether boundary collaborators are mocked.
+    all_mocked: List[str] = []
+    collaborators = [b.get('callee', '') for b in boundaries if b.get('callee')]
+
+    for tf in test_files:
+        # test_files may be relative or absolute; try project_path-relative first
+        import os
+        tf_path = tf if os.path.isabs(tf) else os.path.join(project_path, tf)
+        if not os.path.isfile(tf_path):
+            continue
+        try:
+            with open(tf_path, 'r', encoding='utf-8', errors='replace') as fh:
+                test_source = fh.read()
+        except OSError:
+            continue
+        mocked = ig.detect_mocked_collaborators(test_source, collaborators, stack)
+        for m in mocked:
+            if m not in all_mocked:
+                all_mocked.append(m)
+
+    if all_mocked:
+        issues = [f'fake integration: {m} is mocked' for m in all_mocked]
+        return _gate_reject(critic_task_id, original_task_id, issues)
+
+    # ── L3: Branch coverage per boundary — advisory only ──────────────────────
+    # Enrich each boundary with a label; verdict is never changed by L3.
+    boundaries_with_labels = []
+    _ts = (proj_mod.ensure_project(project_name, project_path).get('tech_stack') or {})
+
+    for b in boundaries:
+        b_annotated = dict(b)
+        b_annotated['_project_name'] = project_name
+        label = ig._classify_boundary_l3(b_annotated, project_path, test_files, stack)
+        b_annotated['label'] = label
+        boundaries_with_labels.append(b_annotated)
+
+    summary = ig.format_boundary_summary(boundaries_with_labels, l1_total=l1_total)
+    return {'verdict': 'proceed', 'warn': None, 'coverage_summary': summary}
+
+
 def get_next_dispatch_gated(parent_id: str,
                             project_name: str,
                             project_path: str,

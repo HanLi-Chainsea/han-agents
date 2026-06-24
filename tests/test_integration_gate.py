@@ -562,3 +562,299 @@ class TestBoundariesForTarget:
         assert all_nodes_call, "get_code_nodes must be called to fetch all nodes"
         assert all_nodes_call[0]['limit'] >= 1000, \
             f"Expected limit >= 1000, got {all_nodes_call[0]['limit']}"
+
+
+# ---------------------------------------------------------------------------
+# run_integration_gate + format_boundary_summary — B4 policy tests
+# ---------------------------------------------------------------------------
+
+class TestRunIntegrationGate:
+    """TDD tests for run_integration_gate (written BEFORE implementation).
+
+    Policy:
+      L1 (run+pass) — hard gate: tests must run and pass.
+      L2 (mock-smell) — hard gate: no boundary collaborator may be mocked.
+      L3 (branch coverage) — advisory only; never blocks verdict.
+    """
+
+    def _setup_integration_task(self, metadata):
+        """Create an epic→story→task hierarchy with given metadata, mark done,
+        reserve a critic, and return (task_id, critic_id)."""
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story,
+                              description='integration test write',
+                              requires_validation=True,
+                              metadata=metadata)
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    # ------------------------------------------------------------------ L1 --
+
+    def test_l1_failure_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """L1: run_tests returns passed=False → verdict rejected (fail-closed)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                       'callee_file': 'repo.java', 'edge': 'injects'}]
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': boundaries,
+             'test_files': ['OrderServiceTest.java'],
+             'stack': 'java'})
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': False, 'total': 3, 'failures': 1,
+            'errors': 0, 'error': 'test_order_creates failed', 'evidence': {}})
+        # L2 + coverage should not be reached
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError('L2 called when L1 failed')))
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), \
+            f"Expected rejected/blocked, got {verdict['verdict']}"
+
+    # ------------------------------------------------------------------ L2 --
+
+    def test_mocked_boundary_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """L2: collaborator is mocked → verdict rejected, reason names collaborator."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                       'callee_file': 'repo.java', 'edge': 'injects'}]
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': boundaries,
+             'test_files': ['OrderServiceTest.java'],
+             'stack': 'java'})
+
+        # L1 passes
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 2,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+        # L2 detects mock
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: ['OrderRepository'])
+        # test file readable
+        test_file = tmp_path / 'OrderServiceTest.java'
+        test_file.write_text('@MockBean\nOrderRepository repo;\n')
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), \
+            f"Expected rejected/blocked, got {verdict['verdict']}"
+        # Rejection reason must name the mocked collaborator
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and 'OrderRepository' in wm, \
+            f"Rejection context should name OrderRepository, got: {wm!r}"
+
+    # ------------------------------------------------------------------ L1+L2 pass --
+
+    def test_real_passing_integration_proceeds(self, mock_db_path, tmp_path, monkeypatch):
+        """L1 passes, no mocks detected → verdict proceed, coverage_summary present."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                       'callee_file': 'repo.java', 'edge': 'injects'}]
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': boundaries,
+             'test_files': ['OrderServiceTest.java'],
+             'stack': 'java'})
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 5,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: [])
+        # L3 coverage — make it not-measurable (unavailable)
+        import servers.coverage_java as cov_java
+        import servers.project as proj_mod
+        monkeypatch.setattr(proj_mod, 'ensure_project',
+                            lambda *a, **kw: {'tech_stack': {'test_tool': 'pytest'}})
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+
+        test_file = tmp_path / 'OrderServiceTest.java'
+        test_file.write_text('@Autowired\nOrderRepository repo;\n')
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed', \
+            f"Expected proceed, got {verdict['verdict']}"
+        assert 'coverage_summary' in verdict
+        assert isinstance(verdict['coverage_summary'], list)
+
+    # ------------------------------------------------------------------ no boundaries --
+
+    def test_no_boundaries_is_not_integration_task_proceeds(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """metadata without integration_boundaries → proceed immediately, no gating."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        # Task with no integration_boundaries key
+        task, critic_id = self._setup_integration_task(
+            {'coverage_targets': [{'file_path': 'x.py', 'name': 'f',
+                                   'line_start': 1, 'line_end': 5}]})
+
+        # run_tests should NOT be called
+        called = {'l1': False}
+        def should_not_call(*a, **kw):
+            called['l1'] = True
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        assert verdict.get('warn') is None
+        assert not called['l1'], "run_tests should NOT be called for non-integration tasks"
+
+    # ------------------------------------------------------------------ L3 --
+
+    def test_l3_classification_four_labels(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """L3 classifies boundaries into 4 labels; verdict stays proceed even when
+        a boundary is not-measurable (advisory never blocks)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        import servers.coverage as cov
+        import servers.project as proj_mod
+
+        # Three boundaries to exercise different L3 labels
+        boundaries = [
+            {'caller': 'OrderService', 'callee': 'OrderRepository',
+             'callee_file': 'OrderRepository.java', 'edge': 'injects'},
+            {'caller': 'OrderService', 'callee': 'EmailService',
+             'callee_file': 'EmailService.java', 'edge': 'calls'},
+            {'caller': 'OrderService', 'callee': 'AuditLog',
+             'callee_file': 'AuditLog.java', 'edge': 'calls'},
+        ]
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': boundaries,
+             'test_files': ['OrderServiceTest.java'],
+             'stack': 'java'})
+
+        # L1 passes
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 3,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+        # L2 no mocks
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: [])
+
+        # L3: use Python backend (simpler to monkeypatch)
+        monkeypatch.setattr(proj_mod, 'ensure_project',
+                            lambda *a, **kw: {'tech_stack': {'test_tool': 'pytest'}})
+        # coverage available — will call measure_branch_coverage per boundary callee
+
+        cov_call_count = {'n': 0}
+
+        def fake_measure(project_path, test_targets, coverage_targets):
+            cov_call_count['n'] += 1
+            callee = coverage_targets[0].get('name', '') if coverage_targets else ''
+            if callee == 'OrderRepository':
+                # verified-real: coverage ran, callee branches covered
+                return {
+                    'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'OrderRepository.java',
+                                    'name': 'OrderRepository',
+                                    'line_start': 1, 'line_end': 50,
+                                    'covered_branches': [{'from': 2, 'to': 3}],
+                                    'missing_branches': [],
+                                    'n_total': 1, 'n_covered': 1}]
+                }
+            elif callee == 'EmailService':
+                # not-observed: coverage ran but callee has 0 covered branches
+                return {
+                    'tool_status': 'ok', 'fully_covered': False, 'error': None,
+                    'per_target': [{'file_path': 'EmailService.java',
+                                    'name': 'EmailService',
+                                    'line_start': 1, 'line_end': 30,
+                                    'covered_branches': [],
+                                    'missing_branches': [{'from': 2, 'to': 3}],
+                                    'n_total': 1, 'n_covered': 0}]
+                }
+            else:
+                # not-measurable: unavailable
+                return {'tool_status': 'unavailable', 'error': 'no coverage', 'per_target': []}
+
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_measure)
+
+        test_file = tmp_path / 'OrderServiceTest.java'
+        test_file.write_text('@Autowired\nOrderRepository repo;\n')
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+
+        # L3 advisory: verdict must still be proceed even with not-measurable
+        assert verdict['verdict'] == 'proceed', \
+            f"Expected proceed (advisory-only L3), got {verdict['verdict']}"
+
+        # coverage_summary must reflect the 4-class labels
+        summary = verdict.get('coverage_summary', [])
+        assert summary, "coverage_summary should be present on proceed"
+        summary_text = '\n'.join(summary)
+        assert 'verified-real' in summary_text, \
+            f"Expected verified-real in summary: {summary_text}"
+        assert 'not-observed' in summary_text, \
+            f"Expected not-observed in summary: {summary_text}"
+        assert 'not-measurable' in summary_text, \
+            f"Expected not-measurable in summary: {summary_text}"
+
+
+class TestFormatBoundarySummary:
+    """Unit tests for format_boundary_summary — pure function, no DB needed."""
+
+    def test_verified_real_label(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [{'caller': 'A', 'callee': 'B', 'label': 'verified-real'}]
+        lines = format_boundary_summary(boundaries)
+        assert len(lines) >= 1
+        joined = '\n'.join(lines)
+        assert 'A' in joined and 'B' in joined
+        assert 'verified-real' in joined
+
+    def test_mocked_label(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [{'caller': 'A', 'callee': 'B', 'label': 'mocked'}]
+        lines = format_boundary_summary(boundaries)
+        joined = '\n'.join(lines)
+        assert 'mocked' in joined
+
+    def test_not_observed_label(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [{'caller': 'A', 'callee': 'B', 'label': 'not-observed'}]
+        lines = format_boundary_summary(boundaries)
+        joined = '\n'.join(lines)
+        assert 'not-observed' in joined
+
+    def test_not_measurable_label(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [{'caller': 'A', 'callee': 'B', 'label': 'not-measurable'}]
+        lines = format_boundary_summary(boundaries)
+        joined = '\n'.join(lines)
+        assert 'not-measurable' in joined
+
+    def test_multiple_boundaries_one_line_each(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [
+            {'caller': 'Svc', 'callee': 'Repo', 'label': 'verified-real'},
+            {'caller': 'Svc', 'callee': 'Cache', 'label': 'not-observed'},
+        ]
+        lines = format_boundary_summary(boundaries)
+        # At least 2 lines (one per boundary, possibly a header line too)
+        boundary_lines = [l for l in lines if 'Repo' in l or 'Cache' in l]
+        assert len(boundary_lines) >= 2
+
+    def test_l1_pass_line_included(self):
+        from servers.integration_gate import format_boundary_summary
+        boundaries = [{'caller': 'A', 'callee': 'B', 'label': 'verified-real'}]
+        lines = format_boundary_summary(boundaries, l1_total=5)
+        joined = '\n'.join(lines)
+        # Should mention L1 tests passed
+        assert '5' in joined

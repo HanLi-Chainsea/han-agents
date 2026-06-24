@@ -595,3 +595,122 @@ def _failed(error: str, *, evidence: Optional[Dict] = None) -> Dict:
         "error": error,
         "evidence": evidence or {},
     }
+
+
+# ---------------------------------------------------------------------------
+# B4: Integration gate policy — L1 (hard) + L2 (hard) + L3 (advisory)
+# ---------------------------------------------------------------------------
+
+_LABEL_VERIFIED_REAL = 'verified-real'
+_LABEL_MOCKED = 'mocked'
+_LABEL_NOT_OBSERVED = 'not-observed'
+_LABEL_NOT_MEASURABLE = 'not-measurable'
+
+# Symbol map for format_boundary_summary
+_LABEL_SYMBOL = {
+    _LABEL_VERIFIED_REAL: '✓',
+    _LABEL_MOCKED: '✗',
+    _LABEL_NOT_OBSERVED: '⚠️',
+    _LABEL_NOT_MEASURABLE: '➖',
+}
+
+
+def format_boundary_summary(
+    boundaries_with_labels: List[Dict],
+    *,
+    l1_total: Optional[int] = None,
+) -> List[str]:
+    """Return a human-readable list of strings for the integration boundary report.
+
+    Each boundary produces one line:
+        🔗 Caller→Callee ✓ verified-real
+        🔗 Caller→Callee ✗ mocked
+        🔗 Caller→Callee ⚠️ not-observed
+        🔗 Caller→Callee ➖ not-measurable
+
+    Optionally prepends an L1 test-pass line when *l1_total* is given.
+
+    Mirrors the spirit of coverage.format_coverage_summary.
+    """
+    lines = []
+    if l1_total is not None:
+        lines.append(f"✅ L1 integration tests passed ({l1_total} tests)")
+    for b in boundaries_with_labels:
+        label = b.get('label', _LABEL_NOT_MEASURABLE)
+        symbol = _LABEL_SYMBOL.get(label, '?')
+        caller = b.get('caller', '?')
+        callee = b.get('callee', '?')
+        lines.append(f"🔗 {caller}→{callee} {symbol} {label}")
+    return lines
+
+
+def _classify_boundary_l3(
+    boundary: Dict,
+    project_path: str,
+    test_files: List[str],
+    stack: str,
+) -> str:
+    """Classify a single boundary into one of the 4 L3 labels using coverage.
+
+    This is advisory-only: any exception or unavailability → 'not-measurable'.
+    Never raises; always returns a label string.
+    """
+    try:
+        from servers import coverage as cov
+        from servers import coverage_java as cov_java
+        from servers import project as proj_mod
+
+        # Determine backend
+        _ts = (proj_mod.ensure_project(
+            boundary.get('_project_name', ''),
+            project_path,
+        ).get('tech_stack') or {})
+        backend = cov_java.select_backend(_ts)
+
+        callee_file = boundary.get('callee_file', '')
+        callee_name = boundary.get('callee', '?')
+
+        # We measure coverage of the callee file/class.
+        # Build a minimal coverage_target for the callee.
+        # line_start/end are required; since we don't know exact range,
+        # use a wide range (1-9999) — the backend will filter by what's in
+        # the file; any coverage hit counts as "observed".
+        coverage_target = [{
+            'file_path': callee_file,
+            'name': callee_name,
+            'line_start': 1,
+            'line_end': 9999,
+        }]
+
+        if backend == 'java':
+            res = cov_java.measure_branch_coverage_java(
+                project_path, test_files, coverage_target)
+        else:
+            # Python or unknown — use pytest/coverage backend
+            if not cov._coverage_available():
+                return _LABEL_NOT_MEASURABLE
+            res = cov.measure_branch_coverage(
+                project_path, test_files, coverage_target)
+
+        status = res.get('tool_status', 'unavailable')
+        if status == 'unavailable':
+            return _LABEL_NOT_MEASURABLE
+        if status != 'ok':
+            return _LABEL_NOT_MEASURABLE
+
+        per_target = res.get('per_target', [])
+        if not per_target:
+            return _LABEL_NOT_MEASURABLE
+
+        pt = per_target[0]
+        covered = pt.get('n_covered', 0)
+        total = pt.get('n_total', 0)
+        if total == 0:
+            # No measurable branches in callee → not-measurable
+            return _LABEL_NOT_MEASURABLE
+        if covered > 0:
+            return _LABEL_VERIFIED_REAL
+        return _LABEL_NOT_OBSERVED
+
+    except Exception:
+        return _LABEL_NOT_MEASURABLE
