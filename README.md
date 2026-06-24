@@ -68,6 +68,29 @@ Three layers work together:
 - **Harness Tracing & Evals** — local trace/span storage plus deterministic trajectory scoring
 - **Auto Tech Stack Detection** — `ensure_project()` detects languages, frameworks, and test tools
 - **Micro-Nap Checkpoints** — save and resume long-running tasks across conversations
+- **Tool-verified test gates** — stack-adaptive, fail-closed quality gates for `/han:unit-test` and `/han:integration-test` (see below)
+
+---
+
+## Tool-Verified Test Gates
+
+Both `/han:unit-test` and `/han:integration-test` verify test quality with real tooling — tool-verifiable, no false-green (工具可驗證、不准假綠). The gate auto-detects the project's stack and routes to the right backend.
+
+**Branch coverage = logical branch, not line.**
+- Python: `coverage.py --branch`
+- Java: JaCoCo `BRANCH` counter, measured non-invasively via a Gradle `-I` init-script + JaCoCo agent (bundled at `reference/tools/jacoco/`). `build.gradle`, `settings.gradle`, `gradle.properties`, and the JDK/toolchain version are never modified.
+
+**`/han:unit-test` gate** rejects (routes back to the executor) unless every branch of the target function is covered — tool-measured, with a human-visible per-branch ✓/✗ summary.
+
+**`/han:integration-test` gate**, fail-closed, three layers:
+
+| Layer | Role | Hard gate? |
+|-------|------|:----------:|
+| **L1** | Tests actually ran and passed — parsed from native JUnit/pytest result XML, not a claim | Yes |
+| **L2** | Static mock-smell — rejects if the test mocks away the very collaborator it claims to integrate with (`@MockBean`, `Mockito.mock`, `patch(...)`, etc.) | Yes |
+| **L3** | Branch coverage as **advisory** evidence only — 4 labels: `verified-real` / `mocked` / `not-observed` / `not-measurable`. Never changes the L1/L2 verdict | No |
+
+Boundaries are derived from the Code Graph's `injects`/call edges (runtime collaborator edges only; `imports`/`extends`/`implements` are excluded).
 
 ---
 

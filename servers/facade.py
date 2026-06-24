@@ -1794,6 +1794,54 @@ def _gate_reject(critic_task_id: str, original_task_id: str,
     return {'verdict': 'rejected', 'issues': issues}
 
 
+def _java_test_file_to_fq_classname(test_file: str) -> str:
+    """Convert a Java/Kotlin test file path to a fully-qualified class name.
+
+    C4 fix: strips leading src/test/java (or src/test/kotlin) prefix,
+    removes the .java/.kt extension, and replaces '/' with '.'.
+
+    Examples:
+        'src/test/java/demo/FooTest.java'          -> 'demo.FooTest'
+        'src/test/kotlin/com/example/BazSpec.kt'   -> 'com.example.BazSpec'
+        '**/src/test/java/com/example/BarTest.java' -> 'com.example.BarTest'
+    """
+    import re
+    path = test_file.replace('\\', '/').lstrip('*').lstrip('/')
+    # Strip leading src/test/{java,kotlin}/ or test/{java,kotlin}/
+    path = re.sub(
+        r'^(?:.*?/)?src/test/(?:java|kotlin)/',
+        '',
+        path,
+    )
+    # Also handle bare test/java/ or test/kotlin/ prefixes
+    path = re.sub(r'^(?:.*?/)?test/(?:java|kotlin)/', '', path)
+    # Drop extension
+    for ext in ('.java', '.kt'):
+        if path.endswith(ext):
+            path = path[:-len(ext)]
+            break
+    return path.replace('/', '.')
+
+
+def _derive_java_test_filters(test_targets: List[str]) -> List[str]:
+    """Return FQ class names for any Java/Kotlin test file paths in test_targets.
+
+    C4: Used to scope the Gradle test run to only the tests written for the
+    target, preventing unrelated tests from covering the branch (false green).
+    Non-Java paths are silently ignored.
+    """
+    filters = []
+    for tf in (test_targets or []):
+        tf_norm = tf.replace('\\', '/')
+        if (('src/test/java/' in tf_norm or 'src/test/kotlin/' in tf_norm
+             or tf_norm.endswith('.java') or tf_norm.endswith('.kt'))
+                and '/test/' in tf_norm):
+            fq = _java_test_file_to_fq_classname(tf_norm)
+            if fq:
+                filters.append(fq)
+    return filters
+
+
 def run_coverage_gate(critic_task_id: str,
                       original_task_id: str,
                       project_name: str,
@@ -1808,6 +1856,15 @@ def run_coverage_gate(critic_task_id: str,
       - 全覆蓋 → {'verdict':'proceed', 'warn': None}。
       - 真正 infra（coverage 未安裝 / unavailable）→ fail-open，回
         {'verdict':'proceed', 'warn': <警示字串>}（上游把警示前置到 critic prompt）。
+
+    C5 fix: backend selection happens FIRST, then per-backend availability is
+    checked — Java availability = gradlew exists; Python availability =
+    _coverage_available(). This prevents a Java project from fail-opening just
+    because the Python 'coverage' package is not installed.
+
+    C4 fix: for Java backend, test file paths are converted to FQ class names
+    and passed as test_filters= to scope the Gradle run to the relevant tests
+    only (prevents unrelated suite tests from covering the target → false green).
     """
     import sys
     from servers.tasks import get_task
@@ -1832,10 +1889,21 @@ def run_coverage_gate(critic_task_id: str,
             f'分支覆蓋率 gate：coverage_targets metadata 型別異常'
             f'（預期 list[dict]，得到 {type(coverage_targets).__name__}）。'])
 
-    # coverage 套件缺失＝真正 infra → fail-open
-    if not cov._coverage_available():
-        return {'verdict': 'proceed',
-                'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
+    # ── C5: Select backend FIRST, then check per-backend availability ──────────
+    # Resolve tech_stack from the project record (same approach as recipes.py).
+    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
+    from servers import coverage_java as cov_java
+    from servers import project as _proj
+    _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
+    _backend = cov_java.select_backend(_ts)
+
+    if _backend != 'java':
+        # Python / unknown stack: check python-coverage availability (infra check).
+        # Java stack does NOT go through this check — gradlew absence is handled
+        # fail-closed by measure_branch_coverage_java itself (returns test_run_error).
+        if not cov._coverage_available():
+            return {'verdict': 'proceed',
+                    'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
 
     sys.stderr.write('… 量測分支覆蓋率中 …\n')  # UX：pytest 較久時別讓使用者以為當機
 
@@ -1846,7 +1914,24 @@ def run_coverage_gate(critic_task_id: str,
             '未能確認你寫的測試檔。請在回報中以**獨立一行** '
             '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，gate 才能量測分支覆蓋。'])
 
-    res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
+    if _backend == 'java':
+        # C4: Derive FQ class-name filters so Gradle runs ONLY the tests written
+        # for this target (not the full suite) — prevents false-green coverage
+        # from unrelated tests that happen to exercise the same branches.
+        java_test_filters = _derive_java_test_filters(test_targets)
+        # Major fix: empty java_test_filters with test_targets present → reject.
+        # Cannot scope Gradle run → cannot trust coverage → fail closed.
+        if test_targets and not java_test_filters:
+            return _gate_reject(critic_task_id, original_task_id, [
+                '分支覆蓋率 gate (Java)：無法從測試檔路徑推導 FQ class 名稱，'
+                '無法限縮 Gradle 執行範圍（fail-closed）。'
+                '請確認測試檔路徑含 src/test/java/ 或 src/test/kotlin/ 片段。'])
+        res = cov_java.measure_branch_coverage_java(
+            project_path, test_targets, coverage_targets,
+            test_filters=java_test_filters if java_test_filters else None)
+    else:
+        # 'python' or 'unknown' → existing Python backend (safe default)
+        res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
     status = res['tool_status']
 
     if status == 'ok':
@@ -1875,6 +1960,241 @@ def run_coverage_gate(critic_task_id: str,
     return _gate_reject(critic_task_id, original_task_id,
                         [f'分支覆蓋率 gate（{status}）：{res.get("error")}'])
 
+
+
+
+def run_integration_gate(critic_task_id: str,
+                         original_task_id: str,
+                         project_name: str,
+                         project_path: str) -> Dict:
+    """Integration gate: L1 (run+pass) and L2 (mock-smell) are HARD gates;
+    L3 (branch coverage per boundary) is ADVISORY — never changes verdict.
+
+    Returns the same verdict contract as run_coverage_gate:
+        {'verdict': 'proceed' | 'rejected' | 'blocked',
+         'warn':    str | None,
+         'coverage_summary': list[str]}   # present when verdict='proceed'
+
+    Policy (D3 update):
+      - metadata.integration_boundaries ABSENT → not an integration task → proceed.
+      - Derive test files from executor result TEST_TARGETS: marker; fall back to
+        metadata.test_files.  If NEITHER yields files → fail-closed reject (C1 fix:
+        unverifiable integration task must not pass).
+      - L1: run_tests(...) scoped to derived test files; passes=False → _gate_reject.
+      - L2: read each derived test file and check mock patterns for boundary
+        collaborators → _gate_reject naming any mocked collaborator.
+      - L3: classify each boundary (verified-real / not-observed / not-measurable);
+            result is advisory, never modifies verdict.
+    """
+    from servers.tasks import get_task
+    import servers.integration_gate as ig
+    import servers.project as proj_mod
+
+    original = get_task(original_task_id)
+    metadata = (original or {}).get('metadata')
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    # C2: Distinguish KEY ABSENT (not an integration task) from KEY PRESENT+EMPTY.
+    # Only the absent case skips all gating.  The present-but-empty case is still
+    # an integration task — L1 must pass even when there are no boundaries to check.
+    if 'integration_boundaries' not in metadata:
+        # Key absent → not an integration task → pass-through, no gating.
+        return {'verdict': 'proceed', 'warn': None}
+
+    boundaries = metadata['integration_boundaries']
+
+    # Present but malformed (not list[dict]) → fail-closed reject (not a silent skip = 假綠).
+    # Mirror run_coverage_gate's treatment of malformed coverage_targets.
+    if not isinstance(boundaries, list) or (
+            boundaries and not all(isinstance(b, dict) for b in boundaries)):
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
+
+    # D5 F3: Validate each boundary dict has required keys with non-empty values.
+    # A boundary missing 'callee' or 'caller' produces an empty collaborator list,
+    # causing L2 to check nothing → false-green (假綠).  Fail-closed: reject if any
+    # boundary is malformed (missing/empty callee or caller).
+    # G1: Complete boundary schema validation — fail-closed.
+    # Each boundary dict MUST have ALL of caller, callee, callee_file, edge.
+    # Each field must be a non-empty string after .strip() (whitespace-only FAILS).
+    # edge must be one of {'injects', 'calls'}.
+    _required_boundary_fields = ('caller', 'callee', 'callee_file', 'edge')
+    _valid_edges = {'injects', 'calls'}
+    for _b in boundaries:
+        if not isinstance(_b, dict):
+            continue  # already caught above; defensive
+        # Check all required fields present and non-empty after strip
+        for _field in _required_boundary_fields:
+            _val = _b.get(_field, '')
+            if not isinstance(_val, str) or not _val.strip():
+                return _gate_reject(critic_task_id, original_task_id, [
+                    f'整合邊界 metadata 欄位不完整或無效：{_field!r} 欄位缺少或不是非空字串。'])
+        # Validate edge value
+        _edge = _b.get('edge', '')
+        if _edge not in _valid_edges:
+            return _gate_reject(critic_task_id, original_task_id, [
+                f'整合邊界 metadata 欄位不完整或無效：edge={_edge!r}，'
+                f'必須為 {_valid_edges} 其中一個。'])
+
+    # G1b fix: Normalize boundary string fields (strip whitespace) after validation.
+    # Validation checked that fields are non-empty after strip(); now apply the strip.
+    # This prevents padded values like callee=" OrderRepository " from bypassing L2 detection.
+    boundaries = [
+        {
+            'caller': b['caller'].strip(),
+            'callee': b['callee'].strip(),
+            'callee_file': b['callee_file'].strip(),
+            'edge': b['edge'].strip(),
+        }
+        for b in boundaries
+    ]
+
+    # C-b fix: boundary extraction error flag (set by recipe when boundaries_for_target
+    # raised an exception) → fail-closed reject so Code Graph failure does not masquerade
+    # as "zero boundaries" and silently disable L2.
+    if metadata.get('boundaries_error'):
+        return _gate_reject(critic_task_id, original_task_id, [
+            '邊界抽取失敗（Code Graph 不完整？請先 /han:sync），無法驗證整合邊界。'])
+
+    stack = metadata.get('stack') or 'python'
+
+    # D3 C1 fix: derive test files from executor result marker first;
+    # fall back to metadata.test_files if marker absent (backwards compatibility).
+    result_text = (original or {}).get('result') or ''
+    test_files = ig.derive_integration_test_files(project_path, result_text)
+    if not test_files:
+        test_files = metadata.get('test_files') or []
+
+    # C-a fix: ANY integration task (key present) MUST have derived test files.
+    # Derive BEFORE branching on empty/non-empty boundaries so even empty-boundary
+    # tasks get scoped L1 (no full-suite run).
+    # Without test files we cannot scope L1 nor verify L2 → reject.
+    if not test_files:
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：無法取得測試檔路徑（整合任務必須提供 TEST_TARGETS:）。'
+            '請在回報中以獨立一行 '
+            '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，'
+            'gate 才能執行並驗證無 mock 邊界。'])
+
+    # ── C-c: Normalize stack via select_backend (handles junit/gradle/maven → 'java')
+    # This prevents 'junit' stacks from routing to run_tests with an unknown stack value.
+    # Pass stack as BOTH test_tool and primary_language so direct values like
+    # 'python'/'java' (stored by recipes) also resolve correctly.
+    from servers import coverage_java as _cov_java
+    _normalized_stack = _cov_java.select_backend(
+        {'test_tool': stack, 'primary_language': stack})
+    if _normalized_stack == 'unknown':
+        return _gate_reject(critic_task_id, original_task_id, [
+            f'Integration gate: unrecognized stack {stack!r} — '
+            f'cannot normalize to java/python (fail-closed).'])
+
+    # ── L1: Run tests — hard gate ──────────────────────────────────────────────
+    # Scoped to derived test files (when available) so we run exactly what the
+    # executor wrote.  Java stack: convert file paths to FQ class names for
+    # --tests filtering.  Python stack: pass file paths as py_test_files.
+    # Runs even when boundaries is an empty list.
+    if _normalized_stack == 'java':
+        # D5 test-quality fix: use _derive_java_test_filters (same as coverage gate)
+        # to filter out paths that lack src/test/java/ / src/test/kotlin/.
+        # This matches the coverage gate behavior and makes the empty-filter reject
+        # genuinely exercisable (bare filenames like 'FooTest.java' yield no filters).
+        java_filters = _derive_java_test_filters(test_files)
+        # Major fix: empty java_filters with test_files present → reject (cannot scope)
+        # ponytail: multi-module gradle_module not derived (runs root module)
+        if test_files and not java_filters:
+            return _gate_reject(critic_task_id, original_task_id, [
+                'Integration gate L1 (Java): 無法從 test_files 推導 FQ class 名稱，'
+                '無法限縮 Gradle 執行範圍（fail-closed）。'
+                '請確認測試檔路徑含 src/test/java/ 或 src/test/kotlin/ 片段。'])
+        # ponytail: multi-module gradle_module not derived (runs root module).
+        l1 = ig.run_tests(project_path, 'java',
+                          test_filters=java_filters if java_filters else None)
+    else:
+        l1 = ig.run_tests(project_path, 'python',
+                          py_test_files=test_files if test_files else None)
+
+    if not l1.get('passed'):
+        error_detail = l1.get('error') or f"failures={l1.get('failures')}, errors={l1.get('errors')}"
+        return _gate_reject(critic_task_id, original_task_id, [
+            f'Integration gate L1: tests did not pass — {error_detail}'])
+
+    l1_total = l1.get('total', 0)
+
+    # When boundary list is empty, L2/L3 are trivially skipped (nothing to check).
+    if not boundaries:
+        return {'verdict': 'proceed', 'warn': None,
+                'coverage_summary': ig.format_boundary_summary([], l1_total=l1_total)}
+
+    # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
+    # Read each DERIVED test file and check whether boundary collaborators are mocked.
+    # Fail-closed: if test_files non-empty but zero files readable → reject.
+    #
+    # H1 fix: for calls-edge boundaries the callee may be a bare method name (e.g.
+    # 'save') while the real test mocks the OWNING TYPE (@MockBean OrderRepository).
+    # Build a per-boundary candidate set: {callee simple name, owning type from file}.
+    # Flag the boundary if ANY candidate is detected as mocked.
+    all_mocked: List[str] = []
+    files_read = 0
+
+    # Pre-compute candidate sets per boundary to avoid repeated work.
+    _boundary_candidates = [
+        ig._candidate_collaborators(b.get('callee', ''), b.get('callee_file', ''))
+        for b in boundaries
+    ]
+
+    # Read each test file once; check all boundaries against the source.
+    _test_sources: List[str] = []
+    for tf in test_files:
+        # test_files may be relative or absolute; try project_path-relative first
+        tf_path = tf if os.path.isabs(tf) else os.path.join(project_path, tf)
+        if not os.path.isfile(tf_path):
+            continue
+        try:
+            with open(tf_path, 'r', encoding='utf-8', errors='replace') as fh:
+                test_source = fh.read()
+        except OSError:
+            continue
+        files_read += 1
+        _test_sources.append(test_source)
+
+    # Fail-closed: non-empty test_files but zero readable → cannot verify → reject
+    if test_files and files_read == 0:
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：無法讀取任何測試原始碼以驗證未 mock 邊界（test_files 路徑不可讀）'])
+
+    # Check each boundary: flag if ANY candidate is mocked in ANY test source.
+    for _b, _candidates in zip(boundaries, _boundary_candidates):
+        _callee = _b.get('callee', '')
+        if not _callee or not _candidates:
+            continue
+        _boundary_mocked = False
+        for _src in _test_sources:
+            _hits = ig.detect_mocked_collaborators(_src, _candidates, stack)
+            if _hits:
+                _boundary_mocked = True
+                break
+        if _boundary_mocked and _callee not in all_mocked:
+            all_mocked.append(_callee)
+
+    if all_mocked:
+        issues = [f'fake integration: {m} is mocked' for m in all_mocked]
+        return _gate_reject(critic_task_id, original_task_id, issues)
+
+    # ── L3: Branch coverage per boundary — advisory only ──────────────────────
+    # Enrich each boundary with a label; verdict is never changed by L3.
+    # ponytail: L3 is ADVISORY; it never changes the verdict.
+    boundaries_with_labels = []
+
+    for b in boundaries:
+        b_annotated = dict(b)
+        b_annotated['_project_name'] = project_name
+        label = ig._classify_boundary_l3(b_annotated, project_path, test_files)
+        b_annotated['label'] = label
+        boundaries_with_labels.append(b_annotated)
+
+    summary = ig.format_boundary_summary(boundaries_with_labels, l1_total=l1_total)
+    return {'verdict': 'proceed', 'warn': None, 'coverage_summary': summary}
 
 def get_next_dispatch_gated(parent_id: str,
                             project_name: str,
@@ -1914,6 +2234,48 @@ def get_next_dispatch_gated(parent_id: str,
             inst['prompt'] = verdict['warn'] + '\n\n' + inst['prompt']
         if verdict.get('coverage_summary'):
             # 掛到回傳的 critic dispatch 上，讓 /han:unit-test 迴圈每輪攔得到，收尾寫進報告。
+            inst['coverage_summary'] = verdict['coverage_summary']
+        return inst
+
+
+def get_next_dispatch_integration_gated(parent_id: str,
+                                        project_name: str,
+                                        project_path: str,
+                                        trace_id: str = None) -> Dict:
+    """get_next_dispatch + integration gate (L1 run+pass, L2 mock-smell).
+
+    Mirrors get_next_dispatch_gated but calls run_integration_gate instead of
+    run_coverage_gate.  When the next dispatch is a critic, the integration gate
+    runs first:
+      - rejected  → finish_validation already handled; continue to get next dispatch
+                   (will become executor retry with collaborator name in prompt)
+      - blocked   → return blocked action immediately
+      - proceed   → attach coverage_summary (boundary report) and return critic dispatch
+    Other actions (executor / done / blocked) are returned unchanged.
+    """
+    seen_critics: set = set()
+    while True:
+        inst = get_next_dispatch(parent_id, project_name, project_path, trace_id)
+        if inst.get('action') != 'dispatch' or inst.get('subagent_type') != 'critic':
+            return inst
+        critic_id = inst.get('task_id')
+        if critic_id in seen_critics:
+            return inst  # safety: avoid infinite loop if state did not advance
+        seen_critics.add(critic_id)
+        verdict = run_integration_gate(
+            critic_id, inst['original_task_id'], project_name, project_path)
+        if verdict['verdict'] == 'blocked':
+            return {
+                'action': 'blocked',
+                'progress': inst.get('progress'),
+                'message': verdict.get('message') or '任務已達最大驗證重試次數，需人工審查。',
+                'review_id': verdict.get('review_id'),
+            }
+        if verdict['verdict'] == 'rejected':
+            continue  # retry: gate already called finish_validation
+        if verdict.get('warn'):
+            inst['prompt'] = verdict['warn'] + '\n\n' + inst['prompt']
+        if verdict.get('coverage_summary'):
             inst['coverage_summary'] = verdict['coverage_summary']
         return inst
 

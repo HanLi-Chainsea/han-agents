@@ -10,6 +10,7 @@ match: ["integration test", "整合測試", "整合測", "整合測程式"]
 - 採 narrow integration test：聚焦單一邊界，端到端資料流走完整路徑
 - 清理副作用（測試後還原狀態），確保 Repeatable
 - 寫完必須實際執行並回報 pass/fail 與指令
+- **回報測試檔路徑（必填）**：在回報中以獨立一行 `TEST_TARGETS: <相對專案根的測試檔路徑, 逗號分隔>` 列出本次撰寫或修改的測試檔，gate 才能執行並驗證無邊界協作者被 mock。
 - **建置環境護欄（JDK / Gradle / 依賴 / CI）**：遇到相關問題時——(1) 優先非侵入式處理（補測試依賴、用既有版本、test double）；(2) 若需改 root `build.gradle`/`build.gradle.kts`/`gradle.properties`/`settings.gradle`，**必須停止並標記人工確認**；(3) **不得為了測試通過而改變專案目標 JDK 版本**。原因：上雲版本固定，改版本會讓「上雲能不能跑」變未知數——寧可回報受阻也不動版本。
 
 ## Critic Checklist

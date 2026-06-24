@@ -322,6 +322,7 @@ def recipe_integration_tests(
 ) -> Dict:
     """為各模組建立整合測試任務樹（以模組/目錄為單位，非單一 function）。"""
     from servers.tasks import create_task, create_subtask
+    from servers.integration_gate import boundaries_for_target
 
     tech = _ensure_synced(project_name, project_path)
     test_tool = tech.get('test_tool', 'unknown')
@@ -351,6 +352,15 @@ def recipe_integration_tests(
     for module in sorted(by_module.keys()):
         if task_count >= max_tasks:
             break
+        module_files = by_module[module]
+        boundaries_error = False
+        try:
+            boundaries = boundaries_for_target(project_name, module_files)
+        except Exception:
+            # C-b fix: record error distinctly so the gate knows extraction failed
+            # (vs. genuinely zero boundaries), preventing silent L2 disable.
+            boundaries = []
+            boundaries_error = True
         story_id = create_task(
             project=project_name,
             description=f"Integration tests for module {module}",
@@ -360,7 +370,14 @@ def recipe_integration_tests(
             description=(f"Write integration tests for module {module}. "
                         f"涵蓋跨檔案協作與邊界。Test tool: {test_tool}"),
             assigned_agent='executor', requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
+            task_level='task', epic_id=epic_id, story_id=story_id,
+            metadata={
+                'integration_boundaries': boundaries,
+                'test_files': [],
+                'stack': test_tool,
+                # C-b: flag extraction failure so the gate can reject
+                **({'boundaries_error': True} if boundaries_error else {}),
+            })
         task_count += 1
         built_modules.append(module)
 
