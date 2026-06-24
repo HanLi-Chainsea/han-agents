@@ -22,6 +22,27 @@
 - **自動技術堆疊偵測** — `ensure_project()` 自動識別語言、框架與測試工具
 - **Micro-Nap 檢查點** — 跨對話儲存與恢復長時間執行的任務
 - **Zero-Config** — Clone 完即可用，資料庫首次使用時自動建立
+- **工具驗證測試 Gate** — `/han:unit-test` 與 `/han:integration-test` 均透過真實工具量測，fail-closed，不准假綠（見下）
+
+## 工具驗證測試 Gate
+
+`/han:unit-test` 與 `/han:integration-test` 均以真實工具量測測試品質——**工具可驗證、不准假綠**。Gate 自動偵測專案技術棧並分派對應後端。
+
+**覆蓋率 = 邏輯分支覆蓋，不是行覆蓋。**
+- Python：`coverage.py --branch`
+- Java：JaCoCo `BRANCH` counter，透過 Gradle `-I` init-script + JaCoCo agent 非侵入量測（agent 已打包於 `reference/tools/jacoco/`）。**不會修改** `build.gradle`、`settings.gradle`、`gradle.properties`，也不改動 JDK / toolchain 版本。
+
+**`/han:unit-test` gate** — 若目標函式有任何分支未被覆蓋，直接退回 executor 補測，並附上逐條分支 ✓/✗ 摘要（工具實測值）。
+
+**`/han:integration-test` gate**，fail-closed，三層：
+
+| 層 | 職責 | 是否硬 Gate |
+|----|------|:-----------:|
+| **L1** | 測試確實執行並通過 — 解析原生 JUnit/pytest 結果 XML，非宣稱 | 是 |
+| **L2** | Static mock-smell — 若測試把它宣稱要整合的協作者 mock 掉（`@MockBean`、`Mockito.mock`、`patch(...)` 等），直接退件 | 是 |
+| **L3** | 分支覆蓋率作為**佐證**（advisory）— 四分類：`verified-real` / `mocked` / `not-observed` / `not-measurable`。不影響 L1/L2 判決 | 否 |
+
+邊界來源：Code Graph 的 `injects`（Spring DI）與呼叫邊（runtime 協作邊）；`imports`/`extends`/`implements` 不計入。
 
 ## 安裝
 

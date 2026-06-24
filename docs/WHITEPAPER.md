@@ -34,7 +34,7 @@
 | 能力 | 說明 |
 |------|------|
 | **任務規劃** | 將複雜任務自動分解為可執行的子任務 |
-| **品質驗證** | 透過 Critic 代理驗證任務產出 |
+| **品質驗證** | 透過 Critic 代理驗證任務產出；測試 gate 以真實工具量測，fail-closed，不准假綠 |
 | **經驗累積** | 語義記憶系統儲存學習成果 |
 | **偏差偵測** | 自動檢測文檔與程式碼的不一致 |
 | **程式碼分析** | AST 解析建構程式碼關係圖 |
@@ -324,6 +324,21 @@ Critic 負責品質把關，使用 Code Graph 增強驗證：
 - `APPROVED`：通過，可標記完成
 - `REJECTED`：不通過，需重做
 - `CONDITIONAL`：條件通過，小問題可後續處理
+
+### 4.6 工具驗證測試 Gate（工具可驗證、不准假綠）
+
+`/han:unit-test` 與 `/han:integration-test` 的測試品質驗證均以真實工具量測，fail-closed，不依賴 LLM 宣稱。Gate 自動偵測技術棧並分派對應後端（Python / Java）。
+
+**分支覆蓋（branch，非行）**：Python 用 `coverage.py --branch`；Java 用 JaCoCo `BRANCH` counter，透過 Gradle `-I` init-script 非侵入掛載，不修改 `build.gradle`/`settings.gradle`/`gradle.properties` 或 JDK 版本。
+
+**`/han:unit-test`** — 目標函式必須每條邏輯分支均被工具量測覆蓋；未覆蓋分支直接退回 Executor，附逐條 ✓/✗ 摘要。
+
+**`/han:integration-test`** — 三層把關：
+- **L1（硬 gate）**：解析原生 JUnit/pytest 結果 XML，確認測試確實執行並通過。
+- **L2（硬 gate）**：Static mock-smell，若測試把邊界協作者 mock 掉（`@MockBean`/`Mockito.mock`/`patch` 等），視為假整合直接退件。
+- **L3（advisory）**：JaCoCo/coverage BRANCH 覆蓋作為佐證，四分類：`verified-real` / `mocked` / `not-observed` / `not-measurable`；不影響 L1/L2 判決。
+
+邊界來源：Code Graph 的 `injects`（Spring DI）與呼叫邊（runtime 協作邊）。
 
 ---
 
