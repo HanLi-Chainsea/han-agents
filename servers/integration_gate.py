@@ -361,10 +361,10 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
         # Pattern stops at first semicolon (field boundary) to avoid cross-matching.
         annotation_pattern = re.compile(
             r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)(?:\s*\([^)]*\))?"  # annotation with optional args (J1 fix)
-            r"(?:\n\s*@\w+[^\n;]*)*"                                     # annotation lines (no semicolon)
-            r"(?:\n\s*(?:public|private|protected|static|final|transient|volatile)\s+[^\n;]*)?"  # optional modifiers
-            r"\n\s*(?:(?:public|private|protected|static|final)\s+)*[^\n]*\b"
-            + re.escape(simple) + r"\b[^\n]*;",                          # type name before semicolon (field end)
+            r"(?:\n\s*@\w+[^\n]*(?:\([^)]*\)[^\n]*)*)*"                   # annotations can have parens
+            r"(?:\n\s*(?:public|private|protected|static|final|transient|volatile)\s+[^\n;,)]*)?"  # optional modifiers
+            r"(?:\n\s*)?(?:(?:public|private|protected|static|final)\s+)*[^\n]*\b"
+            + re.escape(simple) + r"\b[^\n]*[;,)]",                      # type name before ; , or ) (K1 fix)
             re.MULTILINE,
         )
         if annotation_pattern.search(test_source):
@@ -636,6 +636,24 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
         )
         if monkeypatch_third_arg_pattern.search(test_source):
             mocked.add(collab)
+
+        # ---- Pattern 6c (K2): monkeypatch.setattr("dotted.path.C", ...) ----
+        # Dotted-string target where C's simple name appears as a dotted segment.
+        # Matches: monkeypatch.setattr("app.repo.OrderRepository.find_all", fake)
+        #          monkeypatch.setattr("app.repo.OrderRepository", fake)
+        # Allows C to appear anywhere in the dotted path as a complete segment.
+        monkeypatch_dotted_string_pattern = re.compile(
+            r"""(?:monkeypatch\.setattr|setattr)\s*\(\s*["']"""
+            r"""(?:[A-Za-z0-9_]+\.)*"""  # zero or more segments before C
+            + re.escape(simple)  # C's simple name
+            + r"""(?:\.[A-Za-z0-9_]+)*"""  # zero or more segments after C
+            + r"""["']""",
+            re.MULTILINE,
+        )
+        if monkeypatch_dotted_string_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
 
     return [c for c in collaborators if c in mocked]
 
