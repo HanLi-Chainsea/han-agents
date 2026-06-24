@@ -1794,6 +1794,54 @@ def _gate_reject(critic_task_id: str, original_task_id: str,
     return {'verdict': 'rejected', 'issues': issues}
 
 
+def _java_test_file_to_fq_classname(test_file: str) -> str:
+    """Convert a Java/Kotlin test file path to a fully-qualified class name.
+
+    C4 fix: strips leading src/test/java (or src/test/kotlin) prefix,
+    removes the .java/.kt extension, and replaces '/' with '.'.
+
+    Examples:
+        'src/test/java/demo/FooTest.java'          -> 'demo.FooTest'
+        'src/test/kotlin/com/example/BazSpec.kt'   -> 'com.example.BazSpec'
+        '**/src/test/java/com/example/BarTest.java' -> 'com.example.BarTest'
+    """
+    import re
+    path = test_file.replace('\\', '/').lstrip('*').lstrip('/')
+    # Strip leading src/test/{java,kotlin}/ or test/{java,kotlin}/
+    path = re.sub(
+        r'^(?:.*?/)?src/test/(?:java|kotlin)/',
+        '',
+        path,
+    )
+    # Also handle bare test/java/ or test/kotlin/ prefixes
+    path = re.sub(r'^(?:.*?/)?test/(?:java|kotlin)/', '', path)
+    # Drop extension
+    for ext in ('.java', '.kt'):
+        if path.endswith(ext):
+            path = path[:-len(ext)]
+            break
+    return path.replace('/', '.')
+
+
+def _derive_java_test_filters(test_targets: List[str]) -> List[str]:
+    """Return FQ class names for any Java/Kotlin test file paths in test_targets.
+
+    C4: Used to scope the Gradle test run to only the tests written for the
+    target, preventing unrelated tests from covering the branch (false green).
+    Non-Java paths are silently ignored.
+    """
+    filters = []
+    for tf in (test_targets or []):
+        tf_norm = tf.replace('\\', '/')
+        if (('src/test/java/' in tf_norm or 'src/test/kotlin/' in tf_norm
+             or tf_norm.endswith('.java') or tf_norm.endswith('.kt'))
+                and '/test/' in tf_norm):
+            fq = _java_test_file_to_fq_classname(tf_norm)
+            if fq:
+                filters.append(fq)
+    return filters
+
+
 def run_coverage_gate(critic_task_id: str,
                       original_task_id: str,
                       project_name: str,
@@ -1808,6 +1856,15 @@ def run_coverage_gate(critic_task_id: str,
       - 全覆蓋 → {'verdict':'proceed', 'warn': None}。
       - 真正 infra（coverage 未安裝 / unavailable）→ fail-open，回
         {'verdict':'proceed', 'warn': <警示字串>}（上游把警示前置到 critic prompt）。
+
+    C5 fix: backend selection happens FIRST, then per-backend availability is
+    checked — Java availability = gradlew exists; Python availability =
+    _coverage_available(). This prevents a Java project from fail-opening just
+    because the Python 'coverage' package is not installed.
+
+    C4 fix: for Java backend, test file paths are converted to FQ class names
+    and passed as test_filters= to scope the Gradle run to the relevant tests
+    only (prevents unrelated suite tests from covering the target → false green).
     """
     import sys
     from servers.tasks import get_task
@@ -1832,10 +1889,21 @@ def run_coverage_gate(critic_task_id: str,
             f'分支覆蓋率 gate：coverage_targets metadata 型別異常'
             f'（預期 list[dict]，得到 {type(coverage_targets).__name__}）。'])
 
-    # coverage 套件缺失＝真正 infra → fail-open
-    if not cov._coverage_available():
-        return {'verdict': 'proceed',
-                'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
+    # ── C5: Select backend FIRST, then check per-backend availability ──────────
+    # Resolve tech_stack from the project record (same approach as recipes.py).
+    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
+    from servers import coverage_java as cov_java
+    from servers import project as _proj
+    _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
+    _backend = cov_java.select_backend(_ts)
+
+    if _backend != 'java':
+        # Python / unknown stack: check python-coverage availability (infra check).
+        # Java stack does NOT go through this check — gradlew absence is handled
+        # fail-closed by measure_branch_coverage_java itself (returns test_run_error).
+        if not cov._coverage_available():
+            return {'verdict': 'proceed',
+                    'warn': '⚠️ coverage 套件未安裝，本任務回退人工逐分支核對。'}
 
     sys.stderr.write('… 量測分支覆蓋率中 …\n')  # UX：pytest 較久時別讓使用者以為當機
 
@@ -1846,17 +1914,14 @@ def run_coverage_gate(critic_task_id: str,
             '未能確認你寫的測試檔。請在回報中以**獨立一行** '
             '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，gate 才能量測分支覆蓋。'])
 
-    # ── Stack-adaptive backend selection ───────────────────────────────────────
-    # Resolve tech_stack from the project record (same approach as recipes.py).
-    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
-    from servers import coverage_java as cov_java
-    from servers import project as _proj
-    _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
-    _backend = cov_java.select_backend(_ts)
-
     if _backend == 'java':
+        # C4: Derive FQ class-name filters so Gradle runs ONLY the tests written
+        # for this target (not the full suite) — prevents false-green coverage
+        # from unrelated tests that happen to exercise the same branches.
+        java_test_filters = _derive_java_test_filters(test_targets)
         res = cov_java.measure_branch_coverage_java(
-            project_path, test_targets, coverage_targets)
+            project_path, test_targets, coverage_targets,
+            test_filters=java_test_filters if java_test_filters else None)
     else:
         # 'python' or 'unknown' → existing Python backend (safe default)
         res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)

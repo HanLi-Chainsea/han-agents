@@ -28,6 +28,51 @@ def _result(status: str, error: Optional[str] = None,
             'per_target': per_target or [], 'error': error}
 
 
+# Common source-root prefixes stripped when normalising a target file_path
+# to find its JaCoCo package-qualified name (e.g. "src/main/java/", "src/main/kotlin/").
+_SRC_PREFIXES = (
+    'src/main/java/',
+    'src/main/kotlin/',
+    'main/java/',
+    'main/kotlin/',
+)
+
+
+def _pkg_qualified_key(pkg_name: str, sf_name: str) -> str:
+    """Return the lookup key used in the package-qualified sourcefile map.
+
+    JaCoCo nests <sourcefile name="Foo.java"> inside <package name="a/b">,
+    so the unique key is 'a/b/Foo.java'.
+    """
+    return f'{pkg_name}/{sf_name}' if pkg_name else sf_name
+
+
+def _target_matches_pkg_key(file_path: str, pkg_key: str) -> bool:
+    """Return True when *file_path* refers to the same source file as *pkg_key*.
+
+    Strategy (in order):
+    1. Exact suffix match:  file_path.endswith(pkg_key)
+       covers   "src/main/java/a/b/Foo.java"  →  "a/b/Foo.java"
+    2. Strip a known src-root prefix from file_path, then compare:
+       "src/main/java/a/b/Foo.java" → "a/b/Foo.java" == pkg_key
+    """
+    # Normalise slashes just in case
+    fp = file_path.replace('\\', '/')
+    pk = pkg_key.replace('\\', '/')
+
+    if fp.endswith('/' + pk) or fp == pk:
+        return True
+
+    # Strip known source-root prefixes and compare directly
+    for prefix in _SRC_PREFIXES:
+        if fp.startswith(prefix):
+            stripped = fp[len(prefix):]
+            if stripped == pk:
+                return True
+
+    return False
+
+
 def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: str) -> Dict:
     """Parse JaCoCo XML report to per-target branch coverage.
 
@@ -39,6 +84,11 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
     Returns:
         {'tool_status', 'fully_covered', 'per_target', 'error'}
         tool_status: 'ok' | 'schema_error' | 'no_targets' | 'invalid_targets' | 'test_run_error'
+
+    C6 fix: keyed by package-qualified path (<package>/<sourcefile>) to prevent
+    basename collisions when multiple packages contain a file with the same name
+    (e.g. a/Foo.java and b/Foo.java would previously collide in the basename map,
+    letting the later entry silently produce a false-green for the earlier target).
     """
     # Validate targets — mirror the Python backend guard (DRY, fail-closed)
     from servers.coverage import _invalid_targets
@@ -56,22 +106,31 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
     except Exception as e:
         return _result('test_run_error', f'Failed to parse JaCoCo XML: {e}')
 
-    # Build a map: source filename -> sourcefile element
-    # <sourcefile name="Classify.java"> contains <line> elements
-    sourcefile_map = {}
-    for sf in root.findall('.//sourcefile'):
-        name = sf.get('name')
-        if name:
-            sourcefile_map[name] = sf
+    # C6: Build a package-qualified map: "<package>/<sourcefile>" -> sourcefile element.
+    # JaCoCo XML nests <sourcefile name="Foo.java"> inside <package name="a/b">.
+    # Keying by basename alone causes collision when two packages have identically-named
+    # files; using the package-qualified key prevents that false-green.
+    sourcefile_map: Dict[str, object] = {}
+    for pkg in root.findall('.//package'):
+        pkg_name = pkg.get('name') or ''
+        for sf in pkg.findall('sourcefile'):
+            sf_name = sf.get('name')
+            if sf_name:
+                key = _pkg_qualified_key(pkg_name, sf_name)
+                sourcefile_map[key] = sf
 
-    # Check if any target's class exists but has no sourcefile (schema_error)
-    # Build class map: class name -> sourcefilename from class element
-    class_sourcefilename_map = {}
-    for cls in root.findall('.//class'):
-        cls_name = cls.get('name')
-        src_name = cls.get('sourcefilename')
-        if cls_name:
-            class_sourcefilename_map[cls_name] = src_name
+    # Build class map: package-qualified class name -> sourcefilename (for schema_error check).
+    # JaCoCo <class name="a/b/Foo" sourcefilename="Foo.java"> is itself a child of <package>.
+    class_sourcefilename_map: Dict[str, str] = {}
+    for pkg in root.findall('.//package'):
+        pkg_name = pkg.get('name') or ''
+        for cls in pkg.findall('class'):
+            cls_name = cls.get('name')
+            src_name = cls.get('sourcefilename')
+            if cls_name and src_name:
+                # Store with package-qualified source key for lookup
+                pkg_key = _pkg_qualified_key(pkg_name, src_name)
+                class_sourcefilename_map[cls_name] = pkg_key
 
     per_target = []
 
@@ -81,16 +140,22 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
         line_start = target.get('line_start')
         line_end = target.get('line_end')
 
-        # Extract source filename from file_path (e.g., "src/main/java/demo/Classify.java" -> "Classify.java")
-        source_filename = os.path.basename(file_path)
+        # C6: Find the sourcefile element by package-qualified path match.
+        # Iterate all keys in the map and find the one whose pkg-qualified path
+        # corresponds to this target's file_path.
+        sourcefile = None
+        matched_pkg_key = None
+        for pkg_key, sf_elem in sourcefile_map.items():
+            if _target_matches_pkg_key(file_path, pkg_key):
+                sourcefile = sf_elem
+                matched_pkg_key = pkg_key
+                break
 
-        # Find the sourcefile element
-        sourcefile = sourcefile_map.get(source_filename)
         if sourcefile is None:
             # Check if any class references this source file but it's not in sourcefile list
             # This is a schema error - class present but no sourcefile data
-            for cls_name, src_name in class_sourcefilename_map.items():
-                if src_name == source_filename:
+            for cls_name, pkg_key in class_sourcefilename_map.items():
+                if _target_matches_pkg_key(file_path, pkg_key):
                     # Class exists but no sourcefile element = schema_error
                     return _result('schema_error',
                                  f'Target {file_path}: class has no sourcefile data')
@@ -177,7 +242,10 @@ def parse_jacoco_xml(xml_path: str, coverage_targets: List[Dict], source_root: s
 
 # ── Stack-adaptive backend selection ──────────────────────────────────────────
 
-_JAVA_TOOLS = frozenset({'gradle', 'maven'})
+# C3 fix: added 'junit' so that real Java projects reporting test_tool='junit'
+# (as returned by servers/project.py) correctly route to the Java backend
+# instead of falling through to 'unknown' and bypassing the JaCoCo gate.
+_JAVA_TOOLS = frozenset({'gradle', 'maven', 'junit'})
 _JAVA_LANGS = frozenset({'java', 'kotlin'})
 _PYTHON_TOOLS = frozenset({'pytest', 'unittest'})
 _PYTHON_LANGS = frozenset({'python'})
@@ -191,7 +259,7 @@ def select_backend(tech_stack: dict) -> str:
                     {'test_tool': 'gradle', 'primary_language': 'java', ...}
 
     Returns:
-        'java'    — gradle/maven test_tool, or java/kotlin primary_language
+        'java'    — gradle/maven/junit test_tool, or java/kotlin primary_language
         'python'  — pytest/unittest test_tool, or python primary_language
         'unknown' — no recognisable indicator found
 

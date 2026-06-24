@@ -93,3 +93,79 @@ def test_class_present_no_branch_data_is_schema_error(tmp_path):
     res = cj.parse_jacoco_xml(str(xml), targets, 'src/main/java')
     assert res['tool_status'] == 'schema_error', f"expected schema_error, got {res['tool_status']}"
     assert res['fully_covered'] is False
+
+
+# ── C6: Package-qualified source attribution (no basename collision) ──────────
+
+def test_c6_basename_collision_attributes_correct_package(tmp_path):
+    """C6 false-green regression: two packages each contain Foo.java.
+    Package a/b has 0/2 branches covered; package c/d has 2/2 covered.
+    A target pointing at a/b/Foo.java must report fully_covered=False,
+    NOT True (which the old basename-keyed lookup would produce if c/d's
+    entry overwrote a/b's in the map)."""
+    from servers import coverage_java as cj
+    xml = tmp_path / "r.xml"
+    xml.write_text('''\
+<?xml version="1.0"?><report name="t">
+  <package name="a/b">
+    <class name="a/b/Foo" sourcefilename="Foo.java"/>
+    <sourcefile name="Foo.java">
+      <line nr="5" mi="3" ci="0" mb="2" cb="0"/>
+    </sourcefile>
+  </package>
+  <package name="c/d">
+    <class name="c/d/Foo" sourcefilename="Foo.java"/>
+    <sourcefile name="Foo.java">
+      <line nr="5" mi="0" ci="3" mb="0" cb="2"/>
+    </sourcefile>
+  </package>
+</report>''')
+    # Target points at the 0/2 package (a/b/Foo.java)
+    targets = [{
+        'file_path': 'src/main/java/a/b/Foo.java',
+        'name': 'process',
+        'line_start': 5,
+        'line_end': 10,
+    }]
+    res = cj.parse_jacoco_xml(str(xml), targets, 'src/main/java')
+    assert res['tool_status'] == 'ok', f"unexpected status: {res['tool_status']}, error: {res.get('error')}"
+    # Key assertion: must NOT be fully covered (0/2 branches)
+    assert res['fully_covered'] is False, (
+        "C6 false-green: basename collision made the wrong (c/d) entry win; "
+        "must use package-qualified path to pick the correct (a/b) entry"
+    )
+    pt = res['per_target'][0]
+    assert pt['n_total'] == 2 and pt['n_covered'] == 0
+
+
+def test_c6_correct_package_fully_covered_is_true(tmp_path):
+    """C6 complementary: target pointing at the 2/2 package (c/d/Foo.java)
+    must report fully_covered=True."""
+    from servers import coverage_java as cj
+    xml = tmp_path / "r.xml"
+    xml.write_text('''\
+<?xml version="1.0"?><report name="t">
+  <package name="a/b">
+    <class name="a/b/Foo" sourcefilename="Foo.java"/>
+    <sourcefile name="Foo.java">
+      <line nr="5" mi="3" ci="0" mb="2" cb="0"/>
+    </sourcefile>
+  </package>
+  <package name="c/d">
+    <class name="c/d/Foo" sourcefilename="Foo.java"/>
+    <sourcefile name="Foo.java">
+      <line nr="5" mi="0" ci="3" mb="0" cb="2"/>
+    </sourcefile>
+  </package>
+</report>''')
+    targets = [{
+        'file_path': 'src/main/java/c/d/Foo.java',
+        'name': 'process',
+        'line_start': 5,
+        'line_end': 10,
+    }]
+    res = cj.parse_jacoco_xml(str(xml), targets, 'src/main/java')
+    assert res['tool_status'] == 'ok'
+    assert res['fully_covered'] is True
+    pt = res['per_target'][0]
+    assert pt['n_total'] == 2 and pt['n_covered'] == 2

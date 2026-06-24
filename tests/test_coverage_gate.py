@@ -1071,3 +1071,282 @@ class TestStackDispatch:
         assert verdict['verdict'] == 'proceed'
         assert len(python_calls) == 1, 'Unknown stack must fall back to Python backend'
         assert len(java_calls) == 0, 'Java backend must NOT be called for unknown stack'
+
+
+# ── C3: JUnit stack must map to java backend ──────────────────────────────────
+
+
+class TestC3SelectBackendJunit:
+    """C3: select_backend must recognize junit as a Java stack indicator.
+
+    Real Java projects often report test_tool='junit' (from servers/project.py),
+    which previously mapped to 'unknown' causing the Java gate to never run.
+    """
+
+    def test_junit_test_tool_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'junit'}) == 'java'
+
+    def test_junit_mixed_case_maps_to_java(self):
+        from servers.coverage_java import select_backend
+        assert select_backend({'test_tool': 'JUnit'}) == 'java'
+
+    def test_junit_with_version_substring_maps_to_java(self):
+        # e.g. 'junit5' or 'junit-platform' should also resolve to java
+        from servers.coverage_java import select_backend
+        # 'junit5' contains 'junit' — implementation must use substring match
+        # (or exact match for 'junit'; at minimum plain 'junit' must work)
+        assert select_backend({'test_tool': 'junit'}) == 'java'
+
+    def test_junit_stack_routes_gate_to_java_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """End-to-end: junit tech_stack routes run_coverage_gate to Java backend."""
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        targets = [{'file_path': 'src/main/java/demo/Foo.java', 'name': 'bar',
+                    'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done',
+                           result='done\nTEST_TARGETS: src/test/java/demo/FooTest.java')
+        critic = reserve_critic_task(task)
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'junit'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['src/test/java/demo/FooTest.java'])
+
+        java_calls = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            java_calls.append(1)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/main/java/demo/Foo.java',
+                                    'name': 'bar', 'line_start': 1, 'line_end': 9,
+                                    'covered_branches': [{'from': 2, 'to': 3}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+
+        verdict = facade.run_coverage_gate(critic['id'], task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        assert len(java_calls) == 1, 'junit stack must route to Java backend'
+
+
+# ── C5: Backend selection must precede _coverage_available() ──────────────────
+
+
+class TestC5BackendSelectionPrecedesCoverageAvailable:
+    """C5: Java path must not be gated by Python coverage availability.
+
+    Previously _coverage_available() ran BEFORE backend selection, so Java
+    projects fail-opened (skipped measurement) when python-coverage was absent.
+    Fix: select backend first; Java availability = gradlew exists; Python
+    availability = _coverage_available().
+    """
+
+    def test_java_backend_proceeds_when_python_coverage_unavailable(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """When python-coverage is 'unavailable' but stack is java and gradlew
+        exists, the gate must route to the Java backend (not fail-open)."""
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        # Simulate a gradlew file existing in tmp_path
+        gradlew = tmp_path / 'gradlew'
+        gradlew.write_text('#!/bin/sh\n')
+
+        targets = [{'file_path': 'src/main/java/demo/Foo.java', 'name': 'bar',
+                    'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done',
+                           result='done\nTEST_TARGETS: src/test/java/demo/FooTest.java')
+        critic = reserve_critic_task(task)
+
+        # Python coverage is NOT installed
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'gradle'}})
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['src/test/java/demo/FooTest.java'])
+
+        java_calls = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            java_calls.append(1)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/main/java/demo/Foo.java',
+                                    'name': 'bar', 'line_start': 1, 'line_end': 9,
+                                    'covered_branches': [{'from': 2, 'to': 3}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+
+        verdict = facade.run_coverage_gate(critic['id'], task, 'proj', str(tmp_path))
+
+        # Must NOT be the python-unavailable fail-open path
+        assert verdict.get('warn') is None or 'coverage 套件未安裝' not in verdict.get('warn', ''), (
+            "C5: gate took the python-coverage-unavailable fail-open path for a Java project. "
+            "Backend selection must happen before _coverage_available()."
+        )
+        # Must have routed to java backend
+        assert len(java_calls) == 1, (
+            "C5: java backend was never called; gate incorrectly fail-opened on "
+            "python coverage unavailability for a Java project."
+        )
+        assert verdict['verdict'] == 'proceed'
+
+    def test_python_unavailable_still_fail_opens_for_python_stack(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Python stack with coverage unavailable keeps existing fail-open behavior."""
+        import servers.coverage as cov
+        import servers.project as project
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test_x.py')
+        critic = reserve_critic_task(task)
+
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        verdict = facade.run_coverage_gate(critic['id'], task, 'proj', str(tmp_path))
+        # Python stack + coverage unavailable → fail-open with warning (existing behavior)
+        assert verdict['verdict'] == 'proceed'
+        assert verdict.get('warn') and '⚠️' in verdict['warn']
+
+
+# ── C4: Java gate must scope test run to derived test-class filters ────────────
+
+
+class TestC4JavaTestFilters:
+    """C4: measure_branch_coverage_java must receive non-empty test_filters
+    derived from the executor's reported test files, to prevent unrelated
+    tests from covering the target branch (false green).
+    """
+
+    def _setup_java_task(self, tmp_path, test_file_line):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        targets = [{'file_path': 'src/main/java/demo/Foo.java', 'name': 'bar',
+                    'line_start': 1, 'line_end': 9}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result=f'done\n{test_file_line}')
+        critic = reserve_critic_task(task)
+        return task, critic['id'], targets
+
+    def test_java_test_filters_derived_as_fq_class_names(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Given a derived Java test file path, assert measure_branch_coverage_java
+        is called with a non-empty test_filters list of fully-qualified class names."""
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+
+        task, critic_id, targets = self._setup_java_task(
+            tmp_path,
+            'TEST_TARGETS: src/test/java/demo/FooTest.java'
+        )
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'gradle'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['src/test/java/demo/FooTest.java'])
+
+        captured_filters = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            captured_filters.extend(kwargs.get('test_filters') or [])
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/main/java/demo/Foo.java',
+                                    'name': 'bar', 'line_start': 1, 'line_end': 9,
+                                    'covered_branches': [{'from': 2, 'to': 3}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+        assert len(captured_filters) > 0, (
+            "C4: measure_branch_coverage_java was called without test_filters; "
+            "this allows unrelated tests to cover the branch (false green)."
+        )
+        # The filter must be the FQ class name, not a file path
+        assert 'demo.FooTest' in captured_filters, (
+            f"C4: expected 'demo.FooTest' in test_filters, got {captured_filters}"
+        )
+
+    def test_java_fq_classname_conversion_various_paths(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Various Java/Kotlin test file paths must convert to correct FQ class names."""
+        import servers.coverage as cov
+        import servers.coverage_java as cov_java
+        import servers.project as project
+        import servers.facade as facade
+
+        # Test multiple test files at once
+        task, critic_id, targets = self._setup_java_task(
+            tmp_path,
+            'TEST_TARGETS: src/test/java/com/example/BarTest.java, '
+            'src/test/kotlin/com/example/BazSpec.kt'
+        )
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'gradle'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: [
+                                'src/test/java/com/example/BarTest.java',
+                                'src/test/kotlin/com/example/BazSpec.kt',
+                            ])
+
+        captured_filters = []
+
+        def fake_java(project_path, test_targets, coverage_targets, **kwargs):
+            captured_filters.extend(kwargs.get('test_filters') or [])
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/main/java/demo/Foo.java',
+                                    'name': 'bar', 'line_start': 1, 'line_end': 9,
+                                    'covered_branches': [{'from': 2, 'to': 3}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_java, 'measure_branch_coverage_java', fake_java)
+
+        facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert 'com.example.BarTest' in captured_filters
+        assert 'com.example.BazSpec' in captured_filters
