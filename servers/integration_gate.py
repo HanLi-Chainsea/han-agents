@@ -167,10 +167,14 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
 
     # C7: passed requires executed-and-passed tests (total - skipped > 0)
     executed = total - skipped
-    passed = (failures == 0) and (errors == 0) and (executed > 0)
+    # C-d hard gate: ANY parse error (unreadable file OR malformed suite) makes
+    # the entire result passed=False.  A mixed valid+corrupt batch is never trusted
+    # because the corrupt file might have hidden the real failures.
+    clean_run = (failures == 0) and (errors == 0) and (executed > 0) and (not parse_errors)
+    passed = clean_run
     error_msg = None
     if parse_errors:
-        error_msg = "Parse warnings: " + "; ".join(parse_errors)
+        error_msg = "Parse errors (hard gate): " + "; ".join(parse_errors)
     return {
         "ran": True,
         "total": total,
@@ -615,11 +619,16 @@ def _run_java(
 
     # C7b: Delete stale test-results before running Gradle so an UP-TO-DATE
     # or NO-SOURCE Gradle run cannot be scored off a previous run's XML.
+    # Major fix: delete failure is fail-closed — stale XML may hide real failures.
     if os.path.isdir(xml_dir):
         try:
             shutil.rmtree(xml_dir)
-        except OSError:
-            pass  # best-effort; if removal fails, proceed — fresh XML must appear
+        except OSError as _del_err:
+            return _failed(
+                f"Cannot delete stale test-results dir {xml_dir}: {_del_err} "
+                f"— aborting to prevent scoring off stale XML (fail-closed)",
+                evidence={"project_path": project_path, "xml_dir": xml_dir},
+            )
 
     evidence = {
         "command": " ".join(cmd),
@@ -848,6 +857,8 @@ def _classify_boundary_l3(
         }]
 
         if backend == 'java':
+            # ponytail: L3 re-runs coverage per boundary without test_filters
+            # (L3 is ADVISORY only — never changes the verdict).
             res = cov_java.measure_branch_coverage_java(
                 project_path, test_files, coverage_target)
         else:

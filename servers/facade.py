@@ -1919,6 +1919,13 @@ def run_coverage_gate(critic_task_id: str,
         # for this target (not the full suite) — prevents false-green coverage
         # from unrelated tests that happen to exercise the same branches.
         java_test_filters = _derive_java_test_filters(test_targets)
+        # Major fix: empty java_test_filters with test_targets present → reject.
+        # Cannot scope Gradle run → cannot trust coverage → fail closed.
+        if test_targets and not java_test_filters:
+            return _gate_reject(critic_task_id, original_task_id, [
+                '分支覆蓋率 gate (Java)：無法從測試檔路徑推導 FQ class 名稱，'
+                '無法限縮 Gradle 執行範圍（fail-closed）。'
+                '請確認測試檔路徑含 src/test/java/ 或 src/test/kotlin/ 片段。'])
         res = cov_java.measure_branch_coverage_java(
             project_path, test_targets, coverage_targets,
             test_filters=java_test_filters if java_test_filters else None)
@@ -2004,6 +2011,13 @@ def run_integration_gate(critic_task_id: str,
         return _gate_reject(critic_task_id, original_task_id, [
             '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
 
+    # C-b fix: boundary extraction error flag (set by recipe when boundaries_for_target
+    # raised an exception) → fail-closed reject so Code Graph failure does not masquerade
+    # as "zero boundaries" and silently disable L2.
+    if metadata.get('boundaries_error'):
+        return _gate_reject(critic_task_id, original_task_id, [
+            '邊界抽取失敗（Code Graph 不完整？請先 /han:sync），無法驗證整合邊界。'])
+
     stack = metadata.get('stack') or 'python'
 
     # D3 C1 fix: derive test files from executor result marker first;
@@ -2013,31 +2027,49 @@ def run_integration_gate(critic_task_id: str,
     if not test_files:
         test_files = metadata.get('test_files') or []
 
-    # C1 fail-closed: when boundaries are present (L2 needed), we MUST have test files
-    # to scan for mocks.  Without test files we cannot verify the executor did not mock
-    # boundary collaborators → unverifiable → reject.
-    # Exception: empty boundaries list → L2 is trivially skipped; allow no test files
-    # (L1 will run the full suite or be monkeypatched in tests).
-    if boundaries and not test_files:
+    # C-a fix: ANY integration task (key present) MUST have derived test files.
+    # Derive BEFORE branching on empty/non-empty boundaries so even empty-boundary
+    # tasks get scoped L1 (no full-suite run).
+    # Without test files we cannot scope L1 nor verify L2 → reject.
+    if not test_files:
         return _gate_reject(critic_task_id, original_task_id, [
-            '整合測試 gate：無法取得測試檔路徑。'
+            '整合測試 gate：無法取得測試檔路徑（整合任務必須提供 TEST_TARGETS:）。'
             '請在回報中以獨立一行 '
             '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，'
             'gate 才能執行並驗證無 mock 邊界。'])
+
+    # ── C-c: Normalize stack via select_backend (handles junit/gradle/maven → 'java')
+    # This prevents 'junit' stacks from routing to run_tests with an unknown stack value.
+    # Pass stack as BOTH test_tool and primary_language so direct values like
+    # 'python'/'java' (stored by recipes) also resolve correctly.
+    from servers import coverage_java as _cov_java
+    _normalized_stack = _cov_java.select_backend(
+        {'test_tool': stack, 'primary_language': stack})
+    if _normalized_stack == 'unknown':
+        return _gate_reject(critic_task_id, original_task_id, [
+            f'Integration gate: unrecognized stack {stack!r} — '
+            f'cannot normalize to java/python (fail-closed).'])
 
     # ── L1: Run tests — hard gate ──────────────────────────────────────────────
     # Scoped to derived test files (when available) so we run exactly what the
     # executor wrote.  Java stack: convert file paths to FQ class names for
     # --tests filtering.  Python stack: pass file paths as py_test_files.
     # Runs even when boundaries is an empty list.
-    stack_lower = stack.lower()
-    if any(s in stack_lower for s in ('java', 'gradle', 'maven')):
+    if _normalized_stack == 'java':
         java_filters = [_java_test_file_to_fq_classname(tf) for tf in test_files
                         if tf]
-        l1 = ig.run_tests(project_path, stack,
+        # Major fix: empty java_filters with test_files present → reject (cannot scope)
+        # ponytail: multi-module gradle_module not derived (runs root module)
+        if test_files and not java_filters:
+            return _gate_reject(critic_task_id, original_task_id, [
+                'Integration gate L1 (Java): 無法從 test_files 推導 FQ class 名稱，'
+                '無法限縮 Gradle 執行範圍（fail-closed）。'
+                '請確認測試檔路徑含 src/test/java/ 或 src/test/kotlin/ 片段。'])
+        # ponytail: multi-module gradle_module not derived (runs root module).
+        l1 = ig.run_tests(project_path, 'java',
                           test_filters=java_filters if java_filters else None)
     else:
-        l1 = ig.run_tests(project_path, stack,
+        l1 = ig.run_tests(project_path, 'python',
                           py_test_files=test_files if test_files else None)
 
     if not l1.get('passed'):
@@ -2086,6 +2118,7 @@ def run_integration_gate(critic_task_id: str,
 
     # ── L3: Branch coverage per boundary — advisory only ──────────────────────
     # Enrich each boundary with a label; verdict is never changed by L3.
+    # ponytail: L3 is ADVISORY; it never changes the verdict.
     boundaries_with_labels = []
 
     for b in boundaries:

@@ -971,13 +971,17 @@ class TestStackDispatch:
         import servers.facade as facade
 
         targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
-        task, critic_id = self._setup_done_task(targets, 'done\nTEST_TARGETS: test_x.py')
+        # Use a proper Java test path so _derive_java_test_filters produces FQ class name
+        java_test_path = 'src/test/java/demo/FooTest.java'
+        task, critic_id = self._setup_done_task(
+            targets, f'done\nTEST_TARGETS: {java_test_path}')
 
         # Patch ensure_project to return a java tech stack
         monkeypatch.setattr(project, 'ensure_project',
                             lambda *a, **k: {'tech_stack': {'test_tool': 'gradle'}})
         monkeypatch.setattr(cov, '_coverage_available', lambda: True)
-        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test_x.py'])
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: [java_test_path])
 
         java_calls = []
         python_calls = []

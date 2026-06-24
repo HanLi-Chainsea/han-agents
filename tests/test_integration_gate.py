@@ -159,21 +159,27 @@ class TestParseJunitResults:
         assert res["passed"] is False  # total==0 prevents passed
 
     def test_mixed_valid_and_corrupt_files_surfaces_warning(self, tmp_path):
-        """Valid + corrupt file: passed=True (valid suite clean) but error warns of bad file."""
+        """C-d fix: Valid + corrupt file → passed=False (hard gate).
+
+        Previously asserted passed=True when one valid suite coexisted with a bad
+        file.  C-d mandates that ANY parse error makes the whole result passed=False
+        (the corrupt file could have hidden real failures — cannot trust the batch).
+        """
         # Valid XML with clean result
         p_valid = _write_xml(tmp_path, "valid.xml", """\
             <?xml version="1.0"?>
             <testsuite name="Clean" tests="2" failures="0" errors="0" skipped="0"/>
         """)
-        # Non-existent file
+        # Non-existent file — a parse error
         p_bad = str(tmp_path / "nonexistent.xml")
 
         from servers.integration_gate import parse_junit_results
         res = parse_junit_results([p_valid, p_bad])
 
-        # Valid suite is clean, so passed should be True
-        assert res["passed"] is True
-        # But we should have a warning about the bad file
+        # C-d hard gate: ANY parse error → passed=False even when a valid suite exists
+        assert res["passed"] is False, (
+            f"C-d: mixed valid+corrupt must be passed=False (hard gate), got: {res}")
+        # Error message must mention the bad file
         assert res["error"] is not None
         assert "nonexistent.xml" in res["error"]
 
@@ -663,8 +669,8 @@ class TestRunIntegrationGate:
                        'callee_file': 'repo.java', 'edge': 'injects'}]
         task, critic_id = self._setup_integration_task(
             {'integration_boundaries': boundaries,
-             'test_files': ['OrderServiceTest.java'],
-             'stack': 'java'})
+             'test_files': ['OrderServiceTest.py'],
+             'stack': 'python'})
 
         monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
             'ran': True, 'passed': True, 'total': 5,
@@ -679,8 +685,8 @@ class TestRunIntegrationGate:
         import servers.coverage as cov
         monkeypatch.setattr(cov, '_coverage_available', lambda: False)
 
-        test_file = tmp_path / 'OrderServiceTest.java'
-        test_file.write_text('@Autowired\nOrderRepository repo;\n')
+        test_file = tmp_path / 'OrderServiceTest.py'
+        test_file.write_text('def test_it(): pass\n')
 
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'proceed', \
@@ -736,8 +742,8 @@ class TestRunIntegrationGate:
         ]
         task, critic_id = self._setup_integration_task(
             {'integration_boundaries': boundaries,
-             'test_files': ['OrderServiceTest.java'],
-             'stack': 'java'})
+             'test_files': ['OrderServiceTest.py'],
+             'stack': 'python'})
 
         # L1 passes
         monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
@@ -786,8 +792,8 @@ class TestRunIntegrationGate:
         monkeypatch.setattr(cov, '_coverage_available', lambda: True)
         monkeypatch.setattr(cov, 'measure_branch_coverage', fake_measure)
 
-        test_file = tmp_path / 'OrderServiceTest.java'
-        test_file.write_text('@Autowired\nOrderRepository repo;\n')
+        test_file = tmp_path / 'OrderServiceTest.py'
+        test_file.write_text('def test_it(): pass\n')
 
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
 
@@ -1305,12 +1311,24 @@ class TestC2EmptyBoundariesPolicy:
         assert called['n'] == 0, "run_tests must NOT be called when key is absent"
 
     def test_present_empty_list_l1_pass_proceeds(self, mock_db_path, tmp_path, monkeypatch):
-        """integration_boundaries KEY PRESENT + empty list + L1 pass → proceed."""
+        """integration_boundaries KEY PRESENT + empty list + L1 pass → proceed.
+
+        C-a fix: test files must now be provided (TEST_TARGETS marker in result).
+        Empty-boundary tasks also require test files to scope L1.
+        """
         import servers.integration_gate as ig
         import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        # Create a test file on disk so derive_integration_test_files can find it
+        test_file = tmp_path / "tests" / "test_integration.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
 
         task, critic_id = self._make_task(
             {'integration_boundaries': [], 'stack': 'python'})
+        # Provide TEST_TARGETS marker in executor result so gate can derive test files
+        update_task_status(task, 'done', result='TEST_TARGETS: tests/test_integration.py\nDone.')
 
         monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
             'ran': True, 'passed': True, 'total': 2,
@@ -1318,18 +1336,27 @@ class TestC2EmptyBoundariesPolicy:
 
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] == 'proceed', (
-            f"Empty boundaries + L1 pass → proceed, got {verdict['verdict']}")
+            f"Empty boundaries + L1 pass + test files → proceed, got {verdict['verdict']}")
 
     def test_present_empty_list_l1_fail_rejects(self, mock_db_path, tmp_path, monkeypatch):
         """C2 core fix: integration_boundaries KEY PRESENT + empty list + L1 FAIL → rejected.
 
         Previously this proceeded (false-green hole).  Now L1 must be enforced.
+        C-a fix: test files must also be present (integration task requires TEST_TARGETS).
         """
         import servers.integration_gate as ig
         import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        # Create a test file on disk so derive_integration_test_files can find it
+        test_file = tmp_path / "tests" / "test_integration.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
 
         task, critic_id = self._make_task(
             {'integration_boundaries': [], 'stack': 'python'})
+        # Provide TEST_TARGETS marker in executor result so gate can derive test files
+        update_task_status(task, 'done', result='TEST_TARGETS: tests/test_integration.py\nDone.')
 
         # L1 fails — tests did not pass
         monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
@@ -1338,7 +1365,7 @@ class TestC2EmptyBoundariesPolicy:
 
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] in ('rejected', 'blocked'), (
-            f"C2 fix: empty boundaries + L1 fail must reject, got {verdict['verdict']}")
+            f"C2 fix: empty boundaries + test files + L1 fail must reject, got {verdict['verdict']}")
 
 
 # ---------------------------------------------------------------------------
@@ -1670,3 +1697,367 @@ class TestL2ScancesDerivedTestFiles:
         wm = get_working_memory(task, 'critic_suggestions')
         assert wm and 'OrderRepository' in wm, (
             f"Rejection must name the mocked collaborator, got: {wm!r}")
+
+
+# ---------------------------------------------------------------------------
+# C-a: Empty boundaries + no TEST_TARGETS → rejected (new TDD test)
+# ---------------------------------------------------------------------------
+
+class TestCaEmptyBoundariesRequiresTestFiles:
+    """C-a: ANY integration task (key present) must have derived test files.
+    Even with empty boundaries, gate must reject if no TEST_TARGETS marker.
+    """
+
+    def _make_empty_boundary_task(self, result_text='done (no marker)'):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story,
+                              description='integration test write',
+                              requires_validation=True,
+                              metadata={'integration_boundaries': [], 'stack': 'python'})
+        update_task_status(task, 'done', result=result_text)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_empty_boundaries_no_test_targets_marker_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """C-a regression: empty boundaries + result has no TEST_TARGETS marker
+        + no metadata.test_files → verdict MUST be 'rejected', not 'proceed'.
+
+        Currently (before fix) this would wrongly proceed.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_empty_boundary_task(
+            result_text='All integration tests done (no marker).')
+
+        # run_tests must NOT be called — gate should reject before L1
+        called = {'l1': False}
+        def should_not_reach(*a, **kw):
+            called['l1'] = True
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_reach)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"C-a: empty boundaries + no TEST_TARGETS must reject, "
+            f"got {verdict['verdict']!r}")
+        assert not called['l1'], (
+            "run_tests must NOT be called when no test files can be derived")
+
+        # Rejection message must mention TEST_TARGETS
+        from servers.memory import get_working_memory
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and 'TEST_TARGETS' in wm, (
+            f"Rejection context must mention TEST_TARGETS, got: {wm!r}")
+
+
+# ---------------------------------------------------------------------------
+# C-b: boundaries_error flag → rejected (TDD)
+# ---------------------------------------------------------------------------
+
+class TestCbBoundariesExtractionError:
+    """C-b: boundaries_error=True in metadata → fail-closed reject.
+    Clean empty boundaries (no flag) + L1 pass → proceed.
+    """
+
+    def _make_task_with_meta(self, metadata, result_text='done'):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='int test',
+                              requires_validation=True, metadata=metadata)
+        update_task_status(task, 'done', result=result_text)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_boundaries_error_flag_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """C-b: metadata with boundaries_error=True → verdict rejected."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_task_with_meta(
+            {'integration_boundaries': [], 'stack': 'python', 'boundaries_error': True})
+
+        # run_tests should NOT be called (gate should reject before L1)
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"C-b: boundaries_error=True must reject, got {verdict['verdict']!r}")
+        assert called['n'] == 0, "run_tests must not be called when boundaries_error=True"
+
+    def test_clean_empty_boundaries_no_error_flag_l1_pass_proceeds(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """C-b: empty boundaries WITHOUT boundaries_error flag + L1 pass → proceed."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        # Create a test file on disk so C-a test-file check passes
+        test_file = tmp_path / "tests" / "test_service.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
+
+        task, critic_id = self._make_task_with_meta(
+            {'integration_boundaries': [], 'stack': 'python'},
+            result_text='TEST_TARGETS: tests/test_service.py\nDone.')
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 1,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed', (
+            f"C-b: clean empty boundaries (no error flag) + L1 pass → proceed, "
+            f"got {verdict['verdict']!r}")
+
+    def test_recipe_records_boundaries_error_on_exception(self, mock_db_path, monkeypatch):
+        """C-b: recipe_integration_tests records boundaries_error=True in metadata
+        when boundaries_for_target raises an exception."""
+        import servers.project as project_mod
+        import servers.code_graph as cg
+        import servers.integration_gate as ig
+
+        fake_node = {
+            'id': 'n1', 'kind': 'file',
+            'file_path': 'servers/foo.py',
+            'name': 'foo.py',
+        }
+        monkeypatch.setattr(cg, 'get_code_nodes',
+                            lambda project, kind=None, file_path=None,
+                                   limit=100, offset=0: [fake_node])
+        monkeypatch.setattr(project_mod, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        # boundaries_for_target raises — simulating Code Graph failure
+        monkeypatch.setattr(ig, 'boundaries_for_target',
+                            lambda project, files: (_ for _ in ()).throw(
+                                RuntimeError('Code Graph unavailable')))
+
+        import servers.tasks as tasks_mod
+        captured = {}
+        real_create_subtask = tasks_mod.create_subtask
+
+        def capturing_create_subtask(parent_id, description, **kwargs):
+            tid = real_create_subtask(parent_id, description, **kwargs)
+            if kwargs.get('assigned_agent') == 'executor':
+                captured['metadata'] = kwargs.get('metadata')
+            return tid
+
+        monkeypatch.setattr(tasks_mod, 'create_subtask', capturing_create_subtask)
+
+        from servers.recipes import recipe_integration_tests
+        res = recipe_integration_tests('proj', '/tmp/proj', max_tasks=1)
+        assert res['task_count'] == 1
+
+        meta = captured.get('metadata') or {}
+        assert meta.get('boundaries_error') is True, (
+            f"C-b: boundaries_error must be True when extraction raises, got: {meta!r}")
+        assert meta.get('integration_boundaries') == [], (
+            f"C-b: boundaries should still be [] on error, got: {meta!r}")
+
+
+# ---------------------------------------------------------------------------
+# C-c: junit stack normalization (TDD)
+# ---------------------------------------------------------------------------
+
+class TestCcJunitStackNormalization:
+    """C-c: stack='junit' must normalize to 'java' before run_tests is called."""
+
+    def _make_task_with_junit_stack(self, tmp_path):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        # Create a test file with proper Java path so C-a + Major pass
+        test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'FooIT.java'
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text('@SpringBootTest\npublic class FooIT {}\n')
+
+        boundaries = [{'caller': 'Svc', 'callee': 'Repo',
+                       'callee_file': 'Repo.java', 'edge': 'injects'}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='junit integration test',
+                              requires_validation=True,
+                              metadata={
+                                  'integration_boundaries': boundaries,
+                                  'stack': 'junit',  # <-- key: non-standard stack name
+                              })
+        # Executor result with TEST_TARGETS pointing to the created file
+        result_text = (
+            'Integration tests done.\n'
+            'TEST_TARGETS: src/test/java/com/example/FooIT.java\n'
+        )
+        update_task_status(task, 'done', result=result_text)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_junit_stack_routes_to_java_path(self, mock_db_path, tmp_path, monkeypatch):
+        """C-c: stack='junit' must be normalized to 'java' by select_backend,
+        so run_tests receives 'java' (not 'junit' which would cause unknown-stack error)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_task_with_junit_stack(tmp_path)
+
+        # Capture the stack argument passed to run_tests
+        received_stack = {}
+
+        def capturing_run_tests(project_path, stack, **kwargs):
+            received_stack['stack'] = stack
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+
+        monkeypatch.setattr(ig, 'run_tests', capturing_run_tests)
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: [])
+
+        # make test file readable for L2
+        test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'FooIT.java'
+        # already created in _make_task_with_junit_stack
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert received_stack.get('stack') == 'java', (
+            f"C-c: stack='junit' must normalize to 'java' before run_tests, "
+            f"got {received_stack.get('stack')!r}")
+
+
+# ---------------------------------------------------------------------------
+# C-d: one valid + one garbage file → passed=False (new explicit test)
+# ---------------------------------------------------------------------------
+
+class TestCdMixedValidCorruptFailed:
+    """C-d: explicit test for the hard-gate mixed case."""
+
+    def test_one_valid_one_garbage_file_passed_false(self, tmp_path):
+        """C-d: one valid <testsuite failures=0> + one garbage file → passed=False."""
+        from servers.integration_gate import parse_junit_results
+
+        # Write a clean valid testsuite
+        p_valid = tmp_path / "valid.xml"
+        p_valid.write_text(
+            '<?xml version="1.0"?>\n'
+            '<testsuite name="Clean" tests="3" failures="0" errors="0" skipped="0"/>\n'
+        )
+        # Write a garbage (unparseable) file
+        p_garbage = tmp_path / "garbage.xml"
+        p_garbage.write_text("not xml at all!!!")
+
+        res = parse_junit_results([str(p_valid), str(p_garbage)])
+
+        assert res["passed"] is False, (
+            f"C-d: valid+garbage must be passed=False (hard gate), got: {res}")
+        assert res["error"] is not None, "C-d: error must describe the garbage file"
+
+
+# ---------------------------------------------------------------------------
+# Major: stale-XML delete failure → fail closed (TDD)
+# ---------------------------------------------------------------------------
+
+class TestMajorStaleXmlDeleteFailure:
+    """Major: if deleting the stale test-results dir raises, return ran=False, passed=False."""
+
+    def test_stale_xml_delete_failure_fails_closed(self, tmp_path, monkeypatch):
+        """If shutil.rmtree raises when clearing stale XML, the runner must
+        return ran=False, passed=False (not continue and score off stale XML)."""
+        import shutil
+        import servers.integration_gate as ig
+
+        # Create fake gradlew
+        gradlew = tmp_path / "gradlew"
+        gradlew.write_text("#!/bin/sh\n")
+        gradlew.chmod(0o755)
+
+        # Create a stale XML directory so the delete path is hit
+        xml_dir = tmp_path / "build" / "test-results" / "test"
+        xml_dir.mkdir(parents=True)
+        (xml_dir / "STALE.xml").write_text(
+            '<?xml version="1.0"?>\n'
+            '<testsuite name="Stale" tests="3" failures="0" errors="0" skipped="0"/>\n'
+        )
+
+        # Monkeypatch shutil.rmtree to raise OSError
+        original_rmtree = shutil.rmtree
+
+        def failing_rmtree(path, *args, **kwargs):
+            if str(xml_dir) in str(path):
+                raise OSError(f"Permission denied: cannot delete {path}")
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, 'rmtree', failing_rmtree)
+
+        result = ig._run_java(str(tmp_path))
+
+        assert result.get('ran') is False, (
+            f"Major: delete failure must set ran=False, got: {result}")
+        assert result.get('passed') is False, (
+            f"Major: delete failure must set passed=False, got: {result}")
+        assert result.get('error') and ('stale' in result['error'].lower()
+                                         or 'delete' in result['error'].lower()
+                                         or 'Cannot delete' in result['error']), (
+            f"Major: error must mention delete failure, got: {result.get('error')!r}")
+
+
+# ---------------------------------------------------------------------------
+# Major: empty Java test_filters → rejected (TDD)
+# ---------------------------------------------------------------------------
+
+class TestMajorEmptyJavaTestFilters:
+    """Major: java task whose derived test files yield zero FQ class filters → rejected."""
+
+    def _make_java_task_bad_paths(self):
+        """Create a java integration task with test_files that won't produce FQ names."""
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        boundaries = [{'caller': 'Svc', 'callee': 'Repo',
+                       'callee_file': 'Repo.java', 'edge': 'calls'}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='java integration test',
+                              requires_validation=True,
+                              metadata={
+                                  'integration_boundaries': boundaries,
+                                  # test_files path lacks src/test/java/ — no FQ name derivable
+                                  'test_files': ['FooTest.java'],
+                                  'stack': 'java',
+                              })
+        # result has no TEST_TARGETS marker either
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_java_task_no_fq_filters_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """Major: java integration task whose test files yield empty FQ class filters
+        must be rejected (not run the full Gradle suite)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_java_task_bad_paths()
+
+        # run_tests must NOT be called — gate should reject
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"Major: empty java FQ filters must reject, got {verdict['verdict']!r}")

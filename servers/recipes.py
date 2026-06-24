@@ -353,10 +353,14 @@ def recipe_integration_tests(
         if task_count >= max_tasks:
             break
         module_files = by_module[module]
+        boundaries_error = False
         try:
             boundaries = boundaries_for_target(project_name, module_files)
         except Exception:
+            # C-b fix: record error distinctly so the gate knows extraction failed
+            # (vs. genuinely zero boundaries), preventing silent L2 disable.
             boundaries = []
+            boundaries_error = True
         story_id = create_task(
             project=project_name,
             description=f"Integration tests for module {module}",
@@ -371,6 +375,8 @@ def recipe_integration_tests(
                 'integration_boundaries': boundaries,
                 'test_files': [],
                 'stack': test_tool,
+                # C-b: flag extraction failure so the gate can reject
+                **({'boundaries_error': True} if boundaries_error else {}),
             })
         task_count += 1
         built_modules.append(module)
