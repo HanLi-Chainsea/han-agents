@@ -1499,6 +1499,75 @@ class TestL2AdditionalMockPatterns:
         assert result == [], f"Real usage must not be flagged: {result}"
 
 
+    def test_java_stacked_annotations_before_field(self):
+        """I1 fix: @MockBean followed by @Qualifier annotation, then field.
+
+        Multiple annotations stacked before the field declaration should be detected.
+        @MockBean
+        @Qualifier("orders")
+        private OrderRepository repo;
+        → should flag OrderRepository as mocked
+        """
+        source = textwrap.dedent("""            @SpringBootTest
+            class OrderServiceTest {
+                @MockBean
+                @Qualifier("orders")
+                private OrderRepository repo;
+
+                @Autowired
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository", "OrderService"], "java")
+        assert result == ["OrderRepository"], (
+            f"I1: Stacked annotations before field should be detected, got {result}")
+
+    def test_java_stacked_annotations_guard_unrelated_fields(self):
+        """I1 guard: Unrelated @MockBean far above plain field should not cross-match.
+
+        Ensure that a @MockBean for SomeOther far above does not incorrectly match
+        a plain OrderRepository field several lines later.
+        """
+        source = textwrap.dedent("""            @SpringBootTest
+            class T {
+                @MockBean
+                private SomeOther other;
+
+                // Some lines in between
+
+                private OrderRepository repo;  // plain field, no @Mock annotation
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        # OrderRepository should NOT be flagged since it has no @Mock annotation
+        assert result == [], (
+            f"I1 guard: Unrelated fields should not cross-match, got {result}")
+
+    def test_python_aliased_patch_object(self):
+        """I2 fix: patch.object with aliased patch (e.g., 'p').
+
+        from unittest.mock import patch as p
+        with p.object(OrderRepository, "find_all"):
+            ...
+        → should flag OrderRepository as mocked
+        """
+        source = textwrap.dedent("""            from unittest.mock import patch as p
+
+            def test_it():
+                with p.object(OrderRepository, "find_all") as mock:
+                    svc = OrderService(OrderRepository)
+                    result = svc.process()
+                    assert result is not None
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository", "OrderService"], "python")
+        assert "OrderRepository" in result, (
+            f"I2: Aliased p.object should detect OrderRepository, got {result}")
+        assert "OrderService" not in result, (
+            f"I2: OrderService should not be flagged, got {result}")
+
 # ---------------------------------------------------------------------------
 # D3: derive_integration_test_files — marker-based test file derivation (TDD)
 # ---------------------------------------------------------------------------

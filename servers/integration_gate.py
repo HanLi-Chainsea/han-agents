@@ -351,15 +351,20 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
     for collab in collaborators:
         simple = _simple_name(collab)
 
-        # ---- Pattern 1: annotation + field declaration ----
+        # ---- Pattern 1: annotation + field declaration (with stacked annotations) ----
         # Match @MockBean / @MockitoBean / @Mock / @SpyBean / @MockitoSpyBean
-        # (but NOT @InjectMocks) followed by optional whitespace/lines then a
-        # field whose type is the simple name.  We allow up to ~3 lines between
-        # annotation and field.
+        # (but NOT @InjectMocks) followed by optional annotations/modifiers then a
+        # field whose type is the simple name.  Allows stacked annotations like:
+        #   @MockBean
+        #   @Qualifier("orders")
+        #   private OrderRepository repo;
+        # Pattern stops at first semicolon (field boundary) to avoid cross-matching.
         annotation_pattern = re.compile(
             r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)\b"  # annotation
-            r"(?:[^@\n]*\n){0,3}"                                       # up to 3 intervening lines
-            r"[^\n]*\b" + re.escape(simple) + r"\b",                   # type name in field line
+            r"(?:\n\s*@\w+[^\n;]*)*"                                     # annotation lines (no semicolon)
+            r"(?:\n\s*(?:public|private|protected|static|final|transient|volatile)\s+[^\n;]*)?"  # optional modifiers
+            r"\n\s*(?:(?:public|private|protected|static|final)\s+)*[^\n]*\b"
+            + re.escape(simple) + r"\b[^\n]*;",                          # type name before semicolon (field end)
             re.MULTILINE,
         )
         if annotation_pattern.search(test_source):
@@ -558,6 +563,24 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
         if patch_object_second_arg_pattern.search(test_source):
             mocked.add(collab)
             continue
+
+        # I2 fix: Also check aliased patch.object calls: p.object(C, ...) where p is an alias
+        # for patch (e.g., from unittest.mock import patch as p)
+        if _patch_aliases:
+            _alias_matched = False
+            for _alias in _patch_aliases:
+                _alias_object_pattern = re.compile(
+                    r"\b" + re.escape(_alias) + r"\.object\s*\(\s*"
+                    r"(?:[A-Za-z0-9_]+\.)*"     # optional module prefix
+                    + re.escape(simple)               # the collaborator simple name
+                    + r"\s*,",                   # followed by a comma
+                )
+                if _alias_object_pattern.search(test_source):
+                    _alias_matched = True
+                    break
+            if _alias_matched:
+                mocked.add(collab)
+                continue
 
         # ---- Pattern 4: create_autospec(C ----
         create_autospec_pattern = re.compile(
