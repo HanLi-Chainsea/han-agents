@@ -153,7 +153,14 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
                     f"Suite '{name}': missing/non-numeric attribute(s): {', '.join(missing)}"
                 )
                 continue  # This suite does not count as clean
-            sk = _int_attr(suite, "skipped")
+            # D5 F2: skipped= must also be strictly numeric; non-numeric is a parse error.
+            sk = _strict_int_attr(suite, "skipped")
+            if sk is None:
+                name = suite.get("name", "<unnamed>")
+                parse_errors.append(
+                    f"Suite '{name}': missing/non-numeric attribute(s): skipped"
+                )
+                continue  # This suite does not count as clean
             total += t
             failures += f
             errors += e
@@ -346,43 +353,57 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
     """Detect Python mock constructs for the given collaborators.
 
     Patterns checked:
-      1. patch('...C') / patch("...C") where C is the simple name or full name
-         appearing as the last segment of the dotted path inside the patch string.
-         This covers @patch(...), mock.patch(...), unittest.mock.patch(...).
-      2. C = MagicMock() / C = Mock() where C is the simple name.
-      3. patch.object(<anything>, 'C') where C is the simple name.
-      4. create_autospec(C  where C is the simple name.
-      5. MagicMock(spec=C  or Mock(spec=C  where C is the simple name.
-      6. monkeypatch.setattr(<anything>, <anything>, C) where C is the simple name
-         (or the third positional arg matches the simple name).
+      1a. patch('...C...') / @patch("...") / mocker.patch("..."):
+          C's simple name appears as a DOTTED PATH SEGMENT anywhere in the quoted
+          target string: (^|.)C(.|$) within the string.  This catches both
+          patch('app.svc.OrderRepository') (final segment) AND
+          patch('app.repo.OrderRepository.find_all') (middle segment — method mock).
+      1b. Full collaborator path literal inside patch string (for FQN collaborators).
+      2.  C = MagicMock() / C = Mock() where C is the simple name.
+      3a. patch.object(C, ...) or mocker.patch.object(C, ...) where C is the
+          FIRST argument (the class/object being patched).  Matches bare name or
+          module-qualified name (pkg.C).
+      3b. patch.object(<anything>, 'C') — original pattern: second arg is string 'C'.
+      4.  create_autospec(C where C is the simple name.
+      5.  MagicMock(spec=C) or Mock(spec=C) where C is the simple name.
+      6a. monkeypatch.setattr(C, ...) / setattr(C, ...) where C is the FIRST arg
+          (the target object/class) — simple name or ends with .C.
+      6b. monkeypatch.setattr(<target>, <attr>, C) — original: third arg is C.
     """
     mocked: set = set()
 
     for collab in collaborators:
         simple = _simple_name(collab)
 
-        # ---- Pattern 1: patch('...C') where the string ends with .C or is C ----
-        # Matches both full dotted path and simple name at end of path.
-        # We look for the collaborator name (full or simple) as the last
-        # segment inside a patch string literal.
-        # e.g.  patch('app.svc.OrderRepository')   → simple name at end
-        #        patch('OrderRepository')            → simple name
-        #        @patch('a.b.OrderRepository')
-
-        patch_pattern = re.compile(
-            r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?patch\s*\(\s*['"]"""
-            r"""(?:[A-Za-z0-9_.]*\.)?"""   # optional dotted prefix
-            + re.escape(simple)             # the simple name
-            + r"""['"]""",                  # closing quote
+        # ---- Pattern 1a: patch('...') where C appears as a DOTTED PATH SEGMENT ----
+        # C's simple name must appear as (^|.)C(.|$) within the quoted string.
+        # This catches: patch('app.repo.OrderRepository.find_all') where C=OrderRepository
+        # as well as the final-segment case patch('app.svc.OrderRepository').
+        # mocker.patch / @patch / patch / mock.patch / unittest.mock.patch all covered.
+        patch_segment_pattern = re.compile(
+            r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?(?:mocker\.)?patch\s*\(\s*['"]"""
+            r"""[A-Za-z0-9_.]*"""             # any dotted prefix (possibly empty)
+            r"""(?:^|(?<=\.))"""             # C starts at string start or after a dot
+            + re.escape(simple)               # the simple name
+            + r"""(?=\.|['"])""",            # followed by a dot or closing quote
+            re.VERBOSE,
         )
-        if patch_pattern.search(test_source):
+        # Use a simpler, reliable approach: look for the segment boundary inline
+        patch_segment_pattern2 = re.compile(
+            r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?(?:mocker\.)?patch\s*\(\s*['"]"""
+            r"""(?:[A-Za-z0-9_]+\.)*"""     # zero or more preceding segments
+            + re.escape(simple)               # the simple name
+            + r"""(?:\.[A-Za-z0-9_]+)*"""   # zero or more following segments
+            + r"""['"]""",                    # closing quote
+        )
+        if patch_segment_pattern2.search(test_source):
             mocked.add(collab)
             continue
 
         # Also match the full collaborator path literally inside patch string
         if collab != simple:
             full_patch_pattern = re.compile(
-                r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?patch\s*\(\s*['"]"""
+                r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?(?:mocker\.)?patch\s*\(\s*['"]"""
                 + re.escape(collab)
                 + r"""['"]""",
             )
@@ -398,14 +419,27 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
             mocked.add(collab)
             continue
 
-        # ---- Pattern 3: patch.object(<obj>, 'C') ----
-        # Matches patch.object(anything, 'OrderRepository') or ("OrderRepository")
-        patch_object_pattern = re.compile(
-            r"""\bpatch\.object\s*\([^)]*['"]"""
+        # ---- Pattern 3a: patch.object(C, ...) — first arg is the collaborator class ----
+        # Matches: patch.object(OrderRepository, ...) or patch.object(pkg.OrderRepository, ...)
+        # mocker.patch.object also covered.
+        patch_object_first_arg_pattern = re.compile(
+            r"""\b(?:mocker\.)?patch\.object\s*\(\s*"""
+            r"""(?:[A-Za-z0-9_]+\.)*"""     # optional module prefix (pkg.)
+            + re.escape(simple)               # the collaborator simple name
+            + r"""\s*,""",                   # followed by a comma (more args follow)
+        )
+        if patch_object_first_arg_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 3b: patch.object(<obj>, 'C') — second arg is string 'C' ----
+        # Original pattern: matches patch.object(anything, 'OrderRepository')
+        patch_object_second_arg_pattern = re.compile(
+            r"""\b(?:mocker\.)?patch\.object\s*\([^)]*['"]"""
             + re.escape(simple)
             + r"""['"]""",
         )
-        if patch_object_pattern.search(test_source):
+        if patch_object_second_arg_pattern.search(test_source):
             mocked.add(collab)
             continue
 
@@ -426,13 +460,27 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
             mocked.add(collab)
             continue
 
-        # ---- Pattern 6: monkeypatch.setattr(<target>, <attr>, C) ----
+        # ---- Pattern 6a: monkeypatch.setattr(C, ...) / setattr(C, ...) ----
+        # First argument is C (the target class/object being patched).
+        # Matches: monkeypatch.setattr(OrderRepository, 'attr', val)
+        #          monkeypatch.setattr(pkg.OrderRepository, 'attr', val)
+        monkeypatch_first_arg_pattern = re.compile(
+            r"""\b(?:monkeypatch\.setattr|setattr)\s*\(\s*"""
+            r"""(?:[A-Za-z0-9_]+\.)*"""     # optional module prefix
+            + re.escape(simple)               # the collaborator simple name
+            + r"""\s*,""",                   # followed by a comma
+        )
+        if monkeypatch_first_arg_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 6b: monkeypatch.setattr(<target>, <attr>, C) ----
         # The simple name appears as the third positional argument (the replacement).
-        monkeypatch_pattern = re.compile(
+        monkeypatch_third_arg_pattern = re.compile(
             r"""\bmonkeypatch\.setattr\s*\([^)]*,\s*"""
             + re.escape(simple) + r"""\s*[,)]""",
         )
-        if monkeypatch_pattern.search(test_source):
+        if monkeypatch_third_arg_pattern.search(test_source):
             mocked.add(collab)
 
     return [c for c in collaborators if c in mocked]

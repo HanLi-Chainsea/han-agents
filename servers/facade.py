@@ -2011,6 +2011,20 @@ def run_integration_gate(critic_task_id: str,
         return _gate_reject(critic_task_id, original_task_id, [
             '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
 
+    # D5 F3: Validate each boundary dict has required keys with non-empty values.
+    # A boundary missing 'callee' or 'caller' produces an empty collaborator list,
+    # causing L2 to check nothing → false-green (假綠).  Fail-closed: reject if any
+    # boundary is malformed (missing/empty callee or caller).
+    _required_boundary_fields = ('caller', 'callee')
+    for _b in boundaries:
+        if not isinstance(_b, dict):
+            continue  # already caught above; defensive
+        for _field in _required_boundary_fields:
+            if not _b.get(_field):  # missing or empty string
+                return _gate_reject(critic_task_id, original_task_id, [
+                    f'整合邊界 metadata 欄位不完整：缺少或空白的 {_field!r} 欄位。'
+                    f'每個 boundary 必須包含非空的 caller 與 callee。'])
+
     # C-b fix: boundary extraction error flag (set by recipe when boundaries_for_target
     # raised an exception) → fail-closed reject so Code Graph failure does not masquerade
     # as "zero boundaries" and silently disable L2.
@@ -2056,8 +2070,11 @@ def run_integration_gate(critic_task_id: str,
     # --tests filtering.  Python stack: pass file paths as py_test_files.
     # Runs even when boundaries is an empty list.
     if _normalized_stack == 'java':
-        java_filters = [_java_test_file_to_fq_classname(tf) for tf in test_files
-                        if tf]
+        # D5 test-quality fix: use _derive_java_test_filters (same as coverage gate)
+        # to filter out paths that lack src/test/java/ / src/test/kotlin/.
+        # This matches the coverage gate behavior and makes the empty-filter reject
+        # genuinely exercisable (bare filenames like 'FooTest.java' yield no filters).
+        java_filters = _derive_java_test_filters(test_files)
         # Major fix: empty java_filters with test_files present → reject (cannot scope)
         # ponytail: multi-module gradle_module not derived (runs root module)
         if test_files and not java_filters:

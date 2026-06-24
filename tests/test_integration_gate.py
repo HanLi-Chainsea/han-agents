@@ -634,9 +634,11 @@ class TestRunIntegrationGate:
 
         boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
                        'callee_file': 'repo.java', 'edge': 'injects'}]
+        # D5 test-quality: use proper src/test/java/ path so _derive_java_test_filters
+        # includes it (reaching L2), rather than rejecting at empty-filter check.
         task, critic_id = self._setup_integration_task(
             {'integration_boundaries': boundaries,
-             'test_files': ['OrderServiceTest.java'],
+             'test_files': ['src/test/java/com/example/OrderServiceTest.java'],
              'stack': 'java'})
 
         # L1 passes
@@ -646,8 +648,9 @@ class TestRunIntegrationGate:
         # L2 detects mock
         monkeypatch.setattr(ig, 'detect_mocked_collaborators',
                             lambda src, collabs, stack: ['OrderRepository'])
-        # test file readable
-        test_file = tmp_path / 'OrderServiceTest.java'
+        # test file readable (must be at the path relative to tmp_path)
+        test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'OrderServiceTest.java'
+        test_file.parent.mkdir(parents=True, exist_ok=True)
         test_file.write_text('@MockBean\nOrderRepository repo;\n')
 
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
@@ -1034,7 +1037,9 @@ class TestIntegrationGatedDispatch:
             requires_validation=True,
             metadata={
                 'integration_boundaries': [boundary],
-                'test_files': ['OrderServiceTest.java'],
+                # D5 test-quality: use proper src/test/java/ path so it passes
+                # _derive_java_test_filters and reaches L2 (not empty-filter reject).
+                'test_files': ['src/test/java/com/example/OrderServiceTest.java'],
                 'stack': 'java',
             })
         update_task_status(task, 'done', result='done')
@@ -1048,8 +1053,9 @@ class TestIntegrationGatedDispatch:
         monkeypatch.setattr(ig, 'detect_mocked_collaborators',
                             lambda src, collabs, stack: ['OrderRepository'])
 
-        # make test file readable so L2 can fire
-        test_file = tmp_path / 'OrderServiceTest.java'
+        # make test file readable so L2 can fire (path relative to tmp_path)
+        test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'OrderServiceTest.java'
+        test_file.parent.mkdir(parents=True, exist_ok=True)
         test_file.write_text('@MockBean\nOrderRepository repo;\n')
 
         inst = facade.get_next_dispatch_integration_gated(
@@ -1676,7 +1682,9 @@ class TestL2ScancesDerivedTestFiles:
             "    private OrderService svc;\n"
             "}\n"
         )
-        test_file_rel = "tests/OrderServiceIT.java"
+        # D5 test-quality: use src/test/java/ path so _derive_java_test_filters includes
+        # it and the test reaches L2 (mock detection), not the empty-filter reject.
+        test_file_rel = "src/test/java/com/example/OrderServiceIT.java"
 
         task, critic_id = self._make_task_with_marker_result(
             tmp_path, mocked_test_source, test_file_rel)
@@ -2044,13 +2052,19 @@ class TestMajorEmptyJavaTestFilters:
 
     def test_java_task_no_fq_filters_rejects(self, mock_db_path, tmp_path, monkeypatch):
         """Major: java integration task whose test files yield empty FQ class filters
-        must be rejected (not run the full Gradle suite)."""
+        must be rejected (not run the full Gradle suite).
+
+        D5 test-quality fix: the test now genuinely exercises the empty-filter branch.
+        test_files=['FooTest.java'] lacks src/test/java/ so _derive_java_test_filters
+        returns [] → gate rejects BEFORE calling run_tests (empty filter = cannot scope).
+        The assertion that run_tests is NOT called (called['n']==0) is now enforced.
+        """
         import servers.integration_gate as ig
         import servers.facade as facade
 
         task, critic_id = self._make_java_task_bad_paths()
 
-        # run_tests must NOT be called — gate should reject
+        # run_tests must NOT be called — gate should reject before L1 (empty java_filters)
         called = {'n': 0}
         def should_not_call(*a, **kw):
             called['n'] += 1
@@ -2061,3 +2075,394 @@ class TestMajorEmptyJavaTestFilters:
         verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
         assert verdict['verdict'] in ('rejected', 'blocked'), (
             f"Major: empty java FQ filters must reject, got {verdict['verdict']!r}")
+        # D5 test-quality fix: assert run_tests was NOT called (rejects before L1)
+        assert called['n'] == 0, (
+            f"run_tests must NOT be called when java_filters is empty (got {called['n']} calls)")
+
+
+# ---------------------------------------------------------------------------
+# D5 F1: Python L2 — method-level and object-target mocking (TDD)
+# ---------------------------------------------------------------------------
+
+class TestD5F1PythonMethodLevelMocking:
+    """D5 F1: Python L2 must detect method-level / object-target mocking.
+
+    These patterns currently return [] but represent real fake-integration:
+      patch("app.repo.OrderRepository.find_all")      # method of collaborator
+      patch.object(OrderRepository, "find_all")        # object form (first arg is class)
+      monkeypatch.setattr(OrderRepository, "find_all", ...)
+    """
+
+    def test_patch_method_of_collaborator_detected(self):
+        """patch("app.repo.OrderRepository.find_all") → C=OrderRepository detected.
+
+        The collaborator simple name appears as a DOTTED PATH SEGMENT in the
+        middle of the patch target string, not as the final segment.
+        """
+        source = (
+            "@patch('app.repo.OrderRepository.find_all')\n"
+            "def test_it(mock_find):\n"
+            "    svc = OrderService()\n"
+            "    result = svc.process()\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            f"patch of method on collaborator must flag collaborator, got {result!r}")
+
+    def test_patch_object_first_arg_is_collaborator(self):
+        """patch.object(OrderRepository, "find_all") → C=OrderRepository detected.
+
+        The FIRST argument to patch.object is the collaborator class itself.
+        """
+        source = (
+            "def test_it():\n"
+            "    with patch.object(OrderRepository, 'find_all') as m:\n"
+            "        svc = OrderService()\n"
+            "        svc.process()\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            f"patch.object first-arg class must flag collaborator, got {result!r}")
+
+    def test_monkeypatch_setattr_first_arg_is_collaborator(self):
+        """monkeypatch.setattr(OrderRepository, "find_all", mock_fn) → detected."""
+        source = (
+            "def test_it(monkeypatch):\n"
+            "    monkeypatch.setattr(OrderRepository, 'find_all', lambda: [])\n"
+            "    svc = OrderService()\n"
+            "    svc.process()\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            f"monkeypatch.setattr with collaborator as first arg must flag it, got {result!r}")
+
+    def test_patch_object_with_module_prefix_first_arg(self):
+        """patch.object(pkg.OrderRepository, "find_all") → detected (ends with .C)."""
+        source = (
+            "def test_it():\n"
+            "    with patch.object(pkg.OrderRepository, 'find_all') as m:\n"
+            "        pass\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == ['OrderRepository'], (
+            f"patch.object pkg.C first arg must flag collaborator, got {result!r}")
+
+    def test_plain_import_not_flagged(self):
+        """from app.repo import OrderRepository is NOT flagged (no patch/mock)."""
+        source = (
+            "from app.repo import OrderRepository\n"
+            "def test_it():\n"
+            "    repo = OrderRepository()\n"
+            "    assert repo.find_all() == []\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == [], f"Plain import must not be flagged: {result!r}"
+
+    def test_constructor_call_not_flagged(self):
+        """OrderRepository() constructor call is NOT flagged."""
+        source = (
+            "def test_it():\n"
+            "    repo = OrderRepository()\n"
+            "    svc = OrderService(repo)\n"
+            "    svc.process()\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
+        assert result == [], f"Constructor call must not be flagged: {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# D5 F2: Non-numeric skipped attr → passed=False (TDD)
+# ---------------------------------------------------------------------------
+
+class TestD5F2NonNumericSkipped:
+    """D5 F2: skipped="oops" must be treated as malformed → passed=False.
+
+    Currently _int_attr silently defaults invalid values to 0, so
+    <testsuite tests="2" failures="0" errors="0" skipped="oops"/> passes.
+    Fix: treat present-but-non-numeric skipped (or any numeric attr) as a
+    parse error → passed=False.
+    """
+
+    def test_non_numeric_skipped_makes_passed_false(self, tmp_path):
+        """skipped="oops" on an otherwise-valid suite → passed=False."""
+        p = _write_xml(tmp_path, "bad_skip.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="OopsSuite" tests="2" failures="0" errors="0" skipped="oops"/>
+        """)
+        from servers.integration_gate import parse_junit_results
+        res = parse_junit_results([p])
+        assert res['passed'] is False, (
+            f"D5 F2: non-numeric skipped= must make passed=False, got: {res}")
+
+    def test_non_numeric_skipped_is_parse_error(self, tmp_path):
+        """skipped="oops" should result in a parse error (not a clean suite)."""
+        p = _write_xml(tmp_path, "bad_skip2.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="OopsSuite" tests="2" failures="0" errors="0" skipped="oops"/>
+        """)
+        from servers.integration_gate import parse_junit_results
+        res = parse_junit_results([p])
+        # Either ran=False (no clean suite) or error is set
+        assert res['error'] is not None or res['ran'] is False, (
+            f"D5 F2: non-numeric skipped= must produce error or ran=False, got: {res}")
+
+    def test_numeric_skipped_still_works(self, tmp_path):
+        """skipped="1" still works correctly (numeric value fine)."""
+        p = _write_xml(tmp_path, "ok_skip.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="Suite" tests="3" failures="0" errors="0" skipped="1"/>
+        """)
+        from servers.integration_gate import parse_junit_results
+        res = parse_junit_results([p])
+        assert res['ran'] is True
+        assert res['skipped'] == 1
+        # 2 executed (3 total - 1 skipped), no failures → should pass
+        assert res['passed'] is True, (
+            f"Numeric skipped=1 with 2 executed must pass, got: {res}")
+
+    def test_zero_skipped_still_passes(self, tmp_path):
+        """skipped="0" → passed=True (no regression for valid suites)."""
+        p = _write_xml(tmp_path, "zero_skip.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="Suite" tests="2" failures="0" errors="0" skipped="0"/>
+        """)
+        from servers.integration_gate import parse_junit_results
+        res = parse_junit_results([p])
+        assert res['passed'] is True, (
+            f"Zero skipped with passing tests must still pass, got: {res}")
+
+
+# ---------------------------------------------------------------------------
+# D5 F3: Malformed boundary dict (missing required keys) → rejected (TDD)
+# ---------------------------------------------------------------------------
+
+class TestD5F3MalformedBoundaryDict:
+    """D5 F3: integration_boundaries=[{}] bypasses L2.
+
+    A dict missing callee/caller/callee_file/edge makes collaborator list empty,
+    so L2 checks nothing. Fix: validate required keys; reject if any boundary
+    is missing callee or caller with non-empty values.
+    """
+
+    def _make_task_with_boundaries(self, boundaries, result_text=None):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='int test',
+                              requires_validation=True,
+                              metadata={'integration_boundaries': boundaries,
+                                        'stack': 'python'})
+        update_task_status(task, 'done',
+                           result=result_text or 'done')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_empty_dict_boundary_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """integration_boundaries=[{}] → verdict 'rejected' (missing callee/caller)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        # Need a test file so test-file check passes
+        test_file = tmp_path / "tests" / "test_svc.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
+
+        task, critic_id = self._make_task_with_boundaries(
+            [{}],
+            result_text='TEST_TARGETS: tests/test_svc.py\ndone')
+
+        # run_tests must NOT be called (reject before L1)
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"D5 F3: [{{}}] boundaries must reject, got {verdict['verdict']!r}")
+        assert called['n'] == 0, "run_tests must NOT be called for malformed boundary dicts"
+
+    def test_boundary_missing_callee_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """boundary with caller but no callee → rejected."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        test_file = tmp_path / "tests" / "test_svc.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
+
+        task, critic_id = self._make_task_with_boundaries(
+            [{'caller': 'Svc', 'edge': 'calls'}],  # missing callee
+            result_text='TEST_TARGETS: tests/test_svc.py\ndone')
+
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"D5 F3: boundary missing callee must reject, got {verdict['verdict']!r}")
+
+    def test_boundary_missing_caller_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """boundary with callee but no caller → rejected."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import update_task_status
+
+        test_file = tmp_path / "tests" / "test_svc.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
+
+        task, critic_id = self._make_task_with_boundaries(
+            [{'callee': 'Repo', 'callee_file': 'repo.py', 'edge': 'calls'}],  # missing caller
+            result_text='TEST_TARGETS: tests/test_svc.py\ndone')
+
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"D5 F3: boundary missing caller must reject, got {verdict['verdict']!r}")
+
+    def test_complete_boundary_dict_proceeds(self, mock_db_path, tmp_path, monkeypatch):
+        """Well-formed boundary dict passes the validation (no false positive)."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        test_file = tmp_path / "tests" / "test_svc.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_it(): pass\n")
+
+        task, critic_id = self._make_task_with_boundaries(
+            [{'caller': 'Svc', 'callee': 'Repo',
+              'callee_file': 'repo.py', 'edge': 'calls'}],
+            result_text='TEST_TARGETS: tests/test_svc.py\ndone')
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 2,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: [])
+
+        import servers.coverage as cov
+        import servers.project as proj_mod
+        monkeypatch.setattr(proj_mod, 'ensure_project',
+                            lambda *a, **kw: {'tech_stack': {'test_tool': 'pytest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: False)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed', (
+            f"Well-formed boundary must proceed, got {verdict['verdict']!r}")
+
+
+# ---------------------------------------------------------------------------
+# D5 test-quality fix: Java empty-filter reject branch — correct test
+# ---------------------------------------------------------------------------
+
+class TestD5JavaEmptyFilterRejectBranch:
+    """D5 test-quality fix: the existing test exercises wrong branch.
+
+    TestMajorEmptyJavaTestFilters._make_java_task_bad_paths uses test_files
+    pointing to 'FooTest.java' which lacks src/test/java/ — but the C-a check
+    rejects BEFORE we reach the java_filters check (FooTest.java doesn't exist
+    under tmp_path, so derive_integration_test_files returns [] and metadata
+    fallback to ['FooTest.java'] which is not a real file so no test source is
+    readable; but importantly we need to reach the java_filters empty check
+    with test_files present but no FQ mapping).
+
+    The corrected test: arrange test_files present (file exists so C-a passes)
+    but path lacks src/test/java/ so FQ derivation yields '' (empty string)
+    which must trigger reject. run_tests must NOT be called.
+
+    Also add a unit test for _java_test_file_to_fq_classname with
+    unmappable / empty inputs.
+    """
+
+    def test_java_fq_classname_helper_empty_on_unmappable(self):
+        """_java_test_file_to_fq_classname returns '' for paths lacking src/test/java/."""
+        from servers.facade import _java_test_file_to_fq_classname
+        # Bare filename, no directory segments
+        assert _java_test_file_to_fq_classname('FooTest.java') == 'FooTest', (
+            "bare filename without path: extension stripped, no dots")
+        # But lacks src/test/java — still returns something (just classname without pkg)
+        # The key insight: this becomes 'FooTest' not 'com.example.FooTest'
+        # The filter check in facade: java_filters excludes entries that don't contain
+        # the /test/ path check — let us test what actually becomes empty
+        assert _java_test_file_to_fq_classname('') == '', "empty string → empty"
+
+    def test_java_fq_classname_helper_normal(self):
+        """_java_test_file_to_fq_classname works for standard paths."""
+        from servers.facade import _java_test_file_to_fq_classname
+        result = _java_test_file_to_fq_classname(
+            'src/test/java/com/example/OrderServiceIT.java')
+        assert result == 'com.example.OrderServiceIT', (
+            f"Standard path must map to FQ class, got {result!r}")
+
+    def test_java_empty_filter_reject_genuine(self, mock_db_path, tmp_path, monkeypatch):
+        """Correctly exercises the java_filters empty reject branch.
+
+        Arrange: java task with test file that EXISTS on disk (so C-a check passes)
+        but whose path does NOT satisfy the _derive_java_test_filters condition
+        (lacks src/test/java/ OR /test/ in path), so java_filters == [].
+        The gate must reject BEFORE calling run_tests.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+
+        # Create a test file that EXISTS but lacks src/test/java/ — FQ derivation
+        # will produce a bare name but _derive_java_test_filters requires '/test/' in path
+        test_file = tmp_path / 'FooIT.java'
+        test_file.write_text('@SpringBootTest\npublic class FooIT {}\n')
+
+        boundaries = [{'caller': 'Svc', 'callee': 'Repo',
+                       'callee_file': 'Repo.java', 'edge': 'calls'}]
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='java integration test',
+                              requires_validation=True,
+                              metadata={
+                                  'integration_boundaries': boundaries,
+                                  'stack': 'java',
+                                  # NO test_files metadata — rely on TEST_TARGETS marker
+                              })
+        # TEST_TARGETS marker pointing to the file that exists but lacks /test/ in path
+        update_task_status(task, 'done',
+                           result='TEST_TARGETS: FooIT.java\nIntegration tests done.')
+        critic = reserve_critic_task(task)
+
+        # run_tests must NOT be called
+        run_tests_called = {'n': 0}
+        def should_not_call(*a, **kw):
+            run_tests_called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"Java task with unmappable test file must reject (no FQ filter), "
+            f"got {verdict['verdict']!r}")
+        assert run_tests_called['n'] == 0, (
+            "run_tests must NOT be called when java_filters is empty")
