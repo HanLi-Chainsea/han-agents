@@ -921,3 +921,137 @@ class TestFormatBoundarySummary:
         joined = '\n'.join(lines)
         # Should mention L1 tests passed
         assert '5' in joined
+
+
+# ---------------------------------------------------------------------------
+# B5 TDD: recipe_integration_tests attaches integration_boundaries metadata
+# ---------------------------------------------------------------------------
+
+class TestRecipeAttachesIntegrationBoundariesMetadata:
+    """recipe_integration_tests should attach integration_boundaries to each
+    module task's metadata.  Mirrors TestRecipePersistsCoverageTargets."""
+
+    def test_recipe_attaches_integration_boundaries_metadata(
+            self, mock_db_path, monkeypatch):
+        """Integration recipe creates tasks whose metadata contains
+        'integration_boundaries' key — populated by boundaries_for_target."""
+        import servers.project as project_mod
+        import servers.code_graph as cg
+        import servers.integration_gate as ig
+
+        # Fake code_graph: one file node so the recipe builds one module task.
+        fake_node = {
+            'id': 'n1', 'kind': 'file',
+            'file_path': 'servers/foo.py',
+            'name': 'foo.py',
+        }
+        monkeypatch.setattr(cg, 'get_code_nodes',
+                            lambda project, kind=None, file_path=None,
+                                   limit=100, offset=0: [fake_node])
+
+        monkeypatch.setattr(project_mod, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        # boundaries_for_target returns one boundary for the module's files.
+        fake_boundary = {
+            'caller': 'servers.foo.Foo',
+            'callee': 'servers.bar.Bar',
+            'callee_file': 'servers/bar.py',
+            'edge': 'calls',
+        }
+        monkeypatch.setattr(ig, 'boundaries_for_target',
+                            lambda project, files: [fake_boundary])
+
+        # Intercept create_subtask to capture the metadata passed to the
+        # executor task (the task that get_next_dispatch dispatches).
+        import servers.tasks as tasks_mod
+        captured = {}
+        real_create_subtask = tasks_mod.create_subtask
+
+        def capturing_create_subtask(parent_id, description, **kwargs):
+            tid = real_create_subtask(parent_id, description, **kwargs)
+            if kwargs.get('assigned_agent') == 'executor':
+                captured['task_id'] = tid
+                captured['metadata'] = kwargs.get('metadata')
+            return tid
+
+        monkeypatch.setattr(tasks_mod, 'create_subtask', capturing_create_subtask)
+
+        from servers.recipes import recipe_integration_tests
+        from servers.tasks import get_task
+
+        res = recipe_integration_tests('proj', '/tmp/proj', max_tasks=1)
+        assert res['task_count'] == 1, f"Expected 1 task, got {res}"
+        assert captured, "create_subtask for executor task must have been called"
+
+        meta = captured.get('metadata') or {}
+        assert 'integration_boundaries' in meta, (
+            f"Expected 'integration_boundaries' in metadata, got: {meta!r}")
+        assert meta['integration_boundaries'] == [fake_boundary], (
+            f"Expected fake_boundary, got: {meta['integration_boundaries']!r}")
+
+
+# ---------------------------------------------------------------------------
+# B5 TDD: get_next_dispatch_integration_gated rejects mocked boundary
+# ---------------------------------------------------------------------------
+
+class TestIntegrationGatedDispatch:
+    """get_next_dispatch_integration_gated: mirrors TestGetNextDispatchGated
+    but for the integration gate.
+
+    Test: done integration task whose metadata has a mocked boundary →
+    routes back to executor (rejected) with collaborator named in prompt.
+    """
+
+    def test_integration_gated_dispatch_rejects_mocked_boundary(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """A done task with integration_boundaries where the collaborator is
+        mocked → get_next_dispatch_integration_gated returns executor with
+        the collaborator name in the prompt."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status
+
+        boundary = {
+            'caller': 'OrderService',
+            'callee': 'OrderRepository',
+            'callee_file': 'repo/OrderRepository.java',
+            'edge': 'injects',
+        }
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(
+            parent_id=story,
+            description='write integration tests',
+            requires_validation=True,
+            metadata={
+                'integration_boundaries': [boundary],
+                'test_files': ['OrderServiceTest.java'],
+                'stack': 'java',
+            })
+        update_task_status(task, 'done', result='done')
+
+        # L1: tests pass
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 3,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        # L2: collaborator is mocked
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: ['OrderRepository'])
+
+        # make test file readable so L2 can fire
+        test_file = tmp_path / 'OrderServiceTest.java'
+        test_file.write_text('@MockBean\nOrderRepository repo;\n')
+
+        inst = facade.get_next_dispatch_integration_gated(
+            epic, 'proj', str(tmp_path))
+
+        assert inst['subagent_type'] == 'executor', (
+            f"Expected executor (rejection retry), got {inst.get('subagent_type')!r}")
+        assert inst['task_id'] == task
+        assert 'OrderRepository' in inst['prompt'], (
+            f"Collaborator name should appear in retry prompt; "
+            f"prompt={inst.get('prompt','')[:200]!r}")

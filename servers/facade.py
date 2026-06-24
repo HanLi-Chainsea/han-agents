@@ -2033,6 +2033,48 @@ def get_next_dispatch_gated(parent_id: str,
         return inst
 
 
+def get_next_dispatch_integration_gated(parent_id: str,
+                                        project_name: str,
+                                        project_path: str,
+                                        trace_id: str = None) -> Dict:
+    """get_next_dispatch + integration gate (L1 run+pass, L2 mock-smell).
+
+    Mirrors get_next_dispatch_gated but calls run_integration_gate instead of
+    run_coverage_gate.  When the next dispatch is a critic, the integration gate
+    runs first:
+      - rejected  → finish_validation already handled; continue to get next dispatch
+                   (will become executor retry with collaborator name in prompt)
+      - blocked   → return blocked action immediately
+      - proceed   → attach coverage_summary (boundary report) and return critic dispatch
+    Other actions (executor / done / blocked) are returned unchanged.
+    """
+    seen_critics: set = set()
+    while True:
+        inst = get_next_dispatch(parent_id, project_name, project_path, trace_id)
+        if inst.get('action') != 'dispatch' or inst.get('subagent_type') != 'critic':
+            return inst
+        critic_id = inst.get('task_id')
+        if critic_id in seen_critics:
+            return inst  # safety: avoid infinite loop if state did not advance
+        seen_critics.add(critic_id)
+        verdict = run_integration_gate(
+            critic_id, inst['original_task_id'], project_name, project_path)
+        if verdict['verdict'] == 'blocked':
+            return {
+                'action': 'blocked',
+                'progress': inst.get('progress'),
+                'message': verdict.get('message') or '任務已達最大驗證重試次數，需人工審查。',
+                'review_id': verdict.get('review_id'),
+            }
+        if verdict['verdict'] == 'rejected':
+            continue  # retry: gate already called finish_validation
+        if verdict.get('warn'):
+            inst['prompt'] = verdict['warn'] + '\n\n' + inst['prompt']
+        if verdict.get('coverage_summary'):
+            inst['coverage_summary'] = verdict['coverage_summary']
+        return inst
+
+
 def _record_dispatch_decision(
     trace_id: str,
     parent_id: str,
