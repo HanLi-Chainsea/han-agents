@@ -322,6 +322,135 @@ class TestDetectMockedCollaborators:
         assert result == []
 
 
+    # ---- M1: Java @Spy annotation and Mockito.spy(obj) assignment ----
+
+    def test_java_spy_annotation_detected(self):
+        """@Spy annotation followed by field of type OrderRepository → flagged."""
+        source = textwrap.dedent("""            class OrderServiceTest {
+                @Spy
+                private OrderRepository repo;
+
+                @Autowired
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_mockito_spy_assignment_detected(self):
+        """OrderRepository repo = Mockito.spy(existingRepository) → flagged."""
+        source = textwrap.dedent("""            class OrderServiceTest {
+                OrderRepository repo = Mockito.spy(existingRepository);
+                OrderService svc = new OrderService(repo);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_spy_assignment_no_mockito_prefix_detected(self):
+        """OrderRepository repo = spy(existingRepository) (without Mockito. prefix) → flagged."""
+        source = textwrap.dedent("""            class OrderServiceTest {
+                OrderRepository repo = spy(existingRepository);
+                OrderService svc = new OrderService(repo);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_java_spy_assignment_real_constructor_not_flagged(self):
+        """new OrderRepository() should not be flagged even with @Spy — only spy() is."""
+        source = textwrap.dedent("""            class OrderServiceTest {
+                OrderRepository repo = new OrderRepository();
+                OrderService svc = new OrderService(repo);
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == []
+
+    # ---- M2: Python spec_set and AsyncMock ----
+
+    def test_python_mock_spec_set_detected(self):
+        """Mock(spec_set=OrderRepository) → flagged."""
+        source = textwrap.dedent("""            def test_order_service():
+                mock_repo = Mock(spec_set=OrderRepository)
+                svc = OrderService(mock_repo)
+                svc.process()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "python"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_python_magicmock_spec_set_detected(self):
+        """MagicMock(spec_set=OrderRepository) → flagged."""
+        source = textwrap.dedent("""            def test_order_service():
+                mock_repo = MagicMock(spec_set=OrderRepository)
+                svc = OrderService(mock_repo)
+                svc.process()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "python"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_python_async_mock_spec_detected(self):
+        """AsyncMock(spec=OrderRepository) → flagged."""
+        source = textwrap.dedent("""            def test_order_service():
+                mock_repo = AsyncMock(spec=OrderRepository)
+                svc = OrderService(mock_repo)
+                await svc.process()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "python"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_python_async_mock_spec_set_detected(self):
+        """AsyncMock(spec_set=OrderRepository) → flagged."""
+        source = textwrap.dedent("""            def test_order_service():
+                mock_repo = AsyncMock(spec_set=OrderRepository)
+                svc = OrderService(mock_repo)
+                await svc.process()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "python"
+        )
+        assert result == ["OrderRepository"]
+
+    # ---- M3: Python calls-edge class patch via snake_case file ----
+
+    def test_python_snake_case_file_class_patch_detected(self):
+        """callee_file='app/order_repository.py' + @patch("app.service.OrderRepository") → matched.
+
+        This tests the snake→Pascal conversion: order_repository → OrderRepository.
+        """
+        source = textwrap.dedent("""            @patch('app.service.OrderRepository')
+            def test_save(mock_repo):
+                svc = OrderService(mock_repo)
+                svc.save()
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "python"
+        )
+        assert result == ["OrderRepository"]
+
 # ---------------------------------------------------------------------------
 # boundaries_for_target — B3: boundary extraction from Code Graph
 # ---------------------------------------------------------------------------

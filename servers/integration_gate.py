@@ -314,6 +314,19 @@ def _owning_type_from_file(callee_file: str) -> str:
     return name
 
 
+
+def _snake_to_pascal(snake_str: str) -> str:
+    """Convert snake_case string to PascalCase.
+
+    Examples:
+        'order_repository' -> 'OrderRepository'
+        'api_gateway'      -> 'ApiGateway'
+        'id'               -> 'Id'
+    """
+    if not snake_str:
+        return ''
+    return ''.join(word.capitalize() for word in snake_str.split('_'))
+
 def _candidate_collaborators(callee: str, callee_file: str) -> List[str]:
     """Build the candidate collaborator name set for a single boundary.
 
@@ -324,12 +337,22 @@ def _candidate_collaborators(callee: str, callee_file: str) -> List[str]:
     For injects-edge boundaries the callee is already the type name and the
     file basename matches it, so both candidates are identical (deduplicated).
 
+    For Python calls-edges with snake_case file names (e.g. 'order_repository.py'),
+    also add the PascalCase conversion (e.g. 'OrderRepository') to catch class-based
+    mocks like @patch('app.service.OrderRepository').
+
     Returns a deduplicated list preserving callee as the first entry.
     """
     candidates: List[str] = [callee]
     owning = _owning_type_from_file(callee_file)
     if owning and owning not in candidates:
         candidates.append(owning)
+    # M3 fix: Add PascalCase conversion of snake_case file basename
+    # Only convert if the name contains underscores (indicating snake_case)
+    if '_' in owning:
+        pascal = _snake_to_pascal(owning)
+        if pascal and pascal not in candidates and pascal != owning:
+            candidates.append(pascal)
     return candidates
 
 
@@ -360,7 +383,7 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
         #   private OrderRepository repo;
         # Pattern stops at first semicolon (field boundary) to avoid cross-matching.
         annotation_pattern = re.compile(
-            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)(?:\s*\([^)]*\))?"  # annotation with optional args (J1 fix)
+            r"@(?:MockBean|MockitoBean|Mock|Spy|SpyBean|MockitoSpyBean)(?:\s*\([^)]*\))?"  # annotation with optional args (J1 fix)
             r"(?:\n\s*@\w+[^\n]*(?:\([^)]*\)[^\n]*)*)*"                   # annotations can have parens
             r"(?:\n\s*(?:public|private|protected|static|final|transient|volatile)\s+[^\n;,)]*)?"  # optional modifiers
             r"(?:\n\s*)?(?:(?:public|private|protected|static|final)\s+)*[^\n]*\b"
@@ -391,6 +414,17 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
             mocked.add(collab)
             continue
 
+        # ---- Pattern M1a: typed-assignment spy pattern (C c = spy(...) or Mockito.spy(...)) ----
+        # Matches: OrderRepository repo = Mockito.spy(existingRepository)
+        #          OrderRepository repo = spy(existingRepository)
+        # The variable is declared as type C and assigned spy(...).
+        spy_assignment_pattern = re.compile(
+            r"\b(?:[A-Za-z0-9_]+\.)*" + re.escape(simple) + r"\s+\w+\s*=\s*(?:Mockito\.)?spy\s*\(",
+        )
+        if spy_assignment_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
         # ---- Pattern 5: mockConstruction(C.class ----
         mock_construction_pattern = re.compile(
             r"\bmockConstruction\s*\(\s*(?:[A-Za-z0-9_]+\.)*"
@@ -416,7 +450,7 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
         #   @SpyBean(com.example.OrderRepository.class)
         # Matches @MockBean(C.class) or @MockBean(value=C.class) or any order.
         annotation_class_arg_pattern = re.compile(
-            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)\s*\("  # annotation with opening paren
+            r"@(?:MockBean|MockitoBean|Mock|Spy|SpyBean|MockitoSpyBean)\s*\("  # annotation with opening paren
             r"[^)]*?(?:[A-Za-z0-9_]+\.)*"                                    # optional package prefix (non-greedy)
             + re.escape(simple) + r"\.class[^)]*\)",                         # C.class inside the parens
         )
@@ -605,9 +639,9 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
             mocked.add(collab)
             continue
 
-        # ---- Pattern 5: MagicMock(spec=C) or Mock(spec=C) ----
+        # ---- Pattern 5: MagicMock(spec=C), Mock(spec=C), AsyncMock with spec or spec_set ----
         spec_pattern = re.compile(
-            r"""\b(?:MagicMock|Mock)\s*\([^)]*spec\s*=\s*"""
+            r"""\b(?:MagicMock|Mock|AsyncMock)\s*\([^)]*spec(?:_set)?\s*=\s*"""
             + re.escape(simple) + r"""\b""",
         )
         if spec_pattern.search(test_source):
