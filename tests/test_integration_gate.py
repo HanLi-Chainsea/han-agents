@@ -1464,3 +1464,209 @@ class TestL2AdditionalMockPatterns:
         from servers.integration_gate import detect_mocked_collaborators
         result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
         assert result == [], f"Real usage must not be flagged: {result}"
+
+
+# ---------------------------------------------------------------------------
+# D3: derive_integration_test_files — marker-based test file derivation (TDD)
+# ---------------------------------------------------------------------------
+
+class TestDeriveIntegrationTestFiles:
+    """TDD tests for derive_integration_test_files (D3 C1 fix)."""
+
+    def test_derive_from_marker_existing_file(self, tmp_path):
+        """Executor result containing TEST_TARGETS: tests/FooIT.java
+        (file exists under tmp project) → returns that relative path."""
+        # Create the test file so it exists under project root
+        test_dir = tmp_path / "tests"
+        test_dir.mkdir()
+        test_file = test_dir / "FooIT.java"
+        test_file.write_text("@SpringBootTest\npublic class FooIT {}\n")
+
+        executor_result = "All tests passed.\nTEST_TARGETS: tests/FooIT.java\nDone."
+
+        from servers.integration_gate import derive_integration_test_files
+        result = derive_integration_test_files(str(tmp_path), executor_result)
+
+        assert result == ["tests/FooIT.java"], (
+            f"Expected ['tests/FooIT.java'], got {result!r}")
+
+    def test_no_marker_returns_empty(self, tmp_path):
+        """Executor result with no TEST_TARGETS: marker → empty list."""
+        from servers.integration_gate import derive_integration_test_files
+        result = derive_integration_test_files(str(tmp_path), "All done, tests pass.")
+        assert result == [], f"Expected [], got {result!r}"
+
+    def test_nonexistent_file_in_marker_is_skipped(self, tmp_path):
+        """TEST_TARGETS: path that does not exist → filtered out → empty."""
+        from servers.integration_gate import derive_integration_test_files
+        result = derive_integration_test_files(
+            str(tmp_path), "TEST_TARGETS: tests/NonExistent.java")
+        assert result == [], f"Non-existent file must not be returned, got {result!r}"
+
+    def test_comma_separated_multiple_files(self, tmp_path):
+        """Multiple files separated by comma are all returned when they exist."""
+        test_dir = tmp_path / "tests"
+        test_dir.mkdir()
+        (test_dir / "FooIT.java").write_text("class FooIT {}")
+        (test_dir / "BarIT.java").write_text("class BarIT {}")
+
+        from servers.integration_gate import derive_integration_test_files
+        result = derive_integration_test_files(
+            str(tmp_path),
+            "TEST_TARGETS: tests/FooIT.java, tests/BarIT.java")
+
+        assert "tests/FooIT.java" in result
+        assert "tests/BarIT.java" in result
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# D3: C1 regression test — no test files → rejected (fail-closed)
+# ---------------------------------------------------------------------------
+
+class TestIntegrationTaskWithoutTestFilesRejects:
+    """C1 false-green regression test: integration task (boundaries present)
+    with no TEST_TARGETS: marker AND no metadata.test_files → must reject,
+    NOT proceed.  Previously this was a silent false-green.
+    """
+
+    def _make_integration_task_no_files(self, result_text='done'):
+        """Create an integration task with boundaries but no test files."""
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        # metadata has boundaries but NO test_files key at all
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                        'callee_file': 'repo.java', 'edge': 'injects'}]
+        task = create_subtask(parent_id=story,
+                              description='write integration tests',
+                              requires_validation=True,
+                              metadata={'integration_boundaries': boundaries,
+                                        'stack': 'python'})
+        # result has no TEST_TARGETS: marker
+        update_task_status(task, 'done', result=result_text)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_integration_task_without_test_files_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """C1 regression: boundaries present + result has no TEST_TARGETS marker
+        + no metadata.test_files → verdict MUST be 'rejected', not 'proceed'."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_integration_task_no_files(
+            result_text='All integration tests done.')
+
+        # run_tests must NOT be called (gate should reject before L1)
+        called = {'l1': False}
+        def should_not_reach(*a, **kw):
+            called['l1'] = True
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_reach)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"C1 regression: no test files must reject, got {verdict['verdict']!r}")
+        assert not called['l1'], (
+            "run_tests must NOT be called when no test files can be derived")
+
+        # Rejection message must guide executor to use TEST_TARGETS:
+        from servers.memory import get_working_memory
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and 'TEST_TARGETS' in wm, (
+            f"Rejection context must mention TEST_TARGETS, got: {wm!r}")
+
+
+# ---------------------------------------------------------------------------
+# D3: L2 now actually scans derived test files (TDD)
+# ---------------------------------------------------------------------------
+
+class TestL2ScancesDerivedTestFiles:
+    """L2 now reads the executor's actual test files (derived from marker),
+    not the old metadata.test_files=[].  Previously L2 scanned ZERO files
+    and passed silently (false-green).
+    """
+
+    def _make_task_with_marker_result(self, tmp_path, test_file_content,
+                                      test_file_rel):
+        """Create an integration task whose executor result has a TEST_TARGETS:
+        marker pointing to a file we create in tmp_path."""
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        # Create the test file on disk
+        test_path = tmp_path / test_file_rel
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.write_text(test_file_content)
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                        'callee_file': 'repo.java', 'edge': 'injects'}]
+        task = create_subtask(
+            parent_id=story,
+            description='write integration tests',
+            requires_validation=True,
+            metadata={
+                'integration_boundaries': boundaries,
+                'stack': 'java',
+                # Note: test_files is intentionally NOT set (empty/absent)
+                # so we rely purely on TEST_TARGETS: marker
+            })
+        # Executor result contains the TEST_TARGETS: marker
+        result_text = (
+            f"Integration tests written.\n"
+            f"TEST_TARGETS: {test_file_rel}\n"
+            f"All tests pass."
+        )
+        update_task_status(task, 'done', result=result_text)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_l2_scans_derived_test_files(self, mock_db_path, tmp_path, monkeypatch):
+        """L2 reads the file pointed to by the TEST_TARGETS: marker and rejects
+        when it detects a mocked boundary collaborator.
+
+        Previously: L2 scanned ZERO files (test_files=[]) → always passed (false-green).
+        Now: L2 reads the actual test file from the marker → detects mock → rejects.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        # Test file content that MOCKS the boundary collaborator
+        mocked_test_source = (
+            "@SpringBootTest\n"
+            "class OrderServiceIT {\n"
+            "    @MockBean\n"
+            "    private OrderRepository repo;\n"
+            "\n"
+            "    @Autowired\n"
+            "    private OrderService svc;\n"
+            "}\n"
+        )
+        test_file_rel = "tests/OrderServiceIT.java"
+
+        task, critic_id = self._make_task_with_marker_result(
+            tmp_path, mocked_test_source, test_file_rel)
+
+        # L1: monkeypatch to pass — only L2 should decide verdict
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 1,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"L2 should have detected mocked OrderRepository and rejected, "
+            f"got {verdict['verdict']!r}")
+
+        # Rejection reason must name the collaborator
+        from servers.memory import get_working_memory
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and 'OrderRepository' in wm, (
+            f"Rejection must name the mocked collaborator, got: {wm!r}")

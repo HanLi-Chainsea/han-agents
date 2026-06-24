@@ -1955,6 +1955,7 @@ def run_coverage_gate(critic_task_id: str,
 
 
 
+
 def run_integration_gate(critic_task_id: str,
                          original_task_id: str,
                          project_name: str,
@@ -1967,10 +1968,14 @@ def run_integration_gate(critic_task_id: str,
          'warn':    str | None,
          'coverage_summary': list[str]}   # present when verdict='proceed'
 
-    Policy:
-      - metadata.integration_boundaries absent/empty → not an integration task → proceed.
-      - L1: run_tests(...) passes=False → _gate_reject (fail-closed).
-      - L2: any boundary collaborator mocked → _gate_reject naming the collaborator.
+    Policy (D3 update):
+      - metadata.integration_boundaries ABSENT → not an integration task → proceed.
+      - Derive test files from executor result TEST_TARGETS: marker; fall back to
+        metadata.test_files.  If NEITHER yields files → fail-closed reject (C1 fix:
+        unverifiable integration task must not pass).
+      - L1: run_tests(...) scoped to derived test files; passes=False → _gate_reject.
+      - L2: read each derived test file and check mock patterns for boundary
+        collaborators → _gate_reject naming any mocked collaborator.
       - L3: classify each boundary (verified-real / not-observed / not-measurable);
             result is advisory, never modifies verdict.
     """
@@ -1999,13 +2004,42 @@ def run_integration_gate(critic_task_id: str,
         return _gate_reject(critic_task_id, original_task_id, [
             '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
 
-    test_files = metadata.get('test_files') or []
     stack = metadata.get('stack') or 'python'
 
+    # D3 C1 fix: derive test files from executor result marker first;
+    # fall back to metadata.test_files if marker absent (backwards compatibility).
+    result_text = (original or {}).get('result') or ''
+    test_files = ig.derive_integration_test_files(project_path, result_text)
+    if not test_files:
+        test_files = metadata.get('test_files') or []
+
+    # C1 fail-closed: when boundaries are present (L2 needed), we MUST have test files
+    # to scan for mocks.  Without test files we cannot verify the executor did not mock
+    # boundary collaborators → unverifiable → reject.
+    # Exception: empty boundaries list → L2 is trivially skipped; allow no test files
+    # (L1 will run the full suite or be monkeypatched in tests).
+    if boundaries and not test_files:
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：無法取得測試檔路徑。'
+            '請在回報中以獨立一行 '
+            '`TEST_TARGETS: <相對專案根路徑>, ...` 列出本次測試檔，'
+            'gate 才能執行並驗證無 mock 邊界。'])
+
     # ── L1: Run tests — hard gate ──────────────────────────────────────────────
-    # Runs even when boundaries is an empty list — a failing integration test
-    # must still be rejected even if boundary extraction returned nothing.
-    l1 = ig.run_tests(project_path, stack, py_test_files=test_files)
+    # Scoped to derived test files (when available) so we run exactly what the
+    # executor wrote.  Java stack: convert file paths to FQ class names for
+    # --tests filtering.  Python stack: pass file paths as py_test_files.
+    # Runs even when boundaries is an empty list.
+    stack_lower = stack.lower()
+    if any(s in stack_lower for s in ('java', 'gradle', 'maven')):
+        java_filters = [_java_test_file_to_fq_classname(tf) for tf in test_files
+                        if tf]
+        l1 = ig.run_tests(project_path, stack,
+                          test_filters=java_filters if java_filters else None)
+    else:
+        l1 = ig.run_tests(project_path, stack,
+                          py_test_files=test_files if test_files else None)
+
     if not l1.get('passed'):
         error_detail = l1.get('error') or f"failures={l1.get('failures')}, errors={l1.get('errors')}"
         return _gate_reject(critic_task_id, original_task_id, [
@@ -2019,9 +2053,8 @@ def run_integration_gate(critic_task_id: str,
                 'coverage_summary': ig.format_boundary_summary([], l1_total=l1_total)}
 
     # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
-    # Read each test file and check whether boundary collaborators are mocked.
-    # Fail-closed: if test_files is non-empty but zero files are readable,
-    # we cannot verify absence of mocks → reject (can't verify → reject).
+    # Read each DERIVED test file and check whether boundary collaborators are mocked.
+    # Fail-closed: if test_files non-empty but zero files readable → reject.
     all_mocked: List[str] = []
     collaborators = [b.get('callee', '') for b in boundaries if b.get('callee')]
     files_read = 0
@@ -2064,7 +2097,6 @@ def run_integration_gate(critic_task_id: str,
 
     summary = ig.format_boundary_summary(boundaries_with_labels, l1_total=l1_total)
     return {'verdict': 'proceed', 'warn': None, 'coverage_summary': summary}
-
 
 def get_next_dispatch_gated(parent_id: str,
                             project_name: str,

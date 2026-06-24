@@ -6,6 +6,7 @@ Public entry points:
   run_tests(project_path, stack, ...)                     — runs tests, parses XML, fail-closed
   detect_mocked_collaborators(test_source, collaborators, stack)  — L2 static scanner
   boundaries_for_target(project_name, target_files)       — B3: boundary extraction from Code Graph
+  derive_integration_test_files(project_path, executor_result)   — parse TEST_TARGETS: marker
 
 Policy is intentionally separate from the branch-coverage gate
 (servers/coverage_java.py) so each gate can evolve independently.
@@ -30,6 +31,52 @@ except ImportError:
 
 _GRADLE_TIMEOUT_SEC = 600
 _PYTEST_TIMEOUT_SEC = 300
+
+
+# ---------------------------------------------------------------------------
+# Marker-based test file derivation
+# ---------------------------------------------------------------------------
+
+def derive_integration_test_files(
+    project_path: str,
+    executor_result: Optional[str],
+) -> List[str]:
+    """Parse the ``TEST_TARGETS:`` marker from the executor's result text and
+    return a list of existing test file paths relative to the project root.
+
+    Mirrors ``coverage.derive_test_targets`` in structure: reuses
+    ``coverage._MARKER_RE`` and the same validation logic (path must exist
+    under project root AND look like a test file).  No fallback heuristic —
+    integration gate is marker-only (fail-closed if no marker).
+
+    Returns:
+        Sorted list of relative paths (may be empty if no valid marker found).
+    """
+    from servers import coverage as _cov
+
+    root = os.path.realpath(project_path)
+    found: List[str] = []
+
+    for m in _cov._MARKER_RE.findall(executor_result or ''):
+        for raw in re.split(r'[,\s]+', m.strip()):
+            if not raw:
+                continue
+            # Resolve to absolute, confirm it lives under project root
+            cand = raw if os.path.isabs(raw) else os.path.join(root, raw)
+            cand = os.path.realpath(cand)
+            if not (cand == root or cand.startswith(root + os.sep)):
+                continue  # path escape — skip
+            if not os.path.isfile(cand):
+                continue
+            # Must look like a test file (path segment / naming convention)
+            from servers.recipes import is_test_file
+            if not is_test_file(raw):
+                continue
+            rel = os.path.relpath(cand, root)
+            if rel not in found:
+                found.append(rel)
+
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------
