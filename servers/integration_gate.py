@@ -13,6 +13,7 @@ Policy is intentionally separate from the branch-coverage gate
 
 import glob
 import re
+import shutil
 import sys
 import os
 import subprocess
@@ -44,15 +45,20 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
 
     Returns:
         {
-          'ran':      bool   — True if at least one parseable testsuite found
-          'total':    int    — sum of tests= across all suites
+          'ran':      bool   — True if at least one cleanly-parsed testsuite found
+          'total':    int    — sum of tests= across all clean suites
           'failures': int    — sum of failures=
           'errors':   int    — sum of errors=
-          'passed':   bool   — True iff ran and total>0 and failures==0 and errors==0
-          'error':    str|None — human-readable error description (None on success)
+          'skipped':  int    — sum of skipped= across all clean suites
+          'passed':   bool   — True iff ran and (total-skipped)>0 and failures==0 and errors==0
+          'error':    str|None — human-readable error description (None on clean success)
         }
 
-    Fail-closed: any parse error → ran=False, passed=False.
+    Fail-closed:
+      - Missing or non-numeric failures/errors attribute → that suite is a parse
+        error; it does NOT count toward clean_suite_count.
+      - If NO suite parses cleanly → ran=False, passed=False.
+      - All-skipped suite (total==skipped) → passed=False even with 0 failures.
     """
     if not xml_paths:
         return _ran_false("No XML result files provided")
@@ -60,7 +66,8 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
     total = 0
     failures = 0
     errors = 0
-    suite_count = 0
+    skipped = 0
+    clean_suite_count = 0
     parse_errors = []
 
     for path in xml_paths:
@@ -85,19 +92,35 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
 
         for suite in suites:
             t = _int_attr(suite, "tests")
-            f = _int_attr(suite, "failures")
-            e = _int_attr(suite, "errors")
+            # C7: failures and errors must be present and numeric; if not → parse error
+            f = _strict_int_attr(suite, "failures")
+            e = _strict_int_attr(suite, "errors")
+            if f is None or e is None:
+                name = suite.get("name", "<unnamed>")
+                missing = []
+                if f is None:
+                    missing.append("failures")
+                if e is None:
+                    missing.append("errors")
+                parse_errors.append(
+                    f"Suite '{name}': missing/non-numeric attribute(s): {', '.join(missing)}"
+                )
+                continue  # This suite does not count as clean
+            sk = _int_attr(suite, "skipped")
             total += t
             failures += f
             errors += e
-            suite_count += 1
+            skipped += sk
+            clean_suite_count += 1
 
-    if suite_count == 0:
+    if clean_suite_count == 0:
         if parse_errors:
             return _ran_false("; ".join(parse_errors))
         return _ran_false("No parseable <testsuite> elements found in XML files")
 
-    passed = (failures == 0) and (errors == 0) and (total > 0)
+    # C7: passed requires executed-and-passed tests (total - skipped > 0)
+    executed = total - skipped
+    passed = (failures == 0) and (errors == 0) and (executed > 0)
     error_msg = None
     if parse_errors:
         error_msg = "Parse warnings: " + "; ".join(parse_errors)
@@ -106,6 +129,7 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
         "total": total,
         "failures": failures,
         "errors": errors,
+        "skipped": skipped,
         "passed": passed,
         "error": error_msg,
     }
@@ -122,12 +146,28 @@ def _int_attr(elem, attr: str, default: int = 0) -> int:
         return default
 
 
+def _strict_int_attr(elem, attr: str) -> Optional[int]:
+    """Parse an integer XML attribute strictly; return None on missing/invalid.
+
+    Used for failure-critical attributes (failures, errors) where a missing
+    or non-numeric value must NOT be treated as zero — it is a parse failure.
+    """
+    val = elem.get(attr)
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def _ran_false(error: str) -> Dict:
     return {
         "ran": False,
         "total": 0,
         "failures": 0,
         "errors": 0,
+        "skipped": 0,
         "passed": False,
         "error": error,
     }
@@ -182,11 +222,14 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
     """Detect Java mock constructs for the given collaborators.
 
     Patterns checked (fail-closed — @SpyBean/spy counts as mocked):
-      1. @MockBean / @MockitoBean / @Mock / @SpyBean annotation followed
-         within ~2 lines by a field declaration whose declared type is C.
+      1. @MockBean / @MockitoBean / @Mock / @SpyBean / @MockitoSpyBean annotation
+         followed within ~3 lines by a field declaration whose declared type is C.
          @InjectMocks is explicitly excluded (marks the SUT, not a mock).
       2. Mockito.mock(C.class) or mock(C.class) call.
       3. Mockito.spy(C.class) or spy(C.class) call.
+      4. Mockito.spy(new C( or spy(new C( — spy-on-real-instance pattern.
+      5. mockConstruction(C.class — Mockito static construction mock.
+      6. Mockito.mockStatic(C.class — static method mocking.
     """
     mocked: set = set()
 
@@ -194,34 +237,55 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
         simple = _simple_name(collab)
 
         # ---- Pattern 1: annotation + field declaration ----
-        # Match @MockBean / @MockitoBean / @Mock / @SpyBean (but NOT @InjectMocks)
-        # followed by optional whitespace/lines then a field whose type is the
-        # simple name.  We allow up to ~2 lines between annotation and field.
-        #
-        # Strategy: find each mock annotation block, then check if `simple`
-        # appears as a type in the next ~2 lines of text.
-
-        # Regex: annotation keyword, then up to 200 chars (non-greedy) including
-        # newlines, then the type name as a word boundary.
+        # Match @MockBean / @MockitoBean / @Mock / @SpyBean / @MockitoSpyBean
+        # (but NOT @InjectMocks) followed by optional whitespace/lines then a
+        # field whose type is the simple name.  We allow up to ~3 lines between
+        # annotation and field.
         annotation_pattern = re.compile(
-            r"@(?:MockBean|MockitoBean|Mock|SpyBean)\b"   # annotation
-            r"(?:[^@\n]*\n){0,3}"                         # up to 3 intervening lines
-            r"[^\n]*\b" + re.escape(simple) + r"\b",     # type name in field line
+            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)\b"  # annotation
+            r"(?:[^@\n]*\n){0,3}"                                       # up to 3 intervening lines
+            r"[^\n]*\b" + re.escape(simple) + r"\b",                   # type name in field line
             re.MULTILINE,
         )
         if annotation_pattern.search(test_source):
             mocked.add(collab)
             continue
 
-        # ---- Pattern 2 & 3: Mockito.mock/spy call or bare mock/spy call ----
+        # ---- Pattern 2 & 3: Mockito.mock/spy(C.class) or bare mock/spy(C.class) ----
         # Matches: mock(OrderRepository.class) or Mockito.mock(OrderRepository.class)
         # Also mock(com.aile.OrderRepository.class) (FQN) and mock(..., extra args)
-        # Allows optional fully-qualified prefix and drops closing ) anchor.
         call_pattern = re.compile(
             r"\b(?:Mockito\.)?(?:mock|spy)\s*\(\s*(?:[A-Za-z0-9_]+\.)*"
             + re.escape(simple) + r"\s*\.class",
         )
         if call_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 4: spy(new C( or Mockito.spy(new C( ----
+        spy_new_pattern = re.compile(
+            r"\b(?:Mockito\.)?spy\s*\(\s*new\s+"
+            + re.escape(simple) + r"\s*\(",
+        )
+        if spy_new_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 5: mockConstruction(C.class ----
+        mock_construction_pattern = re.compile(
+            r"\bmockConstruction\s*\(\s*(?:[A-Za-z0-9_]+\.)*"
+            + re.escape(simple) + r"\s*\.class",
+        )
+        if mock_construction_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 6: Mockito.mockStatic(C.class or mockStatic(C.class ----
+        mock_static_pattern = re.compile(
+            r"\b(?:Mockito\.)?mockStatic\s*\(\s*(?:[A-Za-z0-9_]+\.)*"
+            + re.escape(simple) + r"\s*\.class",
+        )
+        if mock_static_pattern.search(test_source):
             mocked.add(collab)
 
     return [c for c in collaborators if c in mocked]
@@ -235,6 +299,11 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
          appearing as the last segment of the dotted path inside the patch string.
          This covers @patch(...), mock.patch(...), unittest.mock.patch(...).
       2. C = MagicMock() / C = Mock() where C is the simple name.
+      3. patch.object(<anything>, 'C') where C is the simple name.
+      4. create_autospec(C  where C is the simple name.
+      5. MagicMock(spec=C  or Mock(spec=C  where C is the simple name.
+      6. monkeypatch.setattr(<anything>, <anything>, C) where C is the simple name
+         (or the third positional arg matches the simple name).
     """
     mocked: set = set()
 
@@ -249,8 +318,6 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
         #        patch('OrderRepository')            → simple name
         #        @patch('a.b.OrderRepository')
 
-        # Build pattern that matches the collaborator appearing as the last
-        # segment (or whole path) in a patch()/patch.object() string.
         patch_pattern = re.compile(
             r"""(?:@|\b)(?:unittest\.mock\.|mock\.)?patch\s*\(\s*['"]"""
             r"""(?:[A-Za-z0-9_.]*\.)?"""   # optional dotted prefix
@@ -277,6 +344,44 @@ def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
             r"\b" + re.escape(simple) + r"\s*=\s*(?:MagicMock|Mock)\s*\(",
         )
         if assign_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 3: patch.object(<obj>, 'C') ----
+        # Matches patch.object(anything, 'OrderRepository') or ("OrderRepository")
+        patch_object_pattern = re.compile(
+            r"""\bpatch\.object\s*\([^)]*['"]"""
+            + re.escape(simple)
+            + r"""['"]""",
+        )
+        if patch_object_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 4: create_autospec(C ----
+        create_autospec_pattern = re.compile(
+            r"""\bcreate_autospec\s*\(\s*""" + re.escape(simple) + r"""\b""",
+        )
+        if create_autospec_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 5: MagicMock(spec=C) or Mock(spec=C) ----
+        spec_pattern = re.compile(
+            r"""\b(?:MagicMock|Mock)\s*\([^)]*spec\s*=\s*"""
+            + re.escape(simple) + r"""\b""",
+        )
+        if spec_pattern.search(test_source):
+            mocked.add(collab)
+            continue
+
+        # ---- Pattern 6: monkeypatch.setattr(<target>, <attr>, C) ----
+        # The simple name appears as the third positional argument (the replacement).
+        monkeypatch_pattern = re.compile(
+            r"""\bmonkeypatch\.setattr\s*\([^)]*,\s*"""
+            + re.escape(simple) + r"""\s*[,)]""",
+        )
+        if monkeypatch_pattern.search(test_source):
             mocked.add(collab)
 
     return [c for c in collaborators if c in mocked]
@@ -322,9 +427,11 @@ def boundaries_for_target(
 
     # Step 1: collect all nodes whose file_path is in target_files.
     # Build a lookup: node_id -> node dict for caller-side nodes.
+    # C8: pass limit=1_000_000 to avoid silent truncation of high-fan-out modules.
+    # ponytail: 1e6 ceiling
     caller_nodes: Dict[str, Dict] = {}
     for file_path in target_files:
-        nodes = cg.get_code_nodes(project_name, file_path=file_path)
+        nodes = cg.get_code_nodes(project_name, file_path=file_path, limit=1_000_000)  # ponytail: 1e6 ceiling
         for node in nodes:
             caller_nodes[node["id"]] = node
 
@@ -339,11 +446,13 @@ def boundaries_for_target(
 
     # Step 3+4: for each caller node, get outgoing edges, keep injects/call
     # kinds, resolve callee, build boundary dict.
+    # C8: pass limit=1_000_000 to avoid silent truncation at 100 edges.
+    # ponytail: 1e6 ceiling
     seen: set = set()
     boundaries: List[Dict] = []
 
     for node_id, caller_node in caller_nodes.items():
-        edges = cg.get_code_edges(project_name, from_id=node_id)
+        edges = cg.get_code_edges(project_name, from_id=node_id, limit=1_000_000)  # ponytail: 1e6 ceiling
         for edge in edges:
             edge_kind_lower = edge.get("kind", "").lower()
             if edge_kind_lower not in _KEEP_KINDS:
@@ -449,10 +558,27 @@ def _run_java(
         for f in test_filters:
             cmd += ["--tests", f]
 
+    # Locate result XML directory
+    if gradle_module:
+        # Module path may contain slashes (e.g. 'app/core') — keep as-is
+        xml_dir = os.path.join(project_path, gradle_module,
+                               "build", "test-results", "test")
+    else:
+        xml_dir = os.path.join(project_path, "build", "test-results", "test")
+
+    # C7b: Delete stale test-results before running Gradle so an UP-TO-DATE
+    # or NO-SOURCE Gradle run cannot be scored off a previous run's XML.
+    if os.path.isdir(xml_dir):
+        try:
+            shutil.rmtree(xml_dir)
+        except OSError:
+            pass  # best-effort; if removal fails, proceed — fresh XML must appear
+
     evidence = {
         "command": " ".join(cmd),
         "project_path": project_path,
         "gradle_module": gradle_module,
+        "result_xml_dir": xml_dir,
     }
 
     try:
@@ -471,16 +597,6 @@ def _run_java(
     except Exception as exc:
         return _failed(f"Failed to launch Gradle: {exc}", evidence=evidence)
 
-    # Locate result XML directory
-    if gradle_module:
-        # Module path may contain slashes (e.g. 'app/core') — keep as-is
-        xml_dir = os.path.join(project_path, gradle_module,
-                               "build", "test-results", "test")
-    else:
-        xml_dir = os.path.join(project_path, "build", "test-results", "test")
-
-    evidence["result_xml_dir"] = xml_dir
-
     if run.returncode != 0:
         combined = (run.stdout or "") + (run.stderr or "")
         evidence["gradle_rc"] = run.returncode
@@ -490,11 +606,11 @@ def _run_java(
             evidence=evidence,
         )
 
-    # Find result XMLs
+    # Find result XMLs — must be FRESH (xml_dir was cleared before the run)
     xml_paths = glob.glob(os.path.join(xml_dir, "*.xml"))
     if not xml_paths:
         return _failed(
-            f"Gradle test passed but no result XML found in {xml_dir}",
+            f"Gradle test passed but no fresh result XML found in {xml_dir}",
             evidence=evidence,
         )
 

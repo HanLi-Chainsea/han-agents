@@ -1055,3 +1055,412 @@ class TestIntegrationGatedDispatch:
         assert 'OrderRepository' in inst['prompt'], (
             f"Collaborator name should appear in retry prompt; "
             f"prompt={inst.get('prompt','')[:200]!r}")
+
+
+# ---------------------------------------------------------------------------
+# C7: parse_junit_results — malformed/all-skipped hardening (TDD)
+# ---------------------------------------------------------------------------
+
+class TestParseJunitC7Hardening:
+    """C7: missing/non-numeric failures or errors attrs must NOT default to 0-and-pass.
+    All-skipped suites must be passed=False.
+    """
+
+    def test_missing_failures_attr_is_parse_error(self, tmp_path):
+        """<testsuite tests="2"/> — no failures/errors attrs → NOT a clean pass."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "bad.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="BadSuite" tests="2"/>
+        """)
+        res = parse_junit_results([p])
+        # Should not treat the missing attrs as 0 — suite is malformed
+        assert res["passed"] is False, (
+            f"Suite with no failures/errors attrs must not pass, got: {res}")
+
+    def test_non_numeric_failures_attr_is_parse_error(self, tmp_path):
+        """failures="oops" is non-numeric → NOT a clean pass (must not default to 0)."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "bad.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="BadSuite" tests="2" failures="oops" errors="0"/>
+        """)
+        res = parse_junit_results([p])
+        assert res["passed"] is False, (
+            f"Non-numeric failures= must not pass, got: {res}")
+
+    def test_all_skipped_suite_is_not_passed(self, tmp_path):
+        """tests="2" skipped="2" failures="0" errors="0" → passed=False (no executed tests)."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "skipped.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="AllSkipped" tests="2" failures="0" errors="0" skipped="2"/>
+        """)
+        res = parse_junit_results([p])
+        assert res["ran"] is True, "Suite was parsed — ran should be True"
+        assert res["passed"] is False, (
+            f"All-skipped suite must be passed=False, got: {res}")
+
+    def test_genuine_pass_still_passes(self, tmp_path):
+        """tests="3" failures="0" errors="0" skipped="0" → passed=True (genuine pass)."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "pass.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="GoodSuite" tests="3" failures="0" errors="0" skipped="0"/>
+        """)
+        res = parse_junit_results([p])
+        assert res["ran"] is True
+        assert res["passed"] is True, f"Clean pass suite must be passed=True, got: {res}"
+
+    def test_no_clean_suites_means_ran_false(self, tmp_path):
+        """Only a malformed suite (no failures/errors) → ran=False, passed=False."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "only_bad.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="NaughtyOnly" tests="2"/>
+        """)
+        res = parse_junit_results([p])
+        assert res["ran"] is False, (
+            f"No clean suites must produce ran=False, got: {res}")
+        assert res["passed"] is False
+        assert res["error"] is not None
+
+
+# ---------------------------------------------------------------------------
+# C7b: Java runner must not score off stale XML (TDD)
+# ---------------------------------------------------------------------------
+
+class TestJavaRunnerStaleXml:
+    """C7b: Stale test-results/test/*.xml must be deleted before Gradle runs.
+    If no fresh XML is produced after the run → not passed.
+    """
+
+    def test_stale_xml_is_cleared_before_run(self, tmp_path, monkeypatch):
+        """Pre-seeded old XML is removed before Gradle runs; if no fresh XML after
+        the (no-op) run → result is not passed (ran=False or passed=False)."""
+        import servers.integration_gate as ig
+
+        # Create fake gradlew
+        gradlew = tmp_path / "gradlew"
+        gradlew.write_text("#!/bin/sh\n")
+        gradlew.chmod(0o755)
+
+        # Seed a stale XML file in the expected output directory
+        xml_dir = tmp_path / "build" / "test-results" / "test"
+        xml_dir.mkdir(parents=True)
+        stale_xml = xml_dir / "STALE_TEST-SomeTests.xml"
+        stale_xml.write_text(
+            '<?xml version="1.0"?>\n'
+            '<testsuite name="Stale" tests="3" failures="0" errors="0" skipped="0"/>\n'
+        )
+        assert stale_xml.exists(), "Stale XML must exist before the test"
+
+        # Monkeypatch subprocess.run to be a no-op (returns rc=0, writes NO new XML)
+        import subprocess
+
+        class FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeCompleted())
+
+        # Run the Java backend
+        result = ig._run_java(str(tmp_path))
+
+        # The stale XML dir should have been cleared before run.
+        # Since subprocess is no-op (no fresh XML written), the result must be
+        # not passed (either ran=False because no XML, or passed=False).
+        assert not result.get("passed"), (
+            f"Stale XML must not produce a passing result; got: {result}")
+
+    def test_no_fresh_xml_means_not_passed(self, tmp_path, monkeypatch):
+        """After a successful Gradle run that produces no XML → ran=False, passed=False."""
+        import servers.integration_gate as ig
+        import subprocess
+
+        gradlew = tmp_path / "gradlew"
+        gradlew.write_text("#!/bin/sh\n")
+        gradlew.chmod(0o755)
+
+        class FakeCompleted:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeCompleted())
+
+        # No XML directory at all
+        result = ig._run_java(str(tmp_path))
+        assert result.get("passed") is False, (
+            f"No XML dir should yield passed=False, got: {result}")
+        assert result.get("ran") is False, (
+            f"No XML dir should yield ran=False, got: {result}")
+
+
+# ---------------------------------------------------------------------------
+# C8: boundaries_for_target pagination limit (TDD)
+# ---------------------------------------------------------------------------
+
+class TestBoundariesPaginationLimit:
+    """C8: get_code_nodes (caller fetch) and get_code_edges (per-caller edge fetch)
+    must both be called with limit >= 1000 — NOT the default 100.
+    """
+
+    def test_caller_node_fetch_uses_high_limit(self, monkeypatch):
+        """get_code_nodes for caller-side file_path lookup must pass limit >= 1000."""
+        import servers.code_graph as cg
+
+        recorded_limits = []
+
+        def recording_get_nodes(project, kind=None, file_path=None, limit=100, **kw):
+            recorded_limits.append({'file_path': file_path, 'limit': limit})
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", recording_get_nodes)
+        monkeypatch.setattr(cg, "get_code_edges",
+                            lambda *a, **kw: [])
+
+        from servers.integration_gate import boundaries_for_target
+        boundaries_for_target("proj", ["src/Foo.java"])
+
+        caller_fetches = [c for c in recorded_limits if c['file_path'] == "src/Foo.java"]
+        assert caller_fetches, "get_code_nodes must be called for the target file"
+        for call in caller_fetches:
+            assert call['limit'] >= 1000, (
+                f"Caller-node fetch limit must be >= 1000, got {call['limit']}")
+
+    def test_edge_fetch_uses_high_limit(self, monkeypatch):
+        """get_code_edges per-caller call must pass limit >= 1000."""
+        import servers.code_graph as cg
+
+        caller_node = {
+            "id": "node-c", "kind": "class",
+            "name": "com.example.Ctrl", "file_path": "src/Ctrl.java",
+        }
+
+        edge_limits = []
+
+        def get_nodes(project, kind=None, file_path=None, limit=100, **kw):
+            if file_path == "src/Ctrl.java":
+                return [caller_node]
+            if file_path is None and kind is None:
+                return [caller_node]
+            return []
+
+        def get_edges(project, from_id=None, to_id=None, kind=None, limit=100, **kw):
+            edge_limits.append(limit)
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", get_nodes)
+        monkeypatch.setattr(cg, "get_code_edges", get_edges)
+
+        from servers.integration_gate import boundaries_for_target
+        boundaries_for_target("proj", ["src/Ctrl.java"])
+
+        assert edge_limits, "get_code_edges must be called at least once"
+        for lim in edge_limits:
+            assert lim >= 1000, (
+                f"Edge fetch limit must be >= 1000, got {lim}")
+
+
+# ---------------------------------------------------------------------------
+# C2: Empty integration_boundaries — L1 must still run (TDD)
+# ---------------------------------------------------------------------------
+
+class TestC2EmptyBoundariesPolicy:
+    """C2: Key present + empty list → L1 must run; failing L1 → rejected.
+    Key absent → pass-through without calling run_tests.
+    """
+
+    def _make_task(self, metadata):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='integration task',
+                              requires_validation=True, metadata=metadata)
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_absent_key_does_not_call_run_tests(self, mock_db_path, tmp_path, monkeypatch):
+        """integration_boundaries KEY ABSENT → proceed without calling run_tests."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_task({'other_key': 'irrelevant'})
+
+        called = {'n': 0}
+        def should_not_call(*a, **kw):
+            called['n'] += 1
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed', (
+            f"Absent key → proceed, got {verdict['verdict']}")
+        assert called['n'] == 0, "run_tests must NOT be called when key is absent"
+
+    def test_present_empty_list_l1_pass_proceeds(self, mock_db_path, tmp_path, monkeypatch):
+        """integration_boundaries KEY PRESENT + empty list + L1 pass → proceed."""
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_task(
+            {'integration_boundaries': [], 'stack': 'python'})
+
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 2,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed', (
+            f"Empty boundaries + L1 pass → proceed, got {verdict['verdict']}")
+
+    def test_present_empty_list_l1_fail_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """C2 core fix: integration_boundaries KEY PRESENT + empty list + L1 FAIL → rejected.
+
+        Previously this proceeded (false-green hole).  Now L1 must be enforced.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        task, critic_id = self._make_task(
+            {'integration_boundaries': [], 'stack': 'python'})
+
+        # L1 fails — tests did not pass
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': False, 'total': 3, 'failures': 2,
+            'errors': 0, 'error': 'test_something failed', 'evidence': {}})
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"C2 fix: empty boundaries + L1 fail must reject, got {verdict['verdict']}")
+
+
+# ---------------------------------------------------------------------------
+# L2 Majors: additional mock false-negative patterns (TDD)
+# ---------------------------------------------------------------------------
+
+class TestL2AdditionalMockPatterns:
+    """L2 new patterns: MockitoSpyBean, spy(new C(), mockConstruction, mockStatic (Java);
+    patch.object, create_autospec, MagicMock(spec=C), Mock(spec=C), monkeypatch.setattr (Python).
+    """
+
+    # ---- Java new patterns ----
+
+    def test_java_mockito_spy_bean_annotation(self):
+        """@MockitoSpyBean OrderRepository repo → detected."""
+        source = (
+            "@SpringBootTest\nclass T {\n"
+            "    @MockitoSpyBean\n"
+            "    private OrderRepository repo;\n"
+            "}\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        assert result == ["OrderRepository"], f"@MockitoSpyBean not detected: {result}"
+
+    def test_java_spy_new_instance(self):
+        """spy(new OrderRepository()) → detected."""
+        source = (
+            "class T {\n"
+            "    OrderRepository repo = spy(new OrderRepository());\n"
+            "}\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        assert result == ["OrderRepository"], f"spy(new C() not detected: {result}"
+
+    def test_java_mock_construction(self):
+        """mockConstruction(OrderRepository.class → detected."""
+        source = (
+            "class T {\n"
+            "    MockedConstruction<OrderRepository> m = "
+            "mockConstruction(OrderRepository.class);\n"
+            "}\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        assert result == ["OrderRepository"], f"mockConstruction not detected: {result}"
+
+    def test_java_mock_static(self):
+        """Mockito.mockStatic(OrderRepository.class → detected."""
+        source = (
+            "class T {\n"
+            "    try (MockedStatic<OrderRepository> ms = "
+            "Mockito.mockStatic(OrderRepository.class)) {}\n"
+            "}\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        assert result == ["OrderRepository"], f"mockStatic not detected: {result}"
+
+    def test_java_real_new_not_flagged(self):
+        """new OrderRepository() without spy/mock wrapper is NOT flagged."""
+        source = (
+            "class T {\n"
+            "    OrderRepository repo = new OrderRepository();\n"
+            "}\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "java")
+        assert result == [], f"Plain new() must not be flagged: {result}"
+
+    # ---- Python new patterns ----
+
+    def test_python_patch_object(self):
+        """patch.object(obj, 'OrderRepository') → detected."""
+        source = (
+            "def test_it(monkeypatch):\n"
+            "    with patch.object(module, 'OrderRepository') as m:\n"
+            "        pass\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
+        assert result == ["OrderRepository"], f"patch.object not detected: {result}"
+
+    def test_python_create_autospec(self):
+        """create_autospec(OrderRepository → detected."""
+        source = (
+            "def test_it():\n"
+            "    repo = create_autospec(OrderRepository, instance=True)\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
+        assert result == ["OrderRepository"], f"create_autospec not detected: {result}"
+
+    def test_python_magic_mock_spec(self):
+        """MagicMock(spec=OrderRepository → detected."""
+        source = (
+            "def test_it():\n"
+            "    repo = MagicMock(spec=OrderRepository)\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
+        assert result == ["OrderRepository"], f"MagicMock(spec=C) not detected: {result}"
+
+    def test_python_mock_spec(self):
+        """Mock(spec=OrderRepository → detected."""
+        source = (
+            "def test_it():\n"
+            "    repo = Mock(spec=OrderRepository)\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
+        assert result == ["OrderRepository"], f"Mock(spec=C) not detected: {result}"
+
+    def test_python_real_usage_not_flagged(self):
+        """Plain import and direct use of OrderRepository is NOT flagged."""
+        source = (
+            "from app.repo import OrderRepository\n"
+            "def test_it():\n"
+            "    repo = OrderRepository()\n"
+            "    assert repo.find_all() == []\n"
+        )
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(source, ["OrderRepository"], "python")
+        assert result == [], f"Real usage must not be flagged: {result}"

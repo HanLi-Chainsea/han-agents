@@ -1983,16 +1983,19 @@ def run_integration_gate(critic_task_id: str,
     if not isinstance(metadata, dict):
         metadata = {}
 
-    boundaries = metadata.get('integration_boundaries')
-
-    # Not an integration task (absent/empty boundaries) → pass-through, no gating.
-    if not boundaries:
+    # C2: Distinguish KEY ABSENT (not an integration task) from KEY PRESENT+EMPTY.
+    # Only the absent case skips all gating.  The present-but-empty case is still
+    # an integration task — L1 must pass even when there are no boundaries to check.
+    if 'integration_boundaries' not in metadata:
+        # Key absent → not an integration task → pass-through, no gating.
         return {'verdict': 'proceed', 'warn': None}
+
+    boundaries = metadata['integration_boundaries']
 
     # Present but malformed (not list[dict]) → fail-closed reject (not a silent skip = 假綠).
     # Mirror run_coverage_gate's treatment of malformed coverage_targets.
-    if (not isinstance(boundaries, list)
-            or not all(isinstance(b, dict) for b in boundaries)):
+    if not isinstance(boundaries, list) or (
+            boundaries and not all(isinstance(b, dict) for b in boundaries)):
         return _gate_reject(critic_task_id, original_task_id, [
             '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
 
@@ -2000,6 +2003,8 @@ def run_integration_gate(critic_task_id: str,
     stack = metadata.get('stack') or 'python'
 
     # ── L1: Run tests — hard gate ──────────────────────────────────────────────
+    # Runs even when boundaries is an empty list — a failing integration test
+    # must still be rejected even if boundary extraction returned nothing.
     l1 = ig.run_tests(project_path, stack, py_test_files=test_files)
     if not l1.get('passed'):
         error_detail = l1.get('error') or f"failures={l1.get('failures')}, errors={l1.get('errors')}"
@@ -2007,6 +2012,11 @@ def run_integration_gate(critic_task_id: str,
             f'Integration gate L1: tests did not pass — {error_detail}'])
 
     l1_total = l1.get('total', 0)
+
+    # When boundary list is empty, L2/L3 are trivially skipped (nothing to check).
+    if not boundaries:
+        return {'verdict': 'proceed', 'warn': None,
+                'coverage_summary': ig.format_boundary_summary([], l1_total=l1_total)}
 
     # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
     # Read each test file and check whether boundary collaborators are mocked.
