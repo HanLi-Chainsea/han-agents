@@ -2037,6 +2037,19 @@ def run_integration_gate(critic_task_id: str,
                 f'整合邊界 metadata 欄位不完整或無效：edge={_edge!r}，'
                 f'必須為 {_valid_edges} 其中一個。'])
 
+    # G1b fix: Normalize boundary string fields (strip whitespace) after validation.
+    # Validation checked that fields are non-empty after strip(); now apply the strip.
+    # This prevents padded values like callee=" OrderRepository " from bypassing L2 detection.
+    boundaries = [
+        {
+            'caller': b['caller'].strip(),
+            'callee': b['callee'].strip(),
+            'callee_file': b['callee_file'].strip(),
+            'edge': b['edge'].strip(),
+        }
+        for b in boundaries
+    ]
+
     # C-b fix: boundary extraction error flag (set by recipe when boundaries_for_target
     # raised an exception) → fail-closed reject so Code Graph failure does not masquerade
     # as "zero boundaries" and silently disable L2.

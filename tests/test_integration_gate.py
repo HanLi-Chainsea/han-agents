@@ -2677,3 +2677,135 @@ def test_g2_valid_counts_still_pass(tmp_path):
         f"Valid counts must pass, got {res}"
     assert res['total'] == 3
     assert res['skipped'] == 1
+
+
+# ---------------------------------------------------------------------------
+# G2b: parse_junit_results — strict tests count attr (TDD)
+# ---------------------------------------------------------------------------
+
+class TestParseJunitG2bHardening:
+    """G2b: tests= attribute must also be strictly parsed (not lenient default to 0).
+    All JUnit count attributes (tests, failures, errors, skipped) must be strictly numeric.
+    """
+
+    def test_malformed_tests_count_rejects_batch(self, tmp_path):
+        """G2b: A suite with tests="oops" (malformed) + a valid suite → whole batch fails.
+
+        Currently tests uses lenient _int_attr (missing/non-numeric → 0).
+        So tests="oops" is treated as tests=0 (lenient), and if failures/errors=0,
+        the suite is considered clean (wrongly) → passed=True if sibling suite is valid.
+
+        After fix: tests must be strictly parsed like failures/errors.
+        tests="oops" → suite is malformed → whole batch passed=False (hard gate).
+        """
+        from servers.integration_gate import parse_junit_results
+        # Malformed suite: tests="oops" (non-numeric)
+        p1 = _write_xml(tmp_path, "bad.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="BadTests" tests="oops" failures="0" errors="0" skipped="0"/>
+        """)
+
+        # Valid passing suite
+        p2 = _write_xml(tmp_path, "good.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="GoodTests" tests="2" failures="0" errors="0" skipped="0"/>
+        """)
+
+        res = parse_junit_results([p1, p2])
+
+        # AFTER FIX: malformed suite → batch fails
+        assert res["passed"] is False, (
+            f"G2b: Malformed tests count should fail batch, got passed={res['passed']}")
+        assert res["error"] is not None
+        assert "oops" in res["error"] or "tests" in res["error"]
+
+    def test_missing_tests_attr_rejects_suite(self, tmp_path):
+        """G2b: <testsuite> with NO tests attr (missing entirely) → malformed."""
+        from servers.integration_gate import parse_junit_results
+        p = _write_xml(tmp_path, "missing.xml", """\
+            <?xml version="1.0"?>
+            <testsuite name="MissingTests" failures="0" errors="0" skipped="0"/>
+        """)
+
+        res = parse_junit_results([p])
+
+        # AFTER FIX: missing tests attr → suite is malformed
+        assert res["ran"] is False
+        assert res["passed"] is False
+        assert res["error"] is not None
+
+
+# ---------------------------------------------------------------------------
+# G1b: run_integration_gate — boundary normalization (TDD)
+# ---------------------------------------------------------------------------
+
+class TestIntegrationGateG1bNormalization:
+    """G1b: Boundary string fields must be normalized (stripped) before L2.
+
+    Validation checks value.strip() is non-empty, but then must pass the
+    NORMALIZED (stripped) boundary dict to L2. Otherwise padded values like
+    callee=" OrderRepository " pass validation but fail L2 mock detection.
+    """
+
+    def test_boundary_with_padded_callee_normalized_for_l2(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """G1b: A boundary with callee=" OrderRepository " → normalized to "OrderRepository"
+        for L2 mock detection, so L2 correctly detects the mock.
+
+        Before fix: L2 gets padded " OrderRepository " → regex fails to match.
+        After fix: L2 gets normalized "OrderRepository" → regex matches.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+        from servers.tasks import create_task, create_subtask, update_task_status
+
+        # Boundary with PADDED callee
+        boundary = {
+            'caller': 'OrderService',
+            'callee': ' OrderRepository ',  # <-- PADDED
+            'callee_file': 'repo.java',
+            'edge': 'injects',
+        }
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(
+            parent_id=story,
+            description='write integration tests',
+            requires_validation=True,
+            metadata={
+                'integration_boundaries': [boundary],
+                'test_files': ['src/test/java/com/example/OrderServiceTest.java'],
+                'stack': 'java',
+            })
+        update_task_status(task, 'done', result='done')
+
+        # L1: tests pass
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 3,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        # L2: with padded collaborator name in ORIGINAL boundary,
+        # L2 might fail to detect the mock (false green).
+        # After normalization in facade, L2 gets clean "OrderRepository" and detects it.
+        monkeypatch.setattr(ig, 'detect_mocked_collaborators',
+                            lambda src, collabs, stack: ['OrderRepository' if 'OrderRepository' in collabs else ''])
+
+        # make test file readable
+        test_file = tmp_path / 'src' / 'test' / 'java' / 'com' / 'example' / 'OrderServiceTest.java'
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text('@MockBean\nOrderRepository repo;\n')
+
+        critic = create_subtask(
+            parent_id=task,
+            description='critic',
+            assigned_agent='critic',
+            requires_validation=False)
+
+        verdict = facade.run_integration_gate(critic, task, 'proj', str(tmp_path))
+
+        # AFTER FIX: L2 detects the mock (because boundary was normalized)
+        # → verdict should be rejected
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"Expected rejected/blocked (mock detected after normalization), got {verdict['verdict']}")

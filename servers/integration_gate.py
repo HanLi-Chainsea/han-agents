@@ -138,13 +138,16 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
             suites = list(root.iter("testsuite"))
 
         for suite in suites:
-            t = _int_attr(suite, "tests")
+            # G2b: tests attribute must also be strictly numeric (not lenient default to 0)
+            t = _strict_int_attr(suite, "tests")
             # C7: failures and errors must be present and numeric; if not → parse error
             f = _strict_int_attr(suite, "failures")
             e = _strict_int_attr(suite, "errors")
-            if f is None or e is None:
+            if t is None or f is None or e is None:
                 name = suite.get("name", "<unnamed>")
                 missing = []
+                if t is None:
+                    missing.append("tests")
                 if f is None:
                     missing.append("failures")
                 if e is None:
