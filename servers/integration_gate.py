@@ -360,7 +360,7 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
         #   private OrderRepository repo;
         # Pattern stops at first semicolon (field boundary) to avoid cross-matching.
         annotation_pattern = re.compile(
-            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)\b"  # annotation
+            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)(?:\s*\([^)]*\))?"  # annotation with optional args (J1 fix)
             r"(?:\n\s*@\w+[^\n;]*)*"                                     # annotation lines (no semicolon)
             r"(?:\n\s*(?:public|private|protected|static|final|transient|volatile)\s+[^\n;]*)?"  # optional modifiers
             r"\n\s*(?:(?:public|private|protected|static|final)\s+)*[^\n]*\b"
@@ -406,6 +406,21 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
             + re.escape(simple) + r"\s*\.class",
         )
         if mock_static_pattern.search(test_source):
+            mocked.add(collab)
+
+        # ---- Pattern 7 (J2): type in annotation arguments (@MockBean(C.class)) ----
+        # Detects class-level or argument-based mock declarations where the
+        # collaborator is specified as C.class inside annotation arguments, e.g.:
+        #   @MockBean(OrderRepository.class)
+        #   @Mock(OrderRepository.class)
+        #   @SpyBean(com.example.OrderRepository.class)
+        # Matches @MockBean(C.class) or @MockBean(value=C.class) or any order.
+        annotation_class_arg_pattern = re.compile(
+            r"@(?:MockBean|MockitoBean|Mock|SpyBean|MockitoSpyBean)\s*\("  # annotation with opening paren
+            r"[^)]*?(?:[A-Za-z0-9_]+\.)*"                                    # optional package prefix (non-greedy)
+            + re.escape(simple) + r"\.class[^)]*\)",                         # C.class inside the parens
+        )
+        if annotation_class_arg_pattern.search(test_source):
             mocked.add(collab)
 
     return [c for c in collaborators if c in mocked]

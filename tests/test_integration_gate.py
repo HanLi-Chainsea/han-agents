@@ -3126,3 +3126,234 @@ class TestH2PythonAliasedPatchImport:
         result = detect_mocked_collaborators(source, ['OrderRepository'], 'python')
         assert result == ['OrderRepository'], (
             "H2: standard @patch must still work alongside alias, got " + repr(result))
+
+
+# ---------------------------------------------------------------------------
+# J1 TDD: mock annotation WITH argument list (parameterized mocks)
+# ---------------------------------------------------------------------------
+
+class TestJ1ParameterizedMockAnnotations:
+    """J1: mock annotation with arguments like @MockBean(name="...") or
+    @Mock(answer=...) must still flag the field type as mocked.
+    """
+
+    def test_mockbean_with_name_argument_detected(self):
+        """@MockBean(name = "orders") followed by field → flagged."""
+        source = textwrap.dedent("""\
+            @SpringBootTest
+            class OrderServiceTest {
+                @MockBean(name = "orders")
+                private OrderRepository repo;
+
+                @Autowired
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"], (
+            f"@MockBean(name=...) must flag OrderRepository, got {result}")
+
+    def test_mock_with_answer_argument_detected(self):
+        """@Mock(answer = Answers.RETURNS_DEEP_STUBS) followed by field → flagged."""
+        source = textwrap.dedent("""\
+            class OrderServiceTest {
+                @Mock(answer = Answers.RETURNS_DEEP_STUBS)
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"], (
+            f"@Mock(answer=...) must flag OrderRepository, got {result}")
+
+    def test_mockbean_with_multiple_args_detected(self):
+        """@MockBean(value="x", resetAfter=...) with multiple args → flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                @MockBean(value = "primary", resetAfter = AFTER_METHOD)
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_mockitobean_with_parens_detected(self):
+        """@MockitoBean(name="repo") variant → flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                @MockitoBean(name = "repo")
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_spybean_with_argument_detected(self):
+        """@SpyBean(...) with argument list → flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                @SpyBean(name = "spy")
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_plain_mockbean_still_works(self):
+        """Ensure plain @MockBean (without args) still works after J1 fix."""
+        source = textwrap.dedent("""\
+            class Test {
+                @MockBean
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_unrelated_field_not_flagged(self):
+        """A field with a different type and annotation should NOT be flagged."""
+        source = textwrap.dedent("""\
+            class Test {
+                @MockBean(name = "other")
+                private SomeOtherClass other;
+
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# J2 TDD: type-in-annotation-args (class-level or value form)
+# ---------------------------------------------------------------------------
+
+class TestJ2ClassLevelMockAnnotations:
+    """J2: @MockBean(C.class) / @Mock(C.class) / etc. at class level or in
+    annotation arguments names the mocked collaborator C inside the args.
+    """
+
+    def test_mockbean_class_level_argument_detected(self):
+        """@MockBean(OrderRepository.class) at class level → flagged."""
+        source = textwrap.dedent("""\
+            @MockBean(OrderRepository.class)
+            class OrderServiceIT {
+                @Autowired
+                private OrderService svc;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository", "OrderService"], "java"
+        )
+        assert result == ["OrderRepository"], (
+            f"@MockBean(C.class) at class level must flag C, got {result}")
+
+    def test_mock_class_argument_in_annotation_detected(self):
+        """@Mock(OrderRepository.class) — type specified in annotation arg."""
+        source = textwrap.dedent("""\
+            @Mock(OrderRepository.class)
+            class Test {
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_spybean_class_argument_detected(self):
+        """@SpyBean(OrderRepository.class) → flagged."""
+        source = textwrap.dedent("""\
+            @SpyBean(OrderRepository.class)
+            class Test {
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_mockbean_with_both_name_and_class_args(self):
+        """@MockBean(value=OrderRepository.class, name="repo") with .class arg."""
+        source = textwrap.dedent("""\
+            @MockBean(value = OrderRepository.class, name = "repo")
+            class Test {
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_class_argument_with_fqn_detected(self):
+        """@MockBean(com.aile.OrderRepository.class) with FQN."""
+        source = textwrap.dedent("""\
+            @MockBean(com.aile.OrderRepository.class)
+            class Test {
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == ["OrderRepository"]
+
+    def test_no_false_positive_on_real_autowired_class_level(self):
+        """@Autowired at class level (rare) or other annotations should NOT flag."""
+        source = textwrap.dedent("""\
+            @Configuration
+            class Test {
+                @Autowired
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result = detect_mocked_collaborators(
+            source, ["OrderRepository"], "java"
+        )
+        assert result == [], (
+            f"@Autowired must NOT be flagged, got {result}")
+
+    def test_j2_distinguishes_from_j1_field_level(self):
+        """J2 catches class-level @MockBean(C.class) separate from J1 field-level pattern."""
+        # Class-level J2
+        source_j2 = textwrap.dedent("""\
+            @MockBean(OrderRepository.class)
+            class Test {
+            }
+        """)
+        # Field-level J1
+        source_j1 = textwrap.dedent("""\
+            class Test {
+                @MockBean
+                private OrderRepository repo;
+            }
+        """)
+        from servers.integration_gate import detect_mocked_collaborators
+        result_j2 = detect_mocked_collaborators(source_j2, ["OrderRepository"], "java")
+        result_j1 = detect_mocked_collaborators(source_j1, ["OrderRepository"], "java")
+        assert result_j2 == ["OrderRepository"], f"J2 must flag, got {result_j2}"
+        assert result_j1 == ["OrderRepository"], f"J1 must flag, got {result_j1}"
