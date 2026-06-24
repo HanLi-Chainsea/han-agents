@@ -2015,15 +2015,27 @@ def run_integration_gate(critic_task_id: str,
     # A boundary missing 'callee' or 'caller' produces an empty collaborator list,
     # causing L2 to check nothing → false-green (假綠).  Fail-closed: reject if any
     # boundary is malformed (missing/empty callee or caller).
-    _required_boundary_fields = ('caller', 'callee')
+    # G1: Complete boundary schema validation — fail-closed.
+    # Each boundary dict MUST have ALL of caller, callee, callee_file, edge.
+    # Each field must be a non-empty string after .strip() (whitespace-only FAILS).
+    # edge must be one of {'injects', 'calls'}.
+    _required_boundary_fields = ('caller', 'callee', 'callee_file', 'edge')
+    _valid_edges = {'injects', 'calls'}
     for _b in boundaries:
         if not isinstance(_b, dict):
             continue  # already caught above; defensive
+        # Check all required fields present and non-empty after strip
         for _field in _required_boundary_fields:
-            if not _b.get(_field):  # missing or empty string
+            _val = _b.get(_field, '')
+            if not isinstance(_val, str) or not _val.strip():
                 return _gate_reject(critic_task_id, original_task_id, [
-                    f'整合邊界 metadata 欄位不完整：缺少或空白的 {_field!r} 欄位。'
-                    f'每個 boundary 必須包含非空的 caller 與 callee。'])
+                    f'整合邊界 metadata 欄位不完整或無效：{_field!r} 欄位缺少或不是非空字串。'])
+        # Validate edge value
+        _edge = _b.get('edge', '')
+        if _edge not in _valid_edges:
+            return _gate_reject(critic_task_id, original_task_id, [
+                f'整合邊界 metadata 欄位不完整或無效：edge={_edge!r}，'
+                f'必須為 {_valid_edges} 其中一個。'])
 
     # C-b fix: boundary extraction error flag (set by recipe when boundaries_for_target
     # raised an exception) → fail-closed reject so Code Graph failure does not masquerade

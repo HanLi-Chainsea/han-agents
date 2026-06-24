@@ -2466,3 +2466,214 @@ class TestD5JavaEmptyFilterRejectBranch:
             f"got {verdict['verdict']!r}")
         assert run_tests_called['n'] == 0, (
             "run_tests must NOT be called when java_filters is empty")
+# ============================================================================
+# G1: Complete boundary schema validation (TDD)
+# ============================================================================
+
+def test_g1_missing_callee_file_field_rejected(tmp_path):
+    """G1: boundary dict missing 'callee_file' → verdict rejected."""
+    from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    import servers.integration_gate as ig
+    import servers.facade as facade
+
+    # Boundary missing callee_file
+    boundaries = [{'caller': 'Svc', 'callee': 'Repo', 'edge': 'injects'}]
+    
+    epic = create_task(project='proj', description='epic', task_level='epic')
+    story = create_subtask(parent_id=epic, description='story', task_level='story', requires_validation=False)
+    task = create_subtask(parent_id=story, description='task', requires_validation=True,
+                         metadata={'integration_boundaries': boundaries, 'stack': 'python'})
+    update_task_status(task, 'done', result='done')
+    critic = reserve_critic_task(task)
+    
+    verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+    assert verdict['verdict'] in ('rejected', 'blocked'), \
+        f"Missing callee_file must reject, got {verdict['verdict']}"
+
+
+def test_g1_missing_edge_field_rejected(tmp_path):
+    """G1: boundary dict missing 'edge' → verdict rejected."""
+    from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    import servers.integration_gate as ig
+    import servers.facade as facade
+
+    # Boundary missing edge
+    boundaries = [{'caller': 'Svc', 'callee': 'Repo', 'callee_file': 'x.java'}]
+    
+    epic = create_task(project='proj', description='epic', task_level='epic')
+    story = create_subtask(parent_id=epic, description='story', task_level='story', requires_validation=False)
+    task = create_subtask(parent_id=story, description='task', requires_validation=True,
+                         metadata={'integration_boundaries': boundaries, 'stack': 'python'})
+    update_task_status(task, 'done', result='done')
+    critic = reserve_critic_task(task)
+    
+    verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+    assert verdict['verdict'] in ('rejected', 'blocked'), \
+        f"Missing edge must reject, got {verdict['verdict']}"
+
+
+def test_g1_whitespace_callee_rejected(tmp_path):
+    """G1: boundary with whitespace-only callee → verdict rejected."""
+    from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    import servers.integration_gate as ig
+    import servers.facade as facade
+
+    # Boundary with whitespace-only callee
+    boundaries = [{'caller': 'Svc', 'callee': '   ', 'callee_file': 'x.java', 'edge': 'injects'}]
+    
+    epic = create_task(project='proj', description='epic', task_level='epic')
+    story = create_subtask(parent_id=epic, description='story', task_level='story', requires_validation=False)
+    task = create_subtask(parent_id=story, description='task', requires_validation=True,
+                         metadata={'integration_boundaries': boundaries, 'stack': 'python'})
+    update_task_status(task, 'done', result='done')
+    critic = reserve_critic_task(task)
+    
+    verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+    assert verdict['verdict'] in ('rejected', 'blocked'), \
+        f"Whitespace callee must reject, got {verdict['verdict']}"
+
+
+def test_g1_bad_edge_value_rejected(tmp_path):
+    """G1: boundary with invalid edge value → verdict rejected."""
+    from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    import servers.integration_gate as ig
+    import servers.facade as facade
+
+    # Boundary with invalid edge value
+    boundaries = [{'caller': 'Svc', 'callee': 'Repo', 'callee_file': 'x.java', 'edge': 'bogus'}]
+    
+    epic = create_task(project='proj', description='epic', task_level='epic')
+    story = create_subtask(parent_id=epic, description='story', task_level='story', requires_validation=False)
+    task = create_subtask(parent_id=story, description='task', requires_validation=True,
+                         metadata={'integration_boundaries': boundaries, 'stack': 'python'})
+    update_task_status(task, 'done', result='done')
+    critic = reserve_critic_task(task)
+    
+    verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+    assert verdict['verdict'] in ('rejected', 'blocked'), \
+        f"Invalid edge must reject, got {verdict['verdict']}"
+
+
+def test_g1_valid_boundary_proceeds(tmp_path, monkeypatch):
+    """G1: fully-valid boundary with all fields → proceeds (not over-tightened)."""
+    from servers.tasks import create_task, create_subtask, update_task_status, reserve_critic_task
+    import servers.integration_gate as ig
+    import servers.facade as facade
+
+    # Fully valid boundary
+    boundaries = [{'caller': 'Svc', 'callee': 'Repo', 'callee_file': 'x.java', 'edge': 'injects'}]
+    
+    epic = create_task(project='proj', description='epic', task_level='epic')
+    story = create_subtask(parent_id=epic, description='story', task_level='story', requires_validation=False)
+    task = create_subtask(parent_id=story, description='task', requires_validation=True,
+                         metadata={'integration_boundaries': boundaries, 'test_files': ['test.py'], 'stack': 'python'})
+    update_task_status(task, 'done', result='done')
+    critic = reserve_critic_task(task)
+    
+    # L1 pass, L2 no mocks
+    monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+        'ran': True, 'passed': True, 'total': 1, 'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+    monkeypatch.setattr(ig, 'detect_mocked_collaborators', lambda *a, **kw: [])
+    
+    test_file = tmp_path / 'test.py'
+    test_file.write_text('def test_it(): pass\n')
+    
+    verdict = facade.run_integration_gate(critic['id'], task, 'proj', str(tmp_path))
+    assert verdict['verdict'] == 'proceed', \
+        f"Valid boundary should proceed, got {verdict['verdict']}"
+
+
+
+
+# ============================================================================
+# G2: JUnit counts validation — non-negative and consistent (TDD)
+# ============================================================================
+
+def test_g2_negative_skipped_count_rejected(tmp_path):
+    """G2: JUnit suite with skipped='-1' → passed=False (fail-closed)."""
+    from servers.integration_gate import parse_junit_results
+    import textwrap
+
+    p = tmp_path / "bad.xml"
+    p.write_text(textwrap.dedent("""\
+        <?xml version="1.0"?>
+        <testsuite name="T" tests="1" failures="0" errors="0" skipped="-1"/>
+    """))
+    
+    res = parse_junit_results([str(p)])
+    assert res['passed'] is False, \
+        f"Negative skipped must fail, got {res}"
+    assert res['error'] is not None, \
+        f"Error must be reported, got {res}"
+
+
+def test_g2_skipped_exceeds_tests_rejected(tmp_path):
+    """G2: JUnit suite with skipped > tests → passed=False (fail-closed)."""
+    from servers.integration_gate import parse_junit_results
+    import textwrap
+
+    p = tmp_path / "bad.xml"
+    p.write_text(textwrap.dedent("""\
+        <?xml version="1.0"?>
+        <testsuite name="T" tests="2" failures="0" errors="0" skipped="5"/>
+    """))
+    
+    res = parse_junit_results([str(p)])
+    assert res['passed'] is False, \
+        f"Skipped > tests must fail, got {res}"
+    assert res['error'] is not None, \
+        f"Error must be reported, got {res}"
+
+
+def test_g2_negative_failures_rejected(tmp_path):
+    """G2: JUnit suite with failures='-1' → passed=False (fail-closed)."""
+    from servers.integration_gate import parse_junit_results
+    import textwrap
+
+    p = tmp_path / "bad.xml"
+    p.write_text(textwrap.dedent("""\
+        <?xml version="1.0"?>
+        <testsuite name="T" tests="3" failures="-1" errors="0" skipped="0"/>
+    """))
+    
+    res = parse_junit_results([str(p)])
+    assert res['passed'] is False, \
+        f"Negative failures must fail, got {res}"
+    assert res['error'] is not None, \
+        f"Error must be reported, got {res}"
+
+
+def test_g2_negative_errors_rejected(tmp_path):
+    """G2: JUnit suite with errors='-1' → passed=False (fail-closed)."""
+    from servers.integration_gate import parse_junit_results
+    import textwrap
+
+    p = tmp_path / "bad.xml"
+    p.write_text(textwrap.dedent("""\
+        <?xml version="1.0"?>
+        <testsuite name="T" tests="3" failures="0" errors="-1" skipped="0"/>
+    """))
+    
+    res = parse_junit_results([str(p)])
+    assert res['passed'] is False, \
+        f"Negative errors must fail, got {res}"
+    assert res['error'] is not None, \
+        f"Error must be reported, got {res}"
+
+
+def test_g2_valid_counts_still_pass(tmp_path):
+    """G2: normal tests="3" failures="0" errors="0" skipped="1" → passed=True."""
+    from servers.integration_gate import parse_junit_results
+    import textwrap
+
+    p = tmp_path / "good.xml"
+    p.write_text(textwrap.dedent("""\
+        <?xml version="1.0"?>
+        <testsuite name="T" tests="3" failures="0" errors="0" skipped="1"/>
+    """))
+    
+    res = parse_junit_results([str(p)])
+    assert res['passed'] is True, \
+        f"Valid counts must pass, got {res}"
+    assert res['total'] == 3
+    assert res['skipped'] == 1

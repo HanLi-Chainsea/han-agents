@@ -161,6 +161,22 @@ def parse_junit_results(xml_paths: List[str]) -> Dict:
                     f"Suite '{name}': missing/non-numeric attribute(s): skipped"
                 )
                 continue  # This suite does not count as clean
+            # G2: counts must be non-negative and consistent
+            # Fail-closed: any violation → suite is malformed
+            if f < 0 or e < 0 or sk < 0 or t < 0:
+                name = suite.get("name", "<unnamed>")
+                parse_errors.append(
+                    f"Suite '{name}': negative count(s) — tests={t}, failures={f}, errors={e}, skipped={sk}"
+                )
+                continue  # This suite does not count as clean
+            # G2: skipped must not exceed tests (consistency check)
+            if sk > t:
+                name = suite.get("name", "<unnamed>")
+                parse_errors.append(
+                    f"Suite '{name}': skipped ({sk}) > tests ({t}) — inconsistent"
+                )
+                continue  # This suite does not count as clean
+            
             total += t
             failures += f
             errors += e
