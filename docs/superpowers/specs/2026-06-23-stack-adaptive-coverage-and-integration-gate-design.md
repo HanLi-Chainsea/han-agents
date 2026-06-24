@@ -124,6 +124,12 @@ single-module、多模組、Spring Data repository、interface service + impl、
 - 不做 `@HanIntegrationBoundary` 顯式註解契約（保留為未來選項；先用 DI graph + mock-smell）。
 - 不改任何建置/JDK 設定。
 
+## 已知限制（codex 審查 11 輪後，PASS 等價於「結構性假綠全關 + 主流 mock 全覆蓋」，餘為非阻擋尾巴）
+- **L2 static mock-smell 抓不到 bare 無型別 mock 注入**：Python `repo = Mock()`（無 spec、變數名 != 協作者）傳入 SUT 建構子無法靠 regex 連結到邊界——需 data-flow/AST。L1（測試真跑真過）仍把關此類測試；具名/帶 spec 的 mock 全數攔截。升級路徑：AST 追蹤 mock 變數流入 SUT。
+- **L3 為 advisory**：逐 boundary 重跑 coverage（成本 O(boundaries×run)）、Java 未傳 test_filters、callee 用整檔範圍——L3 永不改變 verdict，僅作證據參考。
+- **多模組 Gradle 未自動推導 `gradle_module`**：目前跑 root module；多模組專案需後續接線。
+- 罕見 mock 語法尾巴（`patch(target=...)`、positional `Mock(C)`、`mockConstructionWithAnswer` 等）為非阻擋 limitation，可後續補強。
+
 ## 風險與緩解
 | 風險 | 緩解 |
 |---|---|

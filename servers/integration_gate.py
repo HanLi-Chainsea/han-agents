@@ -463,6 +463,13 @@ def _detect_java(test_source: str, collaborators: List[str]) -> List[str]:
 def _detect_python(test_source: str, collaborators: List[str]) -> List[str]:
     """Detect Python mock constructs for the given collaborators.
 
+    ponytail: KNOWN LIMITATION — a bare untyped `repo = Mock()` (no spec, name
+    != collaborator) injected into the SUT (`OrderService(repo)`) is NOT caught:
+    the variable carries no type, so linking it to a boundary needs data-flow
+    analysis, which is out of scope for this static scanner. L1 (tests really
+    run+pass) still gates such tests; named/spec'd mocks are all caught. Upgrade
+    path: AST data-flow tracing mock vars into the SUT constructor/setters.
+
     Patterns checked:
       1a. patch('...C...') / @patch("...") / mocker.patch("..."):
           C's simple name appears as a DOTTED PATH SEGMENT anywhere in the quoted
