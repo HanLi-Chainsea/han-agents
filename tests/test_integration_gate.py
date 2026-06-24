@@ -1700,8 +1700,8 @@ class TestL2AdditionalMockPatterns:
 
     def test_java_mock_parameter_annotation_k1(self):
         """K1 fix: @Mock annotation on method parameter.
-        
-        @Test void test(@Mock OrderRepository repo) {} 
+
+        @Test void test(@Mock OrderRepository repo) {}
         → should flag OrderRepository as mocked
         """
         source = textwrap.dedent("""            class OrderServiceTest {
@@ -1719,7 +1719,7 @@ class TestL2AdditionalMockPatterns:
 
     def test_java_mock_parameter_no_annotation_guard_k1(self):
         """K1 guard: Parameter without @Mock annotation should NOT be flagged.
-        
+
         void test(OrderRepository repo) {} — plain parameter, no @Mock
         → should NOT flag OrderRepository as mocked
         """
@@ -1738,7 +1738,7 @@ class TestL2AdditionalMockPatterns:
 
     def test_python_dotted_monkeypatch_setattr_k2(self):
         """K2 fix: monkeypatch.setattr with dotted-string target.
-        
+
         monkeypatch.setattr("app.repo.OrderRepository.find_all", fake)
         → should flag OrderRepository as mocked
         """
@@ -1758,7 +1758,7 @@ class TestL2AdditionalMockPatterns:
 
     def test_python_object_form_monkeypatch_setattr_still_works(self):
         """Ensure K2 fix doesn't break the existing object-form pattern.
-        
+
         monkeypatch.setattr(OrderRepository, "find_all", fake)
         → should still flag OrderRepository as mocked (existing pattern)
         """
