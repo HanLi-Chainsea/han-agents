@@ -648,9 +648,11 @@ def _classify_boundary_l3(
     boundary: Dict,
     project_path: str,
     test_files: List[str],
-    stack: str,
 ) -> str:
     """Classify a single boundary into one of the 4 L3 labels using coverage.
+
+    Backend is selected internally via select_backend(tech_stack); caller need
+    not supply the stack.
 
     This is advisory-only: any exception or unavailability → 'not-measurable'.
     Never raises; always returns a label string.

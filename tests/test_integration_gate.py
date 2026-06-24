@@ -806,6 +806,69 @@ class TestRunIntegrationGate:
         assert 'not-measurable' in summary_text, \
             f"Expected not-measurable in summary: {summary_text}"
 
+    # ------------------------------------------------------------------ malformed boundaries --
+
+    def test_malformed_boundaries_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """integration_boundaries present but wrong type (string) → verdict rejected, not a crash.
+
+        Mirrors run_coverage_gate's treatment of malformed coverage_targets:
+        absent/empty → not an integration task (proceed);
+        present-but-wrong-type → fail-closed reject (not a silent skip = 假綠).
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        # integration_boundaries is a string (malformed — should be list[dict])
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': "yes", 'stack': 'python'})
+
+        # run_tests must NOT be called — the gate should reject before L1
+        called = {'l1': False}
+        def should_not_call(*a, **kw):
+            called['l1'] = True
+            return {'ran': True, 'passed': True, 'total': 1,
+                    'failures': 0, 'errors': 0, 'error': None, 'evidence': {}}
+        monkeypatch.setattr(ig, 'run_tests', should_not_call)
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"Malformed boundaries must reject, got {verdict['verdict']}")
+        assert not called['l1'], "run_tests must NOT be called for malformed boundaries"
+
+    # ------------------------------------------------------------------ unreadable test sources --
+
+    def test_unreadable_test_sources_rejects(self, mock_db_path, tmp_path, monkeypatch):
+        """L2: test_files non-empty but no file is readable → verdict rejected (fail-closed).
+
+        Cannot verify absence of mocks → reject (can't verify → reject),
+        mirroring how run_coverage_gate rejects when it can't derive test targets.
+        """
+        import servers.integration_gate as ig
+        import servers.facade as facade
+
+        boundaries = [{'caller': 'OrderService', 'callee': 'OrderRepository',
+                       'callee_file': 'repo.java', 'edge': 'injects'}]
+        # test_files points to a nonexistent path — no file will be readable
+        task, critic_id = self._setup_integration_task(
+            {'integration_boundaries': boundaries,
+             'test_files': ['/nonexistent/Foo.java'],
+             'stack': 'java'})
+
+        # L1 passes (monkeypatched to pass)
+        monkeypatch.setattr(ig, 'run_tests', lambda *a, **kw: {
+            'ran': True, 'passed': True, 'total': 2,
+            'failures': 0, 'errors': 0, 'error': None, 'evidence': {}})
+
+        verdict = facade.run_integration_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] in ('rejected', 'blocked'), (
+            f"Unreadable test sources must reject, got {verdict['verdict']}")
+        # Rejection reason must mention unreadable test sources
+        from servers.memory import get_working_memory
+        wm = get_working_memory(task, 'critic_suggestions')
+        assert wm and ('讀取' in wm or 'unreadable' in wm or '不可讀' in wm or 'test_files' in wm), (
+            f"Rejection context must mention unreadable test sources, got: {wm!r}")
+
+
 
 class TestFormatBoundarySummary:
     """Unit tests for format_boundary_summary — pure function, no DB needed."""

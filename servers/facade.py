@@ -1920,9 +1920,16 @@ def run_integration_gate(critic_task_id: str,
 
     boundaries = metadata.get('integration_boundaries')
 
-    # Not an integration task (no boundaries declared) → pass-through, no gating.
+    # Not an integration task (absent/empty boundaries) → pass-through, no gating.
     if not boundaries:
         return {'verdict': 'proceed', 'warn': None}
+
+    # Present but malformed (not list[dict]) → fail-closed reject (not a silent skip = 假綠).
+    # Mirror run_coverage_gate's treatment of malformed coverage_targets.
+    if (not isinstance(boundaries, list)
+            or not all(isinstance(b, dict) for b in boundaries)):
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：integration_boundaries metadata 型別異常（預期 list[dict]）'])
 
     test_files = metadata.get('test_files') or []
     stack = metadata.get('stack') or 'python'
@@ -1938,12 +1945,14 @@ def run_integration_gate(critic_task_id: str,
 
     # ── L2: Mock-smell detection — hard gate ───────────────────────────────────
     # Read each test file and check whether boundary collaborators are mocked.
+    # Fail-closed: if test_files is non-empty but zero files are readable,
+    # we cannot verify absence of mocks → reject (can't verify → reject).
     all_mocked: List[str] = []
     collaborators = [b.get('callee', '') for b in boundaries if b.get('callee')]
+    files_read = 0
 
     for tf in test_files:
         # test_files may be relative or absolute; try project_path-relative first
-        import os
         tf_path = tf if os.path.isabs(tf) else os.path.join(project_path, tf)
         if not os.path.isfile(tf_path):
             continue
@@ -1952,10 +1961,16 @@ def run_integration_gate(critic_task_id: str,
                 test_source = fh.read()
         except OSError:
             continue
+        files_read += 1
         mocked = ig.detect_mocked_collaborators(test_source, collaborators, stack)
         for m in mocked:
             if m not in all_mocked:
                 all_mocked.append(m)
+
+    # Fail-closed: non-empty test_files but zero readable → cannot verify → reject
+    if test_files and files_read == 0:
+        return _gate_reject(critic_task_id, original_task_id, [
+            '整合測試 gate：無法讀取任何測試原始碼以驗證未 mock 邊界（test_files 路徑不可讀）'])
 
     if all_mocked:
         issues = [f'fake integration: {m} is mocked' for m in all_mocked]
@@ -1964,12 +1979,11 @@ def run_integration_gate(critic_task_id: str,
     # ── L3: Branch coverage per boundary — advisory only ──────────────────────
     # Enrich each boundary with a label; verdict is never changed by L3.
     boundaries_with_labels = []
-    _ts = (proj_mod.ensure_project(project_name, project_path).get('tech_stack') or {})
 
     for b in boundaries:
         b_annotated = dict(b)
         b_annotated['_project_name'] = project_name
-        label = ig._classify_boundary_l3(b_annotated, project_path, test_files, stack)
+        label = ig._classify_boundary_l3(b_annotated, project_path, test_files)
         b_annotated['label'] = label
         boundaries_with_labels.append(b_annotated)
 
