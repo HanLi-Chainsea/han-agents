@@ -482,3 +482,83 @@ class TestBoundariesForTarget:
         result = boundaries_for_target("test-project", ["nonexistent/file.py"])
 
         assert result == []
+
+    def test_boundaries_resolves_callee_beyond_default_limit(self, monkeypatch):
+        """Callee nodes beyond the default 100-node limit are resolved.
+
+        When get_code_nodes is called to fetch all nodes, it must pass a high
+        limit (>1000) so callees beyond the default 100 are included in the
+        boundary resolution.
+        """
+        import servers.integration_gate as ig
+        import servers.code_graph as cg
+
+        caller_node = {
+            "id": "node-caller",
+            "kind": "class",
+            "name": "com.example.Controller",
+            "file_path": "src/main/java/Controller.java",
+        }
+        # Callee is at position 150 (beyond the default limit of 100)
+        callee_node = {
+            "id": "node-callee-150",
+            "kind": "class",
+            "name": "com.example.ServiceAt150",
+            "file_path": "src/main/java/ServiceAt150.java",
+        }
+
+        # Track the limit parameter passed to get_code_nodes
+        get_code_nodes_calls = []
+
+        def fake_get_nodes(project, kind=None, file_path=None, limit=100):
+            # Record the call to inspect the limit parameter
+            get_code_nodes_calls.append({
+                'file_path': file_path,
+                'kind': kind,
+                'limit': limit
+            })
+
+            if file_path == "src/main/java/Controller.java":
+                return [caller_node]
+            # When called to fetch all nodes (no file_path filter), return a list
+            # that includes the callee beyond position 100
+            if file_path is None and kind is None:
+                # Simulate a project with many nodes; callee is at position 150
+                many_nodes = [{"id": f"node-{i}", "name": f"cls.Node{i}",
+                               "kind": "class", "file_path": f"src/node{i}.java"}
+                              for i in range(200)]
+                many_nodes[0] = caller_node  # Caller at position 0
+                many_nodes[150] = callee_node  # Callee at position 150
+                return many_nodes
+            return []
+
+        def fake_get_edges(project, from_id=None, to_id=None, kind=None, limit=100):
+            if from_id == "node-caller":
+                return [{"from_id": "node-caller", "to_id": "node-callee-150",
+                        "kind": "calls", "line_number": 50, "confidence": 1.0}]
+            return []
+
+        monkeypatch.setattr(cg, "get_code_nodes", fake_get_nodes)
+        monkeypatch.setattr(cg, "get_code_edges", fake_get_edges)
+
+        from servers.integration_gate import boundaries_for_target
+        result = boundaries_for_target(
+            "test-project",
+            ["src/main/java/Controller.java"],
+        )
+
+        # The fix should make the boundary resolve (callee_node should be found)
+        assert len(result) == 1, f"Expected 1 boundary, got {len(result)}"
+        b = result[0]
+        assert b["caller"] == "com.example.Controller"
+        assert b["callee"] == "com.example.ServiceAt150"
+        assert b["callee_file"] == "src/main/java/ServiceAt150.java"
+        assert b["edge"] == "calls"
+
+        # Verify that get_code_nodes was called with a high limit
+        # (not just the default 100)
+        all_nodes_call = [c for c in get_code_nodes_calls
+                          if c['file_path'] is None and c['kind'] is None]
+        assert all_nodes_call, "get_code_nodes must be called to fetch all nodes"
+        assert all_nodes_call[0]['limit'] >= 1000, \
+            f"Expected limit >= 1000, got {all_nodes_call[0]['limit']}"

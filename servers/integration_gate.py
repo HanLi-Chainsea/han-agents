@@ -334,7 +334,7 @@ def boundaries_for_target(
     # Step 2: fetch all nodes in the project to allow callee resolution by id.
     # get_code_nodes has a limit; for boundary extraction we only need the
     # callee nodes that appear in edges, so build a lazy id->node index.
-    all_nodes_list = cg.get_code_nodes(project_name)
+    all_nodes_list = cg.get_code_nodes(project_name, limit=1_000_000)  # ponytail: hard ceiling 1e6 nodes; switch to by-id lookup if a project exceeds it
     all_nodes_by_id: Dict[str, Dict] = {n["id"]: n for n in all_nodes_list}
 
     # Step 3+4: for each caller node, get outgoing edges, keep injects/call
