@@ -27,12 +27,30 @@ Branch line resolution (in order):
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from typing import Dict, List, Optional
 
 _TIMEOUT_SEC = 600
+
+# Reuse the same ANSI sanitizer pattern used in servers/coverage.py
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+
+
+def _sanitize(text: Optional[str], limit: int = 600) -> str:
+    """Strip ANSI escape codes and control characters; truncate to limit chars.
+
+    Mirrors servers.coverage._sanitize — JS runner stdout/stderr goes into
+    reject/working-memory text, so it must be sanitized before use.
+    """
+    if not text:
+        return ''
+    text = _ANSI_RE.sub('', text)
+    text = ''.join(c for c in text
+                   if c in ('\n', '\t') or (ord(c) >= 32 and ord(c) != 127))
+    return text.strip()[-limit:]
 
 
 def _result(status: str, error: Optional[str] = None,
@@ -61,28 +79,67 @@ def _branch_line(branch_entry: dict) -> Optional[int]:
     return None
 
 
-def _match_file(json_key: str, file_path: str, project_root: str) -> bool:
-    """Return True when the coverage JSON key corresponds to file_path.
+def _match_file(coverage_keys: List[str], file_path: str, project_root: str) -> Optional[str]:
+    """Return the unique coverage JSON key that corresponds to file_path, or None.
 
-    Strategy:
-    1. Exact suffix match (json_key ends with file_path component)
-    2. Realpath match using project_root as base
+    J3 fix — three-phase lookup:
+      1. Exact realpath match: resolve file_path against project_root and compare
+         with os.path.realpath of each JSON key.  If exactly one key matches → use it.
+      2. Suffix-unique match: among all JSON keys whose normalized path ends with
+         '/file_path' (or equals it), if exactly one matches → use it.
+      3. Zero matches → None (no_targets).
+         >1 matches at any phase → None ('schema_error' signalled by caller).
+
+    Returns the matched key string, or None when zero matches were found.
+    The caller distinguishes zero-match vs ambiguous-match by checking separately.
     """
-    # Normalize slashes
-    jk = json_key.replace('\\', '/')
     fp = file_path.replace('\\', '/')
 
-    # Suffix match: json key (absolute path) must end with /fp or equal fp
-    if jk.endswith('/' + fp) or jk == fp:
-        return True
-
-    # Realpath match
+    # Phase 1: Exact realpath match
     if not os.path.isabs(fp):
         candidate = os.path.realpath(os.path.join(project_root, fp))
     else:
         candidate = os.path.realpath(fp)
-    if os.path.realpath(jk) == candidate:
+
+    exact_matches = [k for k in coverage_keys if os.path.realpath(k) == candidate]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        return None  # ambiguous — caller should signal schema_error
+
+    # Phase 2: Suffix match — only accept when unique
+    suffix_matches = [k for k in coverage_keys
+                      if k.replace('\\', '/').endswith('/' + fp)
+                      or k.replace('\\', '/') == fp]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    # 0 → no match; >1 → ambiguous; both return None
+    return None
+
+
+def _match_file_ambiguous(coverage_keys: List[str], file_path: str,
+                          project_root: str) -> bool:
+    """Return True when file_path maps to MORE THAN ONE JSON key (ambiguous).
+
+    Used by parse_js_coverage to distinguish no_targets from schema_error.
+    """
+    fp = file_path.replace('\\', '/')
+    if not os.path.isabs(fp):
+        candidate = os.path.realpath(os.path.join(project_root, fp))
+    else:
+        candidate = os.path.realpath(fp)
+
+    exact_matches = [k for k in coverage_keys if os.path.realpath(k) == candidate]
+    if len(exact_matches) > 1:
         return True
+
+    # If exact phase was unambiguous (0 or 1), check suffix-unique
+    if len(exact_matches) == 0:
+        suffix_matches = [k for k in coverage_keys
+                          if k.replace('\\', '/').endswith('/' + fp)
+                          or k.replace('\\', '/') == fp]
+        if len(suffix_matches) > 1:
+            return True
 
     return False
 
@@ -115,8 +172,12 @@ def parse_js_coverage(coverage_json_path: str,
     Fail-closed invariants (no 假綠):
     - Invalid line ranges  → 'invalid_targets'
     - Target file absent   → 'no_targets'
+    - Target file ambiguous (>1 JSON keys match) → 'schema_error'
     - File present but no branchMap/b data → 'schema_error'
     - Missing/malformed b entries          → 'schema_error'
+    - b[id] = [] (zero arms)              → 'schema_error'
+    - orphan b id (in b but not branchMap) within range → 'schema_error'
+    - branchMap entry with unresolvable line within range → 'schema_error'
     - NEVER defaults missing data to fully-covered.
     """
     # Validate targets — reuse the same guard as python/java backends (DRY, fail-closed)
@@ -139,6 +200,7 @@ def parse_js_coverage(coverage_json_path: str,
         return _result('schema_error', 'coverage-final.json: root is not a dict')
 
     root_abs = os.path.realpath(project_root)
+    coverage_keys = list(raw.keys())
     per_target = []
 
     for target in coverage_targets:
@@ -147,16 +209,20 @@ def parse_js_coverage(coverage_json_path: str,
         line_start = target['line_start']
         line_end = target['line_end']
 
-        # Find the matching key in the coverage JSON
-        file_data = None
-        for key, val in raw.items():
-            if _match_file(key, file_path, root_abs):
-                file_data = val
-                break
+        # J3: Use exact/unique match; detect ambiguity
+        matched_key = _match_file(coverage_keys, file_path, root_abs)
 
-        if file_data is None:
+        if matched_key is None:
+            # Distinguish: ambiguous vs absent
+            if _match_file_ambiguous(coverage_keys, file_path, root_abs):
+                return _result('schema_error',
+                               f'Target file {file_path!r} matches multiple entries in '
+                               f'coverage JSON (ambiguous in monorepo). '
+                               f'Use a more specific path.')
             return _result('no_targets',
                            f'Target file not found in coverage: {file_path}')
+
+        file_data = raw[matched_key]
 
         # Validate presence of branchMap and b
         branch_map = file_data.get('branchMap')
@@ -167,9 +233,16 @@ def parse_js_coverage(coverage_json_path: str,
                            f'Target {file_path}: coverage data missing branchMap/b '
                            f'(file present but no branch schema)')
 
-        # Collect branches in range
+        # J1: Validate branchMap↔b correspondence GLOBALLY first, then per-range.
+        # Check for orphan b ids (in b but not in branchMap) within target range.
+        # We do range-aware checking below.
+
+        # Collect branches in range — fail-closed on any structural anomaly
         covered_branches = []
         missing_branches = []
+
+        # Track which branchMap ids are in range
+        in_range_bids = set()
 
         for bid, bentry in branch_map.items():
             if not isinstance(bentry, dict):
@@ -177,14 +250,23 @@ def parse_js_coverage(coverage_json_path: str,
                                f'Target {file_path}: branchMap[{bid}] is not a dict')
 
             br_line = _branch_line(bentry)
+
+            # J1: Unresolvable line within range → schema_error (not skip-and-pass)
             if br_line is None:
-                # Cannot resolve line — skip (defensive; not a hard error)
-                continue
+                # We don't know if this branch is in range or not.
+                # Fail-closed: treat as schema_error since we cannot safely skip
+                # a branch that might be in range.
+                return _result('schema_error',
+                               f'Target {file_path}: branchMap[{bid}] has no '
+                               f'resolvable line number (loc.start.line and line '
+                               f'field are both absent/invalid)')
 
             if not (line_start <= br_line <= line_end):
                 continue
 
-            # Get arm hit-counts
+            in_range_bids.add(bid)
+
+            # J1: b[id] missing → schema_error
             if bid not in b_data:
                 return _result('schema_error',
                                f'Target {file_path}: b[{bid}] missing (branchMap/b mismatch)')
@@ -192,6 +274,12 @@ def parse_js_coverage(coverage_json_path: str,
             if not isinstance(arm_hits, list):
                 return _result('schema_error',
                                f'Target {file_path}: b[{bid}] is not a list')
+
+            # J1: Empty arm list → schema_error (zero-arm branch is malformed)
+            if len(arm_hits) == 0:
+                return _result('schema_error',
+                               f'Target {file_path}: b[{bid}] is empty (zero arms) '
+                               f'at line {br_line}; malformed coverage data')
 
             for arm_idx, hit_count in enumerate(arm_hits):
                 if not isinstance(hit_count, int) or isinstance(hit_count, bool):
@@ -202,6 +290,15 @@ def parse_js_coverage(coverage_json_path: str,
                     covered_branches.append(entry)
                 else:
                     missing_branches.append(entry)
+
+        # J1: Detect orphan b ids — in b_data but not in branchMap — within range.
+        # We approximate "in range" for orphan ids by checking all b ids not in branchMap
+        # at all (since we cannot determine their line). Any orphan → schema_error.
+        for bid in b_data:
+            if bid not in branch_map:
+                return _result('schema_error',
+                               f'Target {file_path}: b[{bid}] has no matching '
+                               f'branchMap entry (orphan b id; branchMap/b mismatch)')
 
         # File present + branchMap/b present, but no branch slots in range → schema_error
         # (not no_targets — the file IS there; we just got no data for this target range)
@@ -250,7 +347,7 @@ def measure_branch_coverage_js(
         project_path: Absolute path to the JS/TS project root.
         test_targets: Test file paths (relative to project_path or absolute).
         coverage_targets: List of {'file_path', 'name', 'line_start', 'line_end'}.
-        tool: 'vitest' (default) or 'jest'.
+        tool: 'vitest' (default) or 'jest'. Other tools (mocha etc.) → 'unavailable'.
 
     Returns:
         Same contract as servers/coverage.py::measure_branch_coverage.
@@ -261,7 +358,7 @@ def measure_branch_coverage_js(
           'no_targets'     — coverage json produced but target file absent
           'invalid_targets'— bad line_start/line_end
           'schema_error'   — json present but malformed
-          'unavailable'    — npx not found (infra; caller may fail-open)
+          'unavailable'    — npx not found / unsupported tool (infra; gate rejects)
     """
     from servers.coverage import _invalid_targets
 
@@ -272,19 +369,32 @@ def measure_branch_coverage_js(
     if not coverage_targets:
         return _result('no_targets', 'No coverage targets provided')
 
+    # Major: mocha (and any non-vitest/jest) → fail-closed unavailable.
+    # Do NOT silently run a different runner — that is a false green.
+    tool_lower = (tool or 'vitest').lower().strip()
+    if tool_lower not in ('vitest', 'jest'):
+        return _result('unavailable',
+                       f'JS coverage runner "{tool}" is not supported '
+                       f'(only vitest and jest are supported); '
+                       f'cannot verify branch coverage')
+
+    # J2: JS unavailable → fail-closed (not proceed).
     if not _js_available():
-        return _result('unavailable', 'npx not found; JS coverage unavailable')
+        return _result('unavailable',
+                       'JS coverage runner 不可用：請確認專案已安裝 vitest/jest；'
+                       '無法驗證分支覆蓋,不予放行')
 
     project_path = os.path.realpath(project_path)
 
     with tempfile.TemporaryDirectory() as tmp:
         cov_dir = os.path.join(tmp, 'coverage')
 
-        tool_lower = (tool or 'vitest').lower().strip()
-
+        # Major: use --no-install so npx uses the project's locally installed
+        # binary and fails (→ unavailable → gate rejects) rather than downloading
+        # an unpinned runner from the registry.
         if tool_lower == 'jest':
             cmd = [
-                'npx', 'jest',
+                'npx', '--no-install', 'jest',
                 '--coverage',
                 '--coverageReporters=json',
                 f'--coverageDirectory={cov_dir}',
@@ -292,9 +402,9 @@ def measure_branch_coverage_js(
                 *test_targets,
             ]
         else:
-            # Default to vitest
+            # vitest
             cmd = [
-                'npx', 'vitest', 'run',
+                'npx', '--no-install', 'vitest', 'run',
                 '--coverage',
                 '--coverage.provider=v8',
                 '--coverage.reporter=json',
@@ -318,7 +428,8 @@ def measure_branch_coverage_js(
             return _result('test_run_error', f'Failed to launch {tool}: {e}')
 
         rc = run.returncode
-        combined = ((run.stdout or '') + (run.stderr or ''))[-600:]
+        # Major: sanitize subprocess output before it enters rejection context
+        combined = _sanitize((run.stdout or '') + (run.stderr or ''))
 
         coverage_json = os.path.join(cov_dir, 'coverage-final.json')
 

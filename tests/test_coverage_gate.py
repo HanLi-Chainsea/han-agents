@@ -1460,9 +1460,9 @@ class TestJsStackRouting:
         assert len(js_calls) == 1
         assert js_calls[0] == 'jest', f'tool should be jest, got {js_calls[0]}'
 
-    def test_js_npx_unavailable_fails_open_with_warning(
+    def test_js_npx_unavailable_rejects_fail_closed(
             self, mock_db_path, tmp_path, monkeypatch):
-        """When npx is not found, gate must fail-open (not fail-closed)."""
+        """J2: When npx is not found, gate must fail-CLOSED (reject, not proceed)."""
         import servers.coverage as cov
         import servers.coverage_js as cov_js
         import servers.project as project
@@ -1475,12 +1475,15 @@ class TestJsStackRouting:
 
         monkeypatch.setattr(project, 'ensure_project',
                             lambda *a, **k: {'tech_stack': {'test_tool': 'vitest'}})
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['src/f.test.js'])
         monkeypatch.setattr(cov_js, '_js_available', lambda: False)
 
         verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
 
-        assert verdict['verdict'] == 'proceed'
-        assert verdict.get('warn') and 'npx' in verdict['warn'].lower()
+        # J2 fix: JS runner absence is NOT an infra carve-out → must reject, not proceed.
+        assert verdict['verdict'] == 'rejected', (
+            f'J2: JS runner absence must reject (fail-closed), got {verdict["verdict"]}' )
+        assert '不予放行' in ' '.join(verdict.get('issues', []))
 
 
 # ── Part A: coverage gate persists per_target data to working_memory ──────────

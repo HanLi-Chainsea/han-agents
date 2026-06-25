@@ -519,3 +519,434 @@ class TestMeasureBranchCoverageJsSubprocess:
 
         assert res['tool_status'] == 'test_run_error'
         assert res['fully_covered'] is False
+
+
+# ---------------------------------------------------------------------------
+# J1 — parser must not silently skip unparseable branches
+# ---------------------------------------------------------------------------
+
+class TestParseJsCoverageJ1FailClosed:
+    """J1: within a target's line range, structural anomalies → schema_error."""
+
+    def _branch_entry(self, line):
+        return {'type': 'if', 'line': line,
+                'loc': {'start': {'line': line, 'column': 0}, 'end': {'line': line + 1, 'column': 0}},
+                'locations': []}
+
+    def test_empty_arm_list_in_range_is_schema_error(self, tmp_path):
+        """b[id] = [] (zero arms) within target range → schema_error, not skip."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {
+            '0': self._branch_entry(2),   # in range 1-5
+            '1': self._branch_entry(3),   # in range 1-5
+        }
+        # id 0 has valid arms; id 1 has empty list (malformed)
+        b_data = {'0': [1, 0], '1': []}
+
+        _write_istanbul_json(str(cov_json), src_abs, branch_map, b_data)
+
+        targets = [_make_target('src/f.js', 'f', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error', (
+            f'Expected schema_error for zero-arm branch, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+
+    def test_orphan_b_id_in_range_is_schema_error(self, tmp_path):
+        """b has id not in branchMap → schema_error (orphan b id)."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        # branchMap only has id '0'
+        branch_map = {'0': self._branch_entry(2)}
+        # b has extra id '99' that doesn't exist in branchMap
+        b_data = {'0': [1, 0], '99': [3, 0]}
+
+        _write_istanbul_json(str(cov_json), src_abs, branch_map, b_data)
+
+        targets = [_make_target('src/f.js', 'f', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error', (
+            f'Expected schema_error for orphan b id, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+
+    def test_unresolvable_line_in_range_is_schema_error(self, tmp_path):
+        """branchMap entry with no resolvable line → schema_error (not skip)."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {
+            '0': {
+                'type': 'if',
+                # neither loc.start.line nor line is present
+                'loc': {'start': {'column': 0}, 'end': {'line': 3, 'column': 0}},
+                'locations': [],
+            },
+        }
+        b_data = {'0': [1, 0]}
+
+        _write_istanbul_json(str(cov_json), src_abs, branch_map, b_data)
+
+        targets = [_make_target('src/f.js', 'f', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error', (
+            f'Expected schema_error for unresolvable line, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+
+    def test_clean_partial_coverage_still_ok(self, tmp_path):
+        """Guard against over-rejection: a clean partial-coverage fixture → ok."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {
+            '0': self._branch_entry(2),
+            '1': self._branch_entry(3),
+        }
+        # Both valid: id 0 has one covered arm, one missing; id 1 all covered
+        b_data = {'0': [1, 0], '1': [2, 3]}
+
+        _write_istanbul_json(str(cov_json), src_abs, branch_map, b_data)
+
+        targets = [_make_target('src/f.js', 'f', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'ok', (
+            f'Expected ok for clean partial coverage, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+        pt = res['per_target'][0]
+        # id0=[1,0]=2 arms, id1=[2,3]=2 arms → n_total=4
+        # Actually: id0 has 2 arms, id1 has 2 arms → n_total=4
+        assert pt['n_total'] == 4
+        assert pt['n_covered'] == 3  # id0 arm0 + id1 arm0 + id1 arm1 = 3
+        assert len(pt['missing_branches']) == 1   # id0 arm1
+
+    def test_branchmap_missing_b_entry_in_range_is_schema_error(self, tmp_path):
+        """branchMap id in range but absent from b → schema_error."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {'0': self._branch_entry(2)}
+        b_data = {}  # missing id '0'
+
+        _write_istanbul_json(str(cov_json), src_abs, branch_map, b_data)
+
+        targets = [_make_target('src/f.js', 'f', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+
+# ---------------------------------------------------------------------------
+# J2 — JS unavailable must NOT proceed in run_coverage_gate
+# ---------------------------------------------------------------------------
+
+class TestRunCoverageGateJ2JsUnavailable:
+    """J2: JS runner absent → _gate_reject (verdict='rejected'), NOT proceed."""
+
+    def _setup_js_task(self, mock_db_path_fixture, tmp_path, monkeypatch,
+                       test_tool='vitest'):
+        """Create a done task with JS coverage_targets and return (task_id, critic_id)."""
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': test_tool}})
+
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        targets = [{'file_path': 'src/f.js', 'name': 'fn',
+                    'line_start': 1, 'line_end': 10}]
+        task = create_subtask(parent_id=story, description='write js tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test/f.test.js')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_js_runner_unavailable_rejects_not_proceeds(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """J2: npx not found → verdict='rejected', not 'proceed'."""
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: False)
+
+        task, critic_id = self._setup_js_task(mock_db_path, tmp_path, monkeypatch)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'JS unavailable must reject (fail-closed), got {verdict["verdict"]}')
+        assert '不予放行' in ' '.join(verdict.get('issues', []))
+
+    def test_js_runner_unavailable_reject_message_is_clear(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """J2: rejection message mentions vitest/jest and explains why."""
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: False)
+
+        task, critic_id = self._setup_js_task(mock_db_path, tmp_path, monkeypatch)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        issues_text = ' '.join(verdict.get('issues', []))
+        assert 'vitest' in issues_text or 'jest' in issues_text or 'JS' in issues_text
+
+
+# ---------------------------------------------------------------------------
+# J3 — file attribution must be exact, not first-suffix-match
+# ---------------------------------------------------------------------------
+
+class TestParseJsCoverageJ3FileAttribution:
+    """J3: monorepo with two same-named files must attribute to the correct one."""
+
+    def _make_branch_map(self, line):
+        return {
+            '0': {'type': 'if', 'line': line,
+                  'loc': {'start': {'line': line, 'column': 0},
+                          'end': {'line': line + 1, 'column': 0}},
+                  'locations': []},
+        }
+
+    def test_monorepo_exact_match_picks_correct_file(self, tmp_path):
+        """Two keys pkgA/src/foo.js (0/2 covered) and pkgB/src/foo.js (2/2).
+        Target pkgA/src/foo.js → must attribute to the 0/2 one (fully_covered False).
+        """
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+
+        pkg_a = str(tmp_path / 'pkgA' / 'src' / 'foo.js')
+        pkg_b = str(tmp_path / 'pkgB' / 'src' / 'foo.js')
+
+        # pkgA: branch at line 2, arm 0 hit (1), arm 1 NOT hit (0) → 1/2 covered
+        data_a = {'branchMap': self._make_branch_map(2), 'b': {'0': [1, 0]},
+                  'path': pkg_a, 'all': False, 'statementMap': {}, 's': {}}
+        # pkgB: branch at line 2, both arms hit → 2/2 covered
+        data_b = {'branchMap': self._make_branch_map(2), 'b': {'0': [3, 5]},
+                  'path': pkg_b, 'all': False, 'statementMap': {}, 's': {}}
+
+        with open(str(cov_json), 'w') as fh:
+            json.dump({pkg_a: data_a, pkg_b: data_b}, fh)
+
+        # Target explicitly names pkgA/src/foo.js → must NOT grab pkgB's 2/2
+        targets = [_make_target('pkgA/src/foo.js', 'fn', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'ok', (
+            f'Expected ok for exact-matched file, got {res["tool_status"]}: {res.get("error")}')
+        assert res['fully_covered'] is False, (
+            'Must attribute to pkgA (0/2 covered), not pkgB (2/2)')
+        pt = res['per_target'][0]
+        assert len(pt['missing_branches']) >= 1
+
+    def test_ambiguous_bare_name_is_schema_error(self, tmp_path):
+        """A bare 'foo.js' target that matches both pkgA/src/foo.js and pkgB/src/foo.js
+        → schema_error (not pick one arbitrarily).
+        """
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+
+        pkg_a = str(tmp_path / 'pkgA' / 'src' / 'foo.js')
+        pkg_b = str(tmp_path / 'pkgB' / 'src' / 'foo.js')
+
+        data_a = {'branchMap': self._make_branch_map(2), 'b': {'0': [1, 0]},
+                  'path': pkg_a, 'all': False, 'statementMap': {}, 's': {}}
+        data_b = {'branchMap': self._make_branch_map(2), 'b': {'0': [3, 5]},
+                  'path': pkg_b, 'all': False, 'statementMap': {}, 's': {}}
+
+        with open(str(cov_json), 'w') as fh:
+            json.dump({pkg_a: data_a, pkg_b: data_b}, fh)
+
+        # Ambiguous bare name — both keys end with /foo.js
+        targets = [_make_target('foo.js', 'fn', 1, 5)]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error', (
+            f'Ambiguous file match must be schema_error, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+
+
+# ---------------------------------------------------------------------------
+# Major — npx --no-install must be present in the command list
+# ---------------------------------------------------------------------------
+
+class TestNpxNoInstall:
+    """Verify that npx --no-install is used so registry downloads are prevented."""
+
+    def _capture_cmd(self, tmp_path, monkeypatch, tool):
+        import servers.coverage_js as cov_js
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        captured = {}
+
+        class FakeRun:
+            returncode = 0
+            stdout = ''
+            stderr = ''
+
+        def fake_run(cmd, **kwargs):
+            captured['cmd'] = list(cmd)
+            # Return zero exit but no coverage json → test_run_error (fine for cmd check)
+            return FakeRun()
+
+        monkeypatch.setattr(cov_js.subprocess, 'run', fake_run)
+
+        targets = [_make_target('src/f.js', 'fn', 1, 5)]
+        cov_js.measure_branch_coverage_js(str(tmp_path), ['test.js'], targets, tool=tool)
+        return captured.get('cmd', [])
+
+    def test_vitest_cmd_includes_no_install(self, tmp_path, monkeypatch):
+        cmd = self._capture_cmd(tmp_path, monkeypatch, 'vitest')
+        assert '--no-install' in cmd, (
+            f'vitest cmd must contain --no-install to prevent registry downloads; got {cmd}')
+        assert cmd[0] == 'npx'
+        assert 'vitest' in cmd
+
+    def test_jest_cmd_includes_no_install(self, tmp_path, monkeypatch):
+        cmd = self._capture_cmd(tmp_path, monkeypatch, 'jest')
+        assert '--no-install' in cmd, (
+            f'jest cmd must contain --no-install to prevent registry downloads; got {cmd}')
+        assert cmd[0] == 'npx'
+        assert 'jest' in cmd
+
+
+# ---------------------------------------------------------------------------
+# Major — mocha must be unsupported (not silently run as vitest)
+# ---------------------------------------------------------------------------
+
+class TestMochaMustBeUnsupported:
+    """Mocha (and any non-vitest/jest) must return unavailable, not run vitest."""
+
+    def test_mocha_returns_unavailable_not_vitest(self, tmp_path, monkeypatch):
+        import servers.coverage_js as cov_js
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        subprocess_called = []
+
+        def boom(*a, **k):
+            subprocess_called.append(list(a[0]) if a else [])
+            raise AssertionError('subprocess.run must NOT be called for mocha')
+
+        monkeypatch.setattr(cov_js.subprocess, 'run', boom)
+
+        targets = [_make_target('src/f.js', 'fn', 1, 5)]
+        res = cov_js.measure_branch_coverage_js(
+            str(tmp_path), ['test/f.test.js'], targets, tool='mocha')
+
+        assert res['tool_status'] == 'unavailable', (
+            f'mocha must return unavailable (not run vitest), got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+        assert subprocess_called == [], 'subprocess.run must not be invoked for mocha'
+
+    def test_unknown_tool_returns_unavailable(self, tmp_path, monkeypatch):
+        import servers.coverage_js as cov_js
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        targets = [_make_target('src/f.js', 'fn', 1, 5)]
+        res = cov_js.measure_branch_coverage_js(
+            str(tmp_path), ['test.js'], targets, tool='karma')
+
+        assert res['tool_status'] == 'unavailable'
+        assert res['fully_covered'] is False
+
+    def test_mocha_gate_rejects_not_proceeds(self, mock_db_path, tmp_path, monkeypatch):
+        """In the gate, mocha → measure returns unavailable → gate must reject (not proceed)."""
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as _proj
+        import servers.facade as facade
+
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'mocha'}})
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['test/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        # measure_branch_coverage_js will return unavailable (mocha unsupported)
+        # without calling subprocess — no need to monkeypatch subprocess
+
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        targets = [{'file_path': 'src/f.js', 'name': 'fn',
+                    'line_start': 1, 'line_end': 10}]
+        task = create_subtask(parent_id=story, description='write mocha tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test/f.test.js')
+        critic = reserve_critic_task(task)
+        critic_id = critic['id']
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'mocha should cause gate to reject (fail-closed), got {verdict["verdict"]}')
+
+
+# ---------------------------------------------------------------------------
+# Major — subprocess output sanitization
+# ---------------------------------------------------------------------------
+
+class TestSubprocessOutputSanitization:
+    """ANSI/control chars in subprocess output must be stripped before use."""
+
+    def test_ansi_codes_stripped_from_error_message(self, tmp_path, monkeypatch):
+        """ANSI color codes in runner stdout/stderr must not appear in error message."""
+        import servers.coverage_js as cov_js
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        class FakeRun:
+            returncode = 1
+            stdout = '\x1b[31mFAIL\x1b[0m src/classify.test.js'
+            stderr = '\x1b[33m⚠ Coverage not collected\x1b[0m'
+
+        monkeypatch.setattr(cov_js.subprocess, 'run', lambda *a, **k: FakeRun())
+
+        targets = [_make_target('src/f.js', 'fn', 1, 5)]
+        res = cov_js.measure_branch_coverage_js(str(tmp_path), ['test.js'], targets)
+
+        assert res['tool_status'] == 'tests_failed'
+        error = res.get('error') or ''
+        assert '\x1b' not in error, (
+            f'ANSI escape codes must be stripped from error message; got: {error!r}')
+
+    def test_control_chars_stripped_from_error_message(self, tmp_path, monkeypatch):
+        """Control chars (e.g., BEL, BS) must be stripped from error messages."""
+        import servers.coverage_js as cov_js
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        class FakeRun:
+            returncode = 1
+            stdout = 'Error\x07\x08 something broke'  # BEL + BS
+            stderr = ''
+
+        monkeypatch.setattr(cov_js.subprocess, 'run', lambda *a, **k: FakeRun())
+
+        targets = [_make_target('src/f.js', 'fn', 1, 5)]
+        res = cov_js.measure_branch_coverage_js(str(tmp_path), ['test.js'], targets)
+
+        error = res.get('error') or ''
+        assert '\x07' not in error and '\x08' not in error, (
+            f'Control chars must be stripped from error message; got: {error!r}')

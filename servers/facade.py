@@ -1899,10 +1899,13 @@ def run_coverage_gate(critic_task_id: str,
 
     if _backend == 'js':
         from servers import coverage_js as cov_js
-        # JS availability = npx resolvable (node present).  Absent → infra fail-open.
+        # J2: JS availability = npx resolvable (node present).
+        # Absent → fail-closed reject (JS test runner is a project dependency;
+        # absence means we cannot verify coverage → must not proceed).
         if not cov_js._js_available():
-            return {'verdict': 'proceed',
-                    'warn': '⚠️ npx/node not found; JS coverage unavailable, manual branch review required.'}
+            return _gate_reject(critic_task_id, original_task_id, [
+                'JS coverage runner 不可用：請確認專案已安裝 vitest/jest；'
+                '無法驗證分支覆蓋,不予放行'])
     elif _backend != 'java':
         # Python / unknown stack: check python-coverage availability (infra check).
         # Java stack does NOT go through this check — gradlew absence is handled
@@ -1936,10 +1939,11 @@ def run_coverage_gate(critic_task_id: str,
             project_path, test_targets, coverage_targets,
             test_filters=java_test_filters if java_test_filters else None)
     elif _backend == 'js':
-        # Vitest/Jest backend — tool derived from tech_stack.test_tool (or default vitest)
+        # Vitest/Jest backend — tool derived from tech_stack.test_tool (or default vitest).
+        # Major: do NOT force mocha/other tools to vitest — that is a false runner.
+        # measure_branch_coverage_js returns 'unavailable' for unsupported tools,
+        # which the gate handles fail-closed below (unavailable → _gate_reject for JS).
         _js_tool = (_ts.get('test_tool') or 'vitest').lower().strip()
-        if _js_tool not in ('vitest', 'jest'):
-            _js_tool = 'vitest'  # mocha and other JS tools: default to vitest
         res = cov_js.measure_branch_coverage_js(
             project_path, test_targets, coverage_targets, tool=_js_tool)
     else:
@@ -1975,9 +1979,10 @@ def run_coverage_gate(critic_task_id: str,
         issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
         return _gate_reject(critic_task_id, original_task_id, issues)
 
-    # 唯一 fail-open：coverage 套件缺失（真正 infra；measure 回 'unavailable'）。
-    # 此時回退人工逐分支核對（playbook critic checklist 已涵蓋）。
-    if status == 'unavailable':
+    # fail-open 只給 Python backend coverage 套件缺失（真正 infra）。
+    # JS backend 的 unavailable (npx not found / mocha unsupported) 已在上方 early check
+    # 或 measure 回傳後走 fail-closed；不能讓 JS unavailable 進這裡 fail-open。
+    if status == 'unavailable' and _backend != 'js':
         return {'verdict': 'proceed',
                 'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
 
