@@ -1481,3 +1481,102 @@ class TestJsStackRouting:
 
         assert verdict['verdict'] == 'proceed'
         assert verdict.get('warn') and 'npx' in verdict['warn'].lower()
+
+
+# ── Part A: coverage gate persists per_target data to working_memory ──────────
+
+
+class TestRunCoverageGatePersistsCoverage:
+    """After run_coverage_gate measures coverage (status=ok), the original task's
+    'coverage' working-memory key must be populated with per_target compact data."""
+
+    def _setup_done_task(self, cov_targets, result):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_fully_covered_persists_coverage_to_working_memory(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import json
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+
+        targets = [{'file_path': 'src/x.py', 'name': 'foo',
+                    'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: tests/test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['tests/test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'src/x.py', 'name': 'foo',
+                            'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}],
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}],
+        })
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+
+        raw = get_working_memory(task, 'coverage')
+        assert raw is not None, 'coverage working-memory must be set after ok measurement'
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(data, list) and len(data) == 1
+        entry = data[0]
+        assert entry['file_path'] == 'src/x.py'
+        assert entry['name'] == 'foo'
+        assert entry['n_covered'] == 2
+        assert entry['n_total'] == 2
+        assert entry['missing_branches'] == []
+
+    def test_partially_covered_also_persists_coverage_before_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Gate must persist coverage data even for the reject path (partial coverage)."""
+        import json
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+
+        targets = [{'file_path': 'src/x.py', 'name': 'foo',
+                    'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: tests/test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['tests/test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'src/x.py', 'name': 'foo',
+                            'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}],
+                            'missing_branches': [{'from': 2, 'to': 5}],
+                            'n_total': 2, 'n_covered': 1}],
+        })
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+
+        raw = get_working_memory(task, 'coverage')
+        assert raw is not None, 'coverage working-memory must be set even on reject path'
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(data, list) and len(data) == 1
+        entry = data[0]
+        assert entry['n_covered'] == 1
+        assert entry['n_total'] == 2
+        assert entry['missing_branches'] == [{'from': 2, 'to': 5}]

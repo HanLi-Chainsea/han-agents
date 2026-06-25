@@ -1953,6 +1953,20 @@ def run_coverage_gate(critic_task_id: str,
         summary = cov.format_coverage_summary(res['per_target'])
         for line in summary:
             sys.stderr.write(line + '\n')
+        # Part A：把 per_target 精簡格式持久化到 working_memory，
+        # 讓收尾報告（reporting.py）可以讀取，不再只存 stderr。
+        try:
+            import json as _json
+            from servers.memory import set_working_memory as _swm
+            _compact = [
+                {'file_path': t.get('file_path', ''), 'name': t.get('name', ''),
+                 'n_covered': t.get('n_covered', 0), 'n_total': t.get('n_total', 0),
+                 'missing_branches': t.get('missing_branches', [])}
+                for t in res['per_target']
+            ]
+            _swm(original_task_id, 'coverage', _json.dumps(_compact))
+        except Exception:
+            pass  # 不影響 gate 判斷
         if res['fully_covered']:
             # 同時把摘要回傳：stderr 是即時的、迴圈結束後就消失；回傳值讓 dispatch
             # 迴圈攔得到，最後能寫進收尾的人類報告（不只 stderr）。
