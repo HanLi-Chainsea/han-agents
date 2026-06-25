@@ -1,9 +1,11 @@
 """
-Tests for _detect_test_tool_from_config — config-file-based test runner detection.
+Tests for _detect_test_tool_from_config and _detect_tech_stack —
+config-file-based test runner detection + framework/test_tool decoupling.
 TDD: write tests first, watch them fail, then implement.
 """
 
 import json
+import sqlite3
 import pytest
 
 from servers.project import _detect_test_tool_from_config
@@ -179,4 +181,260 @@ class TestEdgeCases:
             "export default defineConfig({ server: { port: 3000 } });"
         )
         # No other signals → None
+        assert _detect_test_tool_from_config(tmp_path) is None
+
+
+# =============================================================================
+# D1 — Framework imports must NOT set test_tool
+# =============================================================================
+
+class TestD1FrameworkDecoupled:
+    """D1: Framework hint entries (react, next, express, vue, nuxt) must NOT inject
+    test_tool into _detect_tech_stack result — only real test-runner imports should."""
+
+    def _make_db_with_imports(self, db_path, project, imports):
+        """Insert code_nodes + import edges into a real schema DB."""
+        import os
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'brain', 'schema.sql'
+        )
+        conn = sqlite3.connect(db_path)
+        with open(schema_path, encoding='utf-8') as f:
+            conn.executescript(f.read())
+
+        # Insert a source file node
+        conn.execute(
+            "INSERT OR IGNORE INTO code_nodes (id, project, kind, name, language) "
+            "VALUES ('file.src', ?, 'file', 'src/index.ts', 'typescript')",
+            (project,)
+        )
+        # Insert import target nodes and edges
+        for imp in imports:
+            node_id = f'import.{imp}'
+            conn.execute(
+                "INSERT OR IGNORE INTO code_nodes (id, project, kind, name) "
+                "VALUES (?, ?, 'import', ?)",
+                (node_id, project, imp)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO code_edges (project, from_id, to_id, kind) "
+                "VALUES (?, 'file.src', ?, 'imports')",
+                (project, node_id)
+            )
+        conn.commit()
+        conn.close()
+
+    def test_react_import_no_jest_config_no_jest_in_test_tool(
+            self, tmp_path, mock_db_path, monkeypatch):
+        """D1: importing 'react' with no jest/vitest config → test_tool != 'jest' from hint.
+
+        Without any config files and without jest/vitest import nodes,
+        the test_tool should come from the language default (jest for typescript)
+        or be None — but NOT be forced to 'jest' by the react framework hint.
+
+        Specifically: the react hint must NOT carry test_tool='jest'.
+        After D1, react hint sets test_tool=None, so import heuristic yields
+        only the react framework — no test_tool from hints → falls to language default.
+        We verify that the react hint alone is not responsible for setting test_tool.
+        """
+        from servers.project import _detect_tech_stack, _FRAMEWORK_HINTS
+
+        # D1 fix: the react hint must have test_tool=None
+        framework_name, test_tool_from_hint = _FRAMEWORK_HINTS.get('react', (None, None))
+        assert test_tool_from_hint is None, (
+            "D1 violation: react hint carries test_tool='jest'; "
+            "framework hints must not set test_tool"
+        )
+
+    def test_next_hint_has_no_test_tool(self):
+        """D1: 'next' framework hint must not carry test_tool."""
+        from servers.project import _FRAMEWORK_HINTS
+        _, test_tool = _FRAMEWORK_HINTS.get('next', (None, None))
+        assert test_tool is None, "D1 violation: next hint carries test_tool"
+
+    def test_express_hint_has_no_test_tool(self):
+        """D1: 'express' framework hint must not carry test_tool."""
+        from servers.project import _FRAMEWORK_HINTS
+        _, test_tool = _FRAMEWORK_HINTS.get('express', (None, None))
+        assert test_tool is None, "D1 violation: express hint carries test_tool"
+
+    def test_vue_hint_has_no_test_tool(self):
+        """D1: 'vue' framework hint must not carry test_tool."""
+        from servers.project import _FRAMEWORK_HINTS
+        _, test_tool = _FRAMEWORK_HINTS.get('vue', (None, None))
+        assert test_tool is None, "D1 violation: vue hint carries test_tool"
+
+    def test_nuxt_hint_has_no_test_tool(self):
+        """D1: 'nuxt' framework hint must not carry test_tool."""
+        from servers.project import _FRAMEWORK_HINTS
+        _, test_tool = _FRAMEWORK_HINTS.get('nuxt', (None, None))
+        assert test_tool is None, "D1 violation: nuxt hint carries test_tool"
+
+    def test_react_only_import_does_not_set_jest_via_hint(
+            self, tmp_path, mock_db_path):
+        """D1 integration: project with only 'react' import (no jest/vitest) and
+        no config files → test_tool is NOT 'jest' sourced from react hint.
+
+        After D1, with no config and no jest/vitest import nodes, test_tool may be
+        the language default (typescript→jest) but NOT from the react hint itself.
+        We confirm the react hint's test_tool field is None so it cannot pollute.
+        """
+        from servers.project import _FRAMEWORK_HINTS
+        _, react_test_tool = _FRAMEWORK_HINTS['react']
+        assert react_test_tool is None
+
+
+# =============================================================================
+# D2 — Ambiguous import heuristic → None when >1 test_tool and no config
+# =============================================================================
+
+class TestD2AmbiguousTestTool:
+    """D2: If import heuristic sees both 'jest' and 'vitest' nodes but no config
+    file → test_tool must be None (not silently 'jest' via sorted()[0])."""
+
+    def _make_db_with_imports(self, db_path, project, imports):
+        import os
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'brain', 'schema.sql'
+        )
+        conn = sqlite3.connect(db_path)
+        with open(schema_path, encoding='utf-8') as f:
+            conn.executescript(f.read())
+        conn.execute(
+            "INSERT OR IGNORE INTO code_nodes "
+            "(id, project, kind, name, language) VALUES "
+            "('file.src', ?, 'file', 'src/index.ts', 'typescript')",
+            (project,)
+        )
+        for imp in imports:
+            node_id = f'import.{imp}'
+            conn.execute(
+                "INSERT OR IGNORE INTO code_nodes (id, project, kind, name) "
+                "VALUES (?, ?, 'import', ?)",
+                (node_id, project, imp)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO code_edges "
+                "(project, from_id, to_id, kind) "
+                "VALUES (?, 'file.src', ?, 'imports')",
+                (project, node_id)
+            )
+        conn.commit()
+        conn.close()
+
+    def test_both_jest_and_vitest_import_no_config_yields_none(
+            self, tmp_path, mock_db_path):
+        """D2: imports include both 'jest' and 'vitest', no config → test_tool is None."""
+        import servers as s
+        self._make_db_with_imports(
+            s.BRAIN_DB, 'proj_d2', ['jest', 'vitest']
+        )
+        from servers.project import _detect_tech_stack
+        result = _detect_tech_stack('proj_d2', project_path=None)
+        assert result['test_tool'] is None, (
+            f"D2 violation: expected None for ambiguous imports, "
+            f"got {result['test_tool']!r}"
+        )
+
+    def test_jest_only_import_no_config_yields_jest(
+            self, tmp_path, mock_db_path):
+        """D2: only 'jest' imported, no config → test_tool is 'jest' (unambiguous)."""
+        import servers as s
+        self._make_db_with_imports(
+            s.BRAIN_DB, 'proj_d2b', ['jest']
+        )
+        from servers.project import _detect_tech_stack
+        result = _detect_tech_stack('proj_d2b', project_path=None)
+        assert result['test_tool'] == 'jest'
+
+    def test_vitest_only_import_no_config_yields_vitest(
+            self, tmp_path, mock_db_path):
+        """D2: only 'vitest' imported, no config → test_tool is 'vitest' (unambiguous)."""
+        import servers as s
+        self._make_db_with_imports(
+            s.BRAIN_DB, 'proj_d2c', ['vitest']
+        )
+        from servers.project import _detect_tech_stack
+        result = _detect_tech_stack('proj_d2c', project_path=None)
+        assert result['test_tool'] == 'vitest'
+
+    def test_config_wins_over_ambiguous_imports(
+            self, tmp_path, mock_db_path):
+        """D2: config present (vitest.config.ts) overrides ambiguous imports → vitest."""
+        import servers as s
+        self._make_db_with_imports(
+            s.BRAIN_DB, 'proj_d2d', ['jest', 'vitest']
+        )
+        (tmp_path / "vitest.config.ts").write_text("export default {};")
+        from servers.project import _detect_tech_stack
+        result = _detect_tech_stack('proj_d2d', project_path=str(tmp_path))
+        assert result['test_tool'] == 'vitest'
+
+
+# =============================================================================
+# D3 — Malformed package.json must not skip jest.config.* detection
+# =============================================================================
+
+class TestD3MalformedPackageJson:
+    """D3: A malformed package.json must not short-circuit checking jest.config.*."""
+
+    def test_malformed_package_json_with_jest_config_js(self, tmp_path):
+        """D3: malformed package.json + jest.config.js → returns 'jest'."""
+        (tmp_path / "package.json").write_text("{ this is broken json !!!")
+        (tmp_path / "jest.config.js").write_text("module.exports = {};")
+        assert _detect_test_tool_from_config(tmp_path) == "jest"
+
+    def test_malformed_package_json_with_jest_config_ts(self, tmp_path):
+        """D3: malformed package.json + jest.config.ts → returns 'jest'."""
+        (tmp_path / "package.json").write_text("null")
+        (tmp_path / "jest.config.ts").write_text("export default {};")
+        assert _detect_test_tool_from_config(tmp_path) == "jest"
+
+    def test_malformed_package_json_with_jest_config_json(self, tmp_path):
+        """D3: malformed package.json (non-dict) + jest.config.json → returns 'jest'."""
+        (tmp_path / "package.json").write_text("[1, 2, 3]")  # valid JSON but not dict
+        (tmp_path / "jest.config.json").write_text("{}")
+        assert _detect_test_tool_from_config(tmp_path) == "jest"
+
+    def test_malformed_package_json_alone_returns_none(self, tmp_path):
+        """D3: malformed package.json alone (no config files) → None (no crash)."""
+        (tmp_path / "package.json").write_text("{ broken }")
+        assert _detect_test_tool_from_config(tmp_path) is None
+
+
+# =============================================================================
+# D4 — settings.gradle.kts + vite.config 'test :' whitespace tolerance
+# =============================================================================
+
+class TestD4Robustness:
+    """D4: settings.gradle.kts detection + vite.config tolerant 'test:' regex."""
+
+    def test_settings_gradle_kts_detected(self, tmp_path):
+        """D4: settings.gradle.kts present → gradle."""
+        (tmp_path / "settings.gradle.kts").write_text(
+            "rootProject.name = \"myapp\"\n"
+        )
+        assert _detect_test_tool_from_config(tmp_path) == "gradle"
+
+    def test_vite_config_test_with_space_before_colon(self, tmp_path):
+        """D4: vite.config.ts with 'test :' (space before colon) → vitest."""
+        (tmp_path / "vite.config.ts").write_text(
+            "export default defineConfig({ test : { globals: true } });"
+        )
+        assert _detect_test_tool_from_config(tmp_path) == "vitest"
+
+    def test_vite_config_test_with_quoted_key(self, tmp_path):
+        """D4: vite.config.ts with '\"test\":' (quoted JSON-style) → vitest."""
+        (tmp_path / "vite.config.ts").write_text(
+            'export default defineConfig({ "test": { globals: true } });'
+        )
+        assert _detect_test_tool_from_config(tmp_path) == "vitest"
+
+    def test_vite_config_no_test_block(self, tmp_path):
+        """D4: vite.config.ts without test block → None."""
+        (tmp_path / "vite.config.ts").write_text(
+            "export default defineConfig({ server: { port: 3000 } });"
+        )
         assert _detect_test_tool_from_config(tmp_path) is None

@@ -6,6 +6,7 @@ HAN System - 專案初始化（Lazy）
 
 import os
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,8 @@ from servers import managed_connection
 
 
 # 常見框架偵測規則：import name → (framework, test_tool)
+# NOTE: framework-only imports (react, next, vue, etc.) carry test_tool=None.
+# Only actual test-runner imports (jest, vitest, mocha, pytest, org.junit) set test_tool.
 _FRAMEWORK_HINTS = {
     # Python
     'fastapi': ('FastAPI', 'pytest'),
@@ -20,12 +23,13 @@ _FRAMEWORK_HINTS = {
     'django': ('Django', 'pytest'),
     'pytest': (None, 'pytest'),
     'unittest': (None, 'pytest'),
-    # TypeScript / JavaScript
-    'react': ('React', 'jest'),
-    'next': ('Next.js', 'jest'),
-    'vue': ('Vue', 'vitest'),
-    'nuxt': ('Nuxt', 'vitest'),
-    'express': ('Express', 'jest'),
+    # TypeScript / JavaScript — framework hints carry NO test_tool (D1)
+    'react': ('React', None),
+    'next': ('Next.js', None),
+    'vue': ('Vue', None),
+    'nuxt': ('Nuxt', None),
+    'express': ('Express', None),
+    # Test-runner imports carry test_tool (these are the only JS test-tool signals)
     'jest': (None, 'jest'),
     'vitest': (None, 'vitest'),
     'mocha': (None, 'mocha'),
@@ -51,13 +55,16 @@ _DEFAULT_TEST_TOOLS = {
     'go': 'go test',
 }
 
+# Regex for vite.config 'test:' block detection — tolerates spaces and quoted keys (D4)
+_VITE_TEST_RE = re.compile(r'["\']?test["\']?\s*:')
+
 
 def _detect_test_tool_from_config(project_path) -> Optional[str]:
     """Read project config files to determine the test runner.
 
     Detection rules (first match wins, higher priority first):
     1. vitest.config.{ts,js,mts,mjs,cts,cjs}  → 'vitest'
-    2. vite.config.* containing 'test:'         → 'vitest'
+    2. vite.config.* containing test block      → 'vitest'
     3. package.json devDeps/deps containing vitest OR scripts.test mentioning vitest → 'vitest'
     4. jest.config.{js,ts,cjs,mjs,json}        → 'jest'
     5. package.json top-level 'jest' key OR devDeps 'jest' OR scripts.test 'jest' → 'jest'
@@ -66,7 +73,7 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
     8. tox.ini with [pytest]                    → 'pytest'
     9. setup.cfg with [tool:pytest]             → 'pytest'
     10. pom.xml                                 → 'maven'
-    11. build.gradle / build.gradle.kts / settings.gradle → 'gradle'
+    11. build.gradle / build.gradle.kts / settings.gradle / settings.gradle.kts → 'gradle'
     12. Cargo.toml                              → 'cargo test'
     13. go.mod                                  → 'go test'
 
@@ -91,19 +98,21 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
             return 'vitest'
 
     # ------------------------------------------------------------------
-    # 2. vite.config.* containing 'test:'
+    # 2. vite.config.* containing a test block (D4: regex-based, tolerates spaces)
     # ------------------------------------------------------------------
     for vite_cfg in root.glob("vite.config.*"):
         try:
-            if 'test:' in vite_cfg.read_text(encoding='utf-8', errors='replace'):
+            if _VITE_TEST_RE.search(vite_cfg.read_text(encoding='utf-8', errors='replace')):
                 return 'vitest'
         except OSError:
             pass
 
     # ------------------------------------------------------------------
-    # 3 & 5. package.json — parse once, check vitest first then jest
+    # 3 & 5. package.json — parse once, check vitest first then jest.
+    # D3: if package.json is malformed/non-dict, fall through to config-file checks.
     # ------------------------------------------------------------------
     pkg_path = root / "package.json"
+    pkg_parsed = False   # True only when package.json gave a usable result
     if pkg_path.exists():
         try:
             pkg = json.loads(pkg_path.read_text(encoding='utf-8', errors='replace'))
@@ -111,6 +120,7 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
             pkg = None
 
         if pkg is not None and isinstance(pkg, dict):
+            pkg_parsed = True
             # Collect all dependency keys (devDeps + deps)
             all_deps = set()
             for section in ('devDependencies', 'dependencies'):
@@ -145,9 +155,10 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
                 return 'jest'
 
             # package.json existed but gave no signal — fall through
-        # malformed pkg — fall through to other checks
-    else:
-        # No package.json — check jest.config.* standalone
+
+    # D3: whether package.json was absent, malformed, or gave no signal,
+    # always check jest.config.* files as a standalone fallback.
+    if not pkg_parsed:
         _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
         for ext in _jest_config_exts:
             if (root / f"jest.config.{ext}").exists():
@@ -202,9 +213,10 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
         return 'maven'
 
     # ------------------------------------------------------------------
-    # 11. Gradle → gradle
+    # 11. Gradle → gradle (D4: includes settings.gradle.kts)
     # ------------------------------------------------------------------
-    for gradle_file in ('build.gradle', 'build.gradle.kts', 'settings.gradle'):
+    for gradle_file in ('build.gradle', 'build.gradle.kts',
+                        'settings.gradle', 'settings.gradle.kts'):
         if (root / gradle_file).exists():
             return 'gradle'
 
@@ -281,12 +293,15 @@ def _detect_tech_stack(project_name, project_path=None):
         result['frameworks'] = sorted(frameworks)
 
         # 3. 決定測試工具：偵測到的 > 語言預設
-        if test_tools:
-            result['test_tool'] = sorted(test_tools)[0]
-        elif result['primary_language']:
+        # D2: if import heuristic yields >1 distinct test_tool and no config, leave None
+        # (ambiguous; better None than silently picking jest via sorted()[0])
+        if len(test_tools) == 1:
+            result['test_tool'] = next(iter(test_tools))
+        elif len(test_tools) == 0 and result['primary_language']:
             result['test_tool'] = _DEFAULT_TEST_TOOLS.get(
                 result['primary_language']
             )
+        # else: >1 test_tools → leave test_tool = None (ambiguous)
 
     # 4. Config-file pass overrides import heuristic (if project_path given)
     config_tool = _detect_test_tool_from_config(project_path)

@@ -15,6 +15,10 @@ _TEST_TARGETS_RE = re.compile(
     r'^TEST_TARGETS:\s*(.+)$', re.MULTILINE | re.IGNORECASE
 )
 
+# Task statuses considered "still open" — suggestions on these tasks are unresolved.
+# Tasks with validation_status='approved' are resolved; we exclude them from R1.
+_RESOLVED_VALIDATION_STATUSES = frozenset({'approved'})
+
 
 def _parse_test_targets_from_result(result_text: str) -> List[str]:
     """Extract TEST_TARGETS: paths from an executor result string."""
@@ -47,6 +51,38 @@ def _get_executor_tasks_for_epic(epic_id: str) -> List[dict]:
     ]
 
 
+def _is_task_resolved(task: dict) -> bool:
+    """Return True if a task is in a resolved/approved final state.
+
+    R1: a task is resolved when its validation_status is 'approved'.
+    Suggestions on resolved tasks are no longer unresolved.
+    """
+    return task.get('validation_status') in _RESOLVED_VALIDATION_STATUSES
+
+
+def _render_coverage_row(entry) -> Optional[str]:
+    """Render a single coverage table row.
+
+    R2: entries missing n_total or with n_total==0 show 'unknown'/neutral.
+    R3: non-dict entries are skipped (return None).
+    """
+    if not isinstance(entry, dict):
+        # R3: guard against non-dict entries — skip without crashing
+        return None
+
+    fp = entry.get('file_path', '?')
+    name = entry.get('name', '?')
+    nc = entry.get('n_covered')
+    nt = entry.get('n_total')
+
+    # R2: missing or zero n_total → unknown, not a false-green checkmark
+    if nt is None or nt == 0:
+        return f'| {fp} | {name} | unknown | ⚠️ |'
+
+    mark = '✓' if nc == nt else '⚠️'
+    return f'| {fp} | {name} | {nc}/{nt} | {mark} |'
+
+
 def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -> str:
     """Build a markdown run report for a /han:unit-test epic.
 
@@ -56,7 +92,7 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
          or the epic itself if stored there)
       3. Source <-> test mapping (from TEST_TARGETS: marker in executor results)
       4. Critic verdicts
-      5. Unresolved critic suggestions (with count)
+      5. Unresolved critic suggestions (with count) — R1: excludes approved tasks
       6. Completeness caveat
     """
     from servers.memory import get_working_memory
@@ -80,7 +116,7 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
     # ── 2. Per-file coverage ─────────────────────────────────────────────────────
     # Collect coverage data from working_memory: check executor tasks first,
     # then the epic itself (in case the gate stored it there).
-    all_coverage: List[dict] = []
+    all_coverage: List = []
     for t in executor_tasks:
         raw = get_working_memory(t['id'], 'coverage')
         if raw:
@@ -102,18 +138,19 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
             pass
 
     if all_coverage:
-        lines.append('## Per-file Coverage')
-        lines.append('')
-        lines.append('| File | Function | Covered/Total | Status |')
-        lines.append('|------|----------|---------------|--------|')
-        for entry in all_coverage:
-            fp = entry.get('file_path', '?')
-            name = entry.get('name', '?')
-            nc = entry.get('n_covered', 0)
-            nt = entry.get('n_total', 0)
-            mark = '✓' if nc == nt else '⚠️'
-            lines.append(f'| {fp} | {name} | {nc}/{nt} | {mark} |')
-        lines.append('')
+        # R2 + R3: render each entry through _render_coverage_row which handles
+        # non-dict entries (skip) and missing/zero n_total (unknown marker).
+        coverage_rows = [_render_coverage_row(e) for e in all_coverage]
+        valid_rows = [r for r in coverage_rows if r is not None]
+
+        if valid_rows:
+            lines.append('## Per-file Coverage')
+            lines.append('')
+            lines.append('| File | Function | Covered/Total | Status |')
+            lines.append('|------|----------|---------------|--------|')
+            for row in valid_rows:
+                lines.append(row)
+            lines.append('')
 
     # ── 3. Source <-> test mapping ───────────────────────────────────────────────
     mapping_rows = []
@@ -147,8 +184,12 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
         lines.append('')
 
     # ── 5. Unresolved critic suggestions ─────────────────────────────────────────
+    # R1: only include suggestions from tasks that are NOT in a resolved/approved state.
     all_suggestions = []
     for t in executor_tasks:
+        if _is_task_resolved(t):
+            # R1: skip suggestions from approved/resolved tasks — they are not unresolved
+            continue
         raw = get_working_memory(t['id'], 'critic_suggestions')
         if raw:
             suggestions = [s.strip() for s in str(raw).split('\n') if s.strip()]
