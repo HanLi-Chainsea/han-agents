@@ -15,7 +15,7 @@ fail-open：playbook 目錄缺失或解析失敗 → resolve_playbook 回 None�
 import os
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 # playbook 檔案位於 han-agents 安裝目錄（與 servers/ 同層的 reference/）
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +26,15 @@ _CACHE: Optional[Dict[str, "Playbook"]] = None
 # Test-type playbook names: these tasks require actual test execution evidence.
 # refactor is included because it requires characterization tests.
 _TEST_TASK_PLAYBOOK_NAMES = frozenset({
+    "unit_test",
+    "integration_test",
+    "e2e_test",
+    "refactor",
+})
+
+# Task type metadata values that map to test tasks.
+# Non-test types (code_review, docs, analysis, …) are excluded.
+_TEST_TASK_TYPES = frozenset({
     "unit_test",
     "integration_test",
     "e2e_test",
@@ -144,16 +153,40 @@ def resolve_playbook(description: str) -> Optional[Playbook]:
     return best
 
 
-def is_test_task(description: str) -> bool:
-    """Return True if the task description resolves to a test-type playbook.
+def is_test_task(task_or_description: Union[Dict, str]) -> bool:
+    """Return True if the task is a test-type task that requires evidence gating.
 
-    Test-type playbooks: unit_test, integration_test, e2e_test, refactor.
+    Fix 3 — Persisted task_type wins over keyword inference:
+
+    Resolution order:
+    1. If task_or_description is a dict AND metadata['task_type'] is present:
+       - task_type in _TEST_TASK_TYPES  → True
+       - task_type NOT in _TEST_TASK_TYPES → False  (metadata always wins)
+       No keyword fallback when task_type is set.
+    2. Otherwise (no metadata, or task_or_description is a plain string):
+       Fall back to playbook keyword resolution (legacy behaviour).
+
+    Test-type playbooks / task_types: unit_test, integration_test, e2e_test, refactor.
     Refactor is included because it requires characterization tests.
 
     fail-open: if playbook resolution fails or returns None → False
     (non-test path is safe; only test tasks need evidence gating).
     """
     try:
+        # -- Prefer metadata['task_type'] when present -----------------------
+        if isinstance(task_or_description, dict):
+            metadata = task_or_description.get('metadata') or {}
+            if isinstance(metadata, dict) and 'task_type' in metadata:
+                task_type = metadata['task_type']
+                return task_type in _TEST_TASK_TYPES
+
+            # No task_type in metadata — fall back to description keyword check
+            description = task_or_description.get('description', '')
+        else:
+            # Plain string path (legacy callers)
+            description = task_or_description
+
+        # -- Keyword / playbook fallback ------------------------------------
         pb = resolve_playbook(description)
         if pb is None:
             return False

@@ -180,7 +180,7 @@ def recipe_unit_tests(
             task_level='task',
             epic_id=epic_id,
             story_id=story_id,
-            metadata={'coverage_targets': _gaps_to_coverage_targets(file_gaps)},
+            metadata={'coverage_targets': _gaps_to_coverage_targets(file_gaps), 'task_type': 'unit_test'},
         )
 
         story_info['task_ids'].append(task_id)
@@ -304,7 +304,8 @@ def recipe_code_review(
             parent_id=story_id,
             description=f"Code review {fp}. 依 playbook 原則逐項審查並分級回報。",
             assigned_agent='executor', requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
+            task_level='task', epic_id=epic_id, story_id=story_id,
+            metadata={'task_type': 'code_review'})
         task_count += 1
 
     return {
@@ -375,6 +376,7 @@ def recipe_integration_tests(
                 'integration_boundaries': boundaries,
                 'test_files': [],
                 'stack': test_tool,
+                'task_type': 'integration_test',
                 # C-b: flag extraction failure so the gate can reject
                 **({'boundaries_error': True} if boundaries_error else {}),
             })
@@ -441,7 +443,8 @@ def recipe_e2e_tests(
             description=(f"Write end-to-end (E2E) tests for the critical user "
                         f"journeys through module {module}. Test tool: {test_tool}"),
             assigned_agent='executor', requires_validation=True,
-            task_level='task', epic_id=epic_id, story_id=story_id)
+            task_level='task', epic_id=epic_id, story_id=story_id,
+            metadata={'task_type': 'e2e_test'})
         task_count += 1
         built_modules.append(module)
 
@@ -660,7 +663,8 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
                     f"{sym} in {loc} (refactor-for-testability safety net). "
                     f"Do not judge correctness; pin every branch's current behavior."),
                 assigned_agent='executor', requires_validation=True,
-                task_level='task', epic_id=epic_id, story_id=story_id)
+                task_level='task', epic_id=epic_id, story_id=story_id,
+                metadata={'task_type': 'refactor'})
             t2 = create_subtask(
                 parent_id=story_id,
                 description=(
@@ -668,7 +672,8 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
                     f"Behavior-preserving, mechanical."),
                 assigned_agent='executor', depends_on=[t1],
                 requires_validation=True,
-                task_level='task', epic_id=epic_id, story_id=story_id)
+                task_level='task', epic_id=epic_id, story_id=story_id,
+                metadata={'task_type': 'refactor'})
             create_subtask(
                 parent_id=story_id,
                 description=(
@@ -676,7 +681,8 @@ def build_refactor_epic(project_name: str, items: List[Dict]) -> Dict:
                     f"tests, must stay green."),
                 assigned_agent='executor', depends_on=[t2],
                 requires_validation=True,
-                task_level='task', epic_id=epic_id, story_id=story_id)
+                task_level='task', epic_id=epic_id, story_id=story_id,
+                metadata={'task_type': 'refactor'})
             task_count += 3
     except Exception:
         _delete_epic_tree(project_name, epic_id)  # 補償：不留 partial tree

@@ -2518,9 +2518,10 @@ Please address the issues above in this retry.
     # Only inject the compact TEST_TARGETS evidence block for test-type tasks.
     # Non-test tasks (code_review, docs, analysis) must NOT be required to supply
     # TEST_TARGETS — that would block them unconditionally (regression fix).
+    # Fix 3: pass the full task dict so is_test_task can prefer metadata['task_type'].
     try:
         from servers.playbooks import is_test_task as _is_test
-        _need_evidence = _is_test(description)
+        _need_evidence = _is_test(task)
     except Exception:
         _need_evidence = False
 
@@ -2604,9 +2605,23 @@ def _build_critic_prompt(
         playbook_section = ""
 
     # Determine if this is a test-type task that requires evidence gating.
+    # Fix 3: prefer metadata['task_type'] from the original task when available;
+    # fall back to description keyword inference for legacy tasks.
     try:
         from servers.playbooks import is_test_task as _is_test
-        _need_evidence = _is_test(description)
+        _orig_task_id = critic_task.get('original_task_id')
+        if _orig_task_id:
+            try:
+                from servers.tasks import get_task as _get_task
+                _orig = _get_task(_orig_task_id)
+                if _orig is not None:
+                    _need_evidence = _is_test(_orig)
+                else:
+                    _need_evidence = _is_test(description)
+            except Exception:
+                _need_evidence = _is_test(description)
+        else:
+            _need_evidence = _is_test(description)
     except Exception:
         _need_evidence = False
 

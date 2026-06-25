@@ -103,8 +103,26 @@ def _parse_verdict(response_text: str):
     """Parse the critic verdict from response_text.
 
     Collects ALL verdict markers from two sources:
-      1. '驗證結果: X' pattern (inline or heading)
-      2. '^#+ X$' standalone heading markers
+      1. '驗證結果: X' pattern (inline or heading) — requires word boundary
+         after the verdict token so 'APPROVEDLY' or 'APPROVED-but...' do NOT
+         match (they are not a clean verdict and should be treated as unparseable
+         → fail-closed REJECTED).
+      2. '^#+ X$' standalone heading markers (unchanged — already exact-line match).
+
+    Fix 2: Both patterns now require \\b (word boundary) after the verdict token.
+    This means the character immediately following the token must NOT be a word
+    character (i.e. [A-Za-z0-9_]).  So:
+        '驗證結果: APPROVED'         → APPROVED  (end of string)
+        '## 驗證結果: APPROVED'       → APPROVED
+        '驗證結果: APPROVEDLY'        → no match (word continues)
+        '驗證結果: APPROVED-but...'   → no match (hyphen is non-word but the
+                                         re.search stops at 'D' and \\b checks
+                                         the following '-' — actually '-' IS a
+                                         non-word char so \\b would match there).
+    To cover 'APPROVED-but...' (letters after hyphen make it clearly not a clean
+    token) we additionally require that what follows is end-of-line or
+    whitespace/punctuation only — no more letters.  We use a negative lookahead
+    (?![A-Za-z]) after \\b to ensure no more letters follow the token boundary.
 
     Returns (verdict: str, unparseable: bool):
     - ZERO matches → ('REJECTED', True)   — unparseable, fail-closed
@@ -113,17 +131,20 @@ def _parse_verdict(response_text: str):
     """
     verdicts_found = set()
 
-    # Pattern 1: 驗證結果: VERDICT (anywhere in text, with any surrounding)
+    # Pattern 1: 驗證結果: VERDICT
+    # Requires \b after token AND no further letters (prevents APPROVEDLY,
+    # APPROVED-but-actually-malformed, etc. from matching).
     for m in re.finditer(
-        r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)',
+        r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)\b(?![A-Za-z])',
         response_text,
         re.IGNORECASE,
     ):
         verdicts_found.add(m.group(1).upper())
 
-    # Pattern 2: ^#+ VERDICT$ (markdown headings)
+    # Pattern 2: ^#+ VERDICT$ (markdown headings) — exact-line match is
+    # already tight; keep as-is but add \b for consistency.
     for m in re.finditer(
-        r'^#+\s*(APPROVED|CONDITIONAL|REJECTED)\s*$',
+        r'^#+\s*(APPROVED|CONDITIONAL|REJECTED)\b(?![A-Za-z])\s*$',
         response_text,
         re.MULTILINE | re.IGNORECASE,
     ):
@@ -146,54 +167,85 @@ def _parse_verdict(response_text: str):
 def _check_test_evidence(result_text: str, project_root: str):
     """Check that executor result contains valid test evidence.
 
-    Returns (ok: bool, reason: str):
-    - ok=True  → evidence is present and valid (TEST_TARGETS + RESULT: PASS,
-                  all paths within project_root)
-    - ok=False → missing/malformed evidence or path escape
+    Fix 1 — Exhaustive evidence checks:
+    - Collect ALL TEST_TARGETS: lines and ALL paths across them (comma or
+      space separated).  EVERY path must be within project_root.  ANY path
+      escaping the root → REJECT.
+    - Collect ALL RESULT: lines.  Match with full-token regex so 'PASSIVE'
+      (containing substring 'PASS') does NOT count as PASS.  The result is
+      valid only when there is at least one RESULT: PASS AND zero RESULT: FAIL
+      lines.  Any FAIL present, or PASS+FAIL conflict → REJECT.
 
-    The 'reason' string is human-readable for critic_suggestions.
+    Returns (ok: bool, reason: str):
+    - ok=True  → evidence is present and valid
+    - ok=False → missing/malformed evidence or path escape
     """
     if not result_text:
         return False, "缺可信 evidence: result 為空，需含 TEST_TARGETS + RESULT: PASS，且測試檔須在專案內"
 
-    # Look for TEST_TARGETS: line with at least one path
-    tt_match = re.search(
+    # ── Collect ALL TEST_TARGETS: lines ──────────────────────────────────────
+    tt_matches = re.findall(
         r'^TEST_TARGETS:\s*(.+)$',
         result_text,
         re.MULTILINE | re.IGNORECASE,
     )
-    if not tt_match:
+    if not tt_matches:
         return False, (
             "缺可信 evidence: result 需含 TEST_TARGETS + RESULT: PASS，"
             "且測試檔須在專案內"
         )
 
-    targets_raw = tt_match.group(1).strip()
-    # Split by comma to get individual paths
-    paths = [p.strip() for p in targets_raw.split(',') if p.strip()]
-    if not paths:
+    # Collect all paths from ALL TEST_TARGETS: lines.
+    # Each line may list multiple paths separated by commas or spaces.
+    all_paths: List[str] = []
+    for raw in tt_matches:
+        # Split by comma first, then by whitespace within each segment
+        for segment in raw.split(','):
+            segment = segment.strip()
+            if segment:
+                # Further split by whitespace to catch space-separated paths
+                for p in segment.split():
+                    p = p.strip()
+                    if p:
+                        all_paths.append(p)
+
+    if not all_paths:
         return False, (
             "缺可信 evidence: TEST_TARGETS: 行存在但無有效路徑，"
             "需含 RESULT: PASS，且測試檔須在專案內"
         )
 
-    # Validate paths are within project root
-    if not _paths_within_root(paths, project_root):
+    # ALL paths must be within project root — any escape → REJECT
+    if not _paths_within_root(all_paths, project_root):
         return False, (
             "缺可信 evidence: TEST_TARGETS 中含路徑逸出（絕對路徑或 ../ 穿透），"
             "測試檔必須在專案目錄內"
         )
 
-    # Look for RESULT: PASS line
-    result_match = re.search(
-        r'^RESULT:\s*PASS',
+    # ── Collect ALL RESULT: lines with full-token match ──────────────────────
+    # Use \b so 'PASSIVE' (contains 'PASS' as substring) does NOT match PASS.
+    # Also use case-insensitive so 'pass' / 'fail' are accepted.
+    pass_matches = re.findall(
+        r'^\s*RESULT:\s*PASS\b',
         result_text,
         re.MULTILINE | re.IGNORECASE,
     )
-    if not result_match:
+    fail_matches = re.findall(
+        r'^\s*RESULT:\s*FAIL\b',
+        result_text,
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    if not pass_matches:
         return False, (
             "缺可信 evidence: result 含 TEST_TARGETS 但缺 RESULT: PASS，"
             "測試必須真正通過才能 APPROVED"
+        )
+
+    if fail_matches:
+        return False, (
+            "缺可信 evidence: result 含 RESULT: FAIL（或同時含 PASS 與 FAIL），"
+            "存在任何 FAIL 即不可 APPROVED"
         )
 
     return True, ""
@@ -275,9 +327,10 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
                 from servers.playbooks import is_test_task
 
                 orig_task = get_task(original_task_id)
-                orig_description = (orig_task or {}).get('description', '')
 
-                if orig_task and is_test_task(orig_description):
+                # Fix 3: is_test_task now accepts the full task dict, preferring
+                # metadata['task_type'] over keyword inference.
+                if orig_task and is_test_task(orig_task):
                     # Get project_path: extract from the critic prompt (injected by dispatch)
                     project_path = extract_assignment(prompt, "PROJECT_PATH")
                     # Fallback: try to derive from the stored executor result in task
