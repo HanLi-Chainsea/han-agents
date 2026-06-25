@@ -249,6 +249,8 @@ _JAVA_TOOLS = frozenset({'gradle', 'maven', 'junit'})
 _JAVA_LANGS = frozenset({'java', 'kotlin'})
 _PYTHON_TOOLS = frozenset({'pytest', 'unittest'})
 _PYTHON_LANGS = frozenset({'python'})
+_JS_TOOLS = frozenset({'vitest', 'jest', 'mocha'})
+_JS_LANGS = frozenset({'javascript', 'typescript'})
 
 
 def select_backend(tech_stack: dict) -> str:
@@ -261,6 +263,7 @@ def select_backend(tech_stack: dict) -> str:
     Returns:
         'java'    — gradle/maven/junit test_tool, or java/kotlin primary_language
         'python'  — pytest/unittest test_tool, or python primary_language
+        'js'      — vitest/jest/mocha test_tool, or javascript/typescript language
         'unknown' — no recognisable indicator found
 
     Precedence: test_tool is checked first; primary_language is the tiebreaker.
@@ -277,12 +280,16 @@ def select_backend(tech_stack: dict) -> str:
         return 'java'
     if tool in _PYTHON_TOOLS:
         return 'python'
+    if tool in _JS_TOOLS:
+        return 'js'
 
     # Fall back to primary language
     if lang in _JAVA_LANGS:
         return 'java'
     if lang in _PYTHON_LANGS:
         return 'python'
+    if lang in _JS_LANGS:
+        return 'js'
 
     return 'unknown'
 

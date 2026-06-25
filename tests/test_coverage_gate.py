@@ -1354,3 +1354,130 @@ class TestC4JavaTestFilters:
         facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert 'com.example.BarTest' in captured_filters
         assert 'com.example.BazSpec' in captured_filters
+
+
+# ── JS stack routing (Vitest/Jest) ────────────────────────────────────────────
+
+
+class TestJsStackRouting:
+    """Gate routes vitest/jest/mocha tech_stack to measure_branch_coverage_js.
+
+    The JS backend is monkeypatched; test asserts it is called and only it is called.
+    """
+
+    def _setup_done_task(self, cov_targets, result):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def _fake_ok(self):
+        return {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'src/classify.js', 'name': 'classify',
+                            'line_start': 1, 'line_end': 5,
+                            'covered_branches': [{'from': 2, 'to': 0}],
+                            'missing_branches': [], 'n_total': 1, 'n_covered': 1}],
+        }
+
+    def test_vitest_stack_routes_to_js_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/classify.js', 'name': 'classify',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: test/classify.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'vitest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['test/classify.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+        python_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return self._fake_ok()
+
+        def fake_python(project_path, test_targets, coverage_targets):
+            python_calls.append(1)
+            return self._fake_ok()
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_python)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(js_calls) == 1, 'JS backend must be called exactly once'
+        assert js_calls[0] == 'vitest', f'tool should be vitest, got {js_calls[0]}'
+        assert len(python_calls) == 0, 'Python backend must NOT be called for vitest stack'
+
+    def test_jest_stack_routes_to_js_backend_with_jest_tool(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: src/f.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'jest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['src/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return self._fake_ok()
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(js_calls) == 1
+        assert js_calls[0] == 'jest', f'tool should be jest, got {js_calls[0]}'
+
+    def test_js_npx_unavailable_fails_open_with_warning(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """When npx is not found, gate must fail-open (not fail-closed)."""
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: src/f.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'vitest'}})
+        monkeypatch.setattr(cov_js, '_js_available', lambda: False)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert verdict.get('warn') and 'npx' in verdict['warn'].lower()

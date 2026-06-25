@@ -1891,13 +1891,19 @@ def run_coverage_gate(critic_task_id: str,
 
     # ── C5: Select backend FIRST, then check per-backend availability ──────────
     # Resolve tech_stack from the project record (same approach as recipes.py).
-    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
+    # select_backend: 'java' → JaCoCo/Gradle; 'js' → Vitest/Jest; 'python'/'unknown' → pytest.
     from servers import coverage_java as cov_java
     from servers import project as _proj
     _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
     _backend = cov_java.select_backend(_ts)
 
-    if _backend != 'java':
+    if _backend == 'js':
+        from servers import coverage_js as cov_js
+        # JS availability = npx resolvable (node present).  Absent → infra fail-open.
+        if not cov_js._js_available():
+            return {'verdict': 'proceed',
+                    'warn': '⚠️ npx/node not found; JS coverage unavailable, manual branch review required.'}
+    elif _backend != 'java':
         # Python / unknown stack: check python-coverage availability (infra check).
         # Java stack does NOT go through this check — gradlew absence is handled
         # fail-closed by measure_branch_coverage_java itself (returns test_run_error).
@@ -1929,6 +1935,13 @@ def run_coverage_gate(critic_task_id: str,
         res = cov_java.measure_branch_coverage_java(
             project_path, test_targets, coverage_targets,
             test_filters=java_test_filters if java_test_filters else None)
+    elif _backend == 'js':
+        # Vitest/Jest backend — tool derived from tech_stack.test_tool (or default vitest)
+        _js_tool = (_ts.get('test_tool') or 'vitest').lower().strip()
+        if _js_tool not in ('vitest', 'jest'):
+            _js_tool = 'vitest'  # mocha and other JS tools: default to vitest
+        res = cov_js.measure_branch_coverage_js(
+            project_path, test_targets, coverage_targets, tool=_js_tool)
     else:
         # 'python' or 'unknown' → existing Python backend (safe default)
         res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
