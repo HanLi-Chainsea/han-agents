@@ -347,8 +347,10 @@ class TestCompactEvidenceBlock:
 
 
 class TestCriticPromptInstructsActionableIssues:
-    """Fix B regression guard: critic prompt must instruct finish_validation
-    with specific, actionable issues on REJECT/CONDITIONAL."""
+    """Fix (d) guard: critic prompt must NOT tell the critic to call
+    finish_validation (the hook is the sole lifecycle owner), but MUST still
+    instruct outputting specific, actionable issues in the verdict text so the
+    hook can persist them as executor retry feedback."""
 
     def _critic_prompt(self):
         from servers.facade import _build_critic_prompt
@@ -360,33 +362,24 @@ class TestCriticPromptInstructsActionableIssues:
         return _build_critic_prompt(critic_task, "proj", "/tmp/proj")
 
     def test_critic_prompt_instructs_finish_validation_with_actionable_issues(self):
-        """Critic prompt must explicitly instruct calling finish_validation with
-        a specific, actionable issues list on REJECT (not vague labels)."""
+        """Critic prompt must NOT instruct calling finish_validation (the critic
+        agent has no tool to do so; the hook owns lifecycle). It MUST still
+        instruct outputting specific/actionable issues so the hook can relay
+        them to the executor on retry."""
         prompt = self._critic_prompt()
         prompt_lower = prompt.lower()
 
-        # Must mention finish_validation call
-        assert 'finish_validation' in prompt, (
-            'critic prompt must instruct calling finish_validation')
+        # Fix (d): critic prompt must NOT instruct calling finish_validation —
+        # the hook is the single lifecycle owner; the critic agent cannot call it.
+        assert 'finish_validation' not in prompt, (
+            'critic prompt must NOT instruct calling finish_validation '
+            '(only the hook can drive lifecycle)')
 
-        # Must show approved=False pattern for reject
-        assert 'approved=False' in prompt, (
-            'critic prompt must show approved=False for reject')
-
-        # Must include issues= parameter instruction
-        assert 'issues=' in prompt, (
-            'critic prompt must instruct passing issues= to finish_validation')
-
-        # Must warn against vague issues
-        assert 'vague' in prompt_lower or 'not acceptable' in prompt_lower, (
-            'critic prompt must warn that vague issues are not acceptable')
-
-        # Must instruct actionable / specific items
+        # Must instruct actionable / specific issues in verdict text
         assert ('actionable' in prompt_lower or 'specific' in prompt_lower
                 or 'concrete' in prompt_lower), (
             'critic prompt must instruct specific/actionable issues')
 
-        # Existing content still intact
+        # Output format lines must still be present
         assert '## 驗證結果: APPROVED' in prompt
         assert '## 驗證結果: REJECTED' in prompt
-        assert 'finish_validation' in prompt

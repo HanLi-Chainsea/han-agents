@@ -2635,24 +2635,9 @@ You MUST output one of:
 - `## 驗證結果: CONDITIONAL` — if acceptable with minor suggestions
 - `## 驗證結果: REJECTED` — if significant issues need fixing
 
-## Mandatory finish_validation Call
-
-After rendering your verdict, you MUST call finish_validation with the
-appropriate approved value.
-
-REJECTED or CONDITIONAL — you MUST pass a non-empty `issues` list with
-SPECIFIC, ACTIONABLE items naming exactly what to fix. Each issue must be
-concrete and implementable, for example:
-  - "新增 TEST_TARGETS: 一行列出測試檔"
-  - "test_foo 的斷言 `assert True` 無意義，需驗實際回傳值"
-  - "未涵蓋 null / error path"
-
-Call pattern for reject:
-  finish_validation(task_id=TASK_ID, original_task_id=ORIGINAL_TASK_ID,
-                    approved=False, issues=["具體問題1", "具體問題2"])
-
-Vague issues like "needs improvement" or "code quality" are NOT acceptable —
-the executor uses this issues list verbatim to decide what to fix on retry.
+After rendering your verdict, output SPECIFIC, ACTIONABLE issues in the verdict
+text describing exactly what the executor must fix. The hook will persist your
+output text as feedback for the executor on retry.
 
 '''
     return prompt.strip()

@@ -37,6 +37,24 @@ def _hook_context(message: str) -> Dict:
     }
 
 
+def _agent_output_text(tool_response: Any) -> str:
+    """Extract the agent's final text from a tool_response.
+
+    - If tool_response is a str, return it directly.
+    - If tool_response is a dict, try common text keys in order, returning
+      the first that is a non-empty str.
+    - Otherwise fall back to str(tool_response).
+    """
+    if isinstance(tool_response, str):
+        return tool_response
+    if isinstance(tool_response, dict):
+        for key in ('output', 'result', 'text', 'response', 'content', 'final'):
+            value = tool_response.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return str(tool_response)
+
+
 def _handle_guardrail_event(input_data: Dict[str, Any]) -> Optional[Dict]:
     tool_name = input_data.get("tool_name", "")
     result = evaluate_tool_guardrail(input_data)
@@ -86,7 +104,9 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
             update_task(task_id, executor_agent_id=agent_id)
             log(f"Recorded agentId {agent_id} for task {task_id}")
 
-        result = finish_task(task_id, success=True, result="Executor completed")
+        # Fix (a): save the executor's REAL output so the critic can read it.
+        output_text = _agent_output_text(tool_response)
+        result = finish_task(task_id, success=True, result=(output_text or "Executor completed"))
         log(f"finish_task result: {result}")
         return None
 
@@ -97,6 +117,8 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
             return None
 
         response_text = str(tool_response)
+        unparseable = False
+
         verdict_match = re.search(
             r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)',
             response_text,
@@ -112,16 +134,26 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
         elif re.search(r'^#+\s*APPROVED\s*$', response_text, re.MULTILINE | re.IGNORECASE):
             verdict = "APPROVED"
         else:
-            verdict = "APPROVED"
+            # Fix (b): fail-closed — unparseable must NEVER auto-approve.
+            verdict = "REJECTED"
+            unparseable = True
 
-        conditional = verdict == "CONDITIONAL"
         approved = verdict != "REJECTED"
-        log(f"Critic verdict: {verdict} for task {original_task_id}")
+        log(f"Critic verdict: {verdict} (unparseable={unparseable}) for task {original_task_id}")
 
-        if conditional:
+        # Fix (c): persist the reject reason for ALL non-approved paths so the
+        # executor's retry prompt picks it up.
+        if verdict in ("REJECTED", "CONDITIONAL"):
+            if unparseable:
+                reason = (
+                    "Critic 未輸出可解析的 verdict（APPROVED/CONDITIONAL/REJECTED），"
+                    "fail-closed 退回重驗。\n" + response_text[:800]
+                )
+            else:
+                reason = response_text
             try:
                 from servers.memory import set_working_memory
-                set_working_memory(original_task_id, 'critic_suggestions', response_text)
+                set_working_memory(original_task_id, 'critic_suggestions', reason)
                 log("Saved critic_suggestions to working_memory")
             except Exception as exc:
                 log(f"Failed to save critic_suggestions: {exc}")
@@ -129,7 +161,7 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
         result = finish_validation(task_id, original_task_id, approved=approved)
         log(f"finish_validation result: {result}")
 
-        if conditional:
+        if verdict == "CONDITIONAL":
             return _hook_context(
                 f"任務 {original_task_id} 有條件通過。建議存於 working_memory['critic_suggestions']。"
             )
