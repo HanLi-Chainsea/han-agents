@@ -275,3 +275,72 @@ class TestUnitTestPlaybookBranchCoverage:
         assert "分支" in cc
         # 工具不可用時 critic 要手動核對
         assert "工具" in cc
+
+
+class TestCompactEvidenceBlock:
+    """Token-saving: executor emits compact evidence; critic reads actual test files."""
+
+    def _executor_prompt(self, desc="Write unit tests for servers/memory.py"):
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t-ev1", "description": desc, "assigned_agent": "executor"}
+        return _build_executor_prompt(task, "proj", "/tmp/proj")
+
+    def _critic_prompt(self, result="TEST_TARGETS: tests/test_x.py\nRESULT: PASS 5\nCHANGED: tests/test_x.py\nCMD: pytest tests/test_x.py"):
+        from servers.facade import _build_critic_prompt
+        critic_task = {"id": "c-ev1", "original_task_id": "t-ev1",
+                       "original_description": "Write unit tests for servers/memory.py",
+                       "result": result}
+        return _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+
+    def test_executor_prompt_requires_compact_evidence_block(self):
+        """Executor prompt must instruct the four-line compact evidence block."""
+        prompt = self._executor_prompt()
+        # All four required field labels must be present
+        assert "TEST_TARGETS:" in prompt
+        assert "RESULT:" in prompt
+        assert "CHANGED:" in prompt
+        assert "CMD:" in prompt
+        # Must tell executor NOT to reproduce/paste the full test file
+        prompt_lower = prompt.lower()
+        assert "do not reproduce" in prompt_lower or "not reproduce" in prompt_lower or \
+               "replaces verbose prose" in prompt_lower or "the block replaces" in prompt_lower
+        # Must still require actually running the tests
+        assert "run" in prompt_lower or "execute" in prompt_lower or "actually" in prompt_lower
+
+    def test_critic_prompt_instructs_read_test_files(self):
+        """Critic prompt must instruct reading the test file(s) listed in TEST_TARGETS."""
+        prompt = self._critic_prompt()
+        prompt_lower = prompt.lower()
+        # Must mention TEST_TARGETS
+        assert "test_targets" in prompt_lower
+        # Must instruct reading files (relative to PROJECT_PATH)
+        assert "read" in prompt_lower
+        assert "project_path" in prompt_lower
+        # Result text is still present (compact form)
+        assert "TEST_TARGETS:" in prompt
+
+    def test_critic_prompt_fail_closed_on_missing_evidence(self):
+        """Critic prompt must explicitly say to REJECT when evidence is missing."""
+        prompt = self._critic_prompt()
+        # Must contain a fail-closed REJECT instruction
+        assert "REJECTED" in prompt or "REJECT" in prompt
+        # Must cover: missing TEST_TARGETS line
+        assert "no TEST_TARGETS" in prompt or "no test_targets" in prompt.lower() or \
+               "TEST_TARGETS: line" in prompt or "test_targets: line" in prompt.lower()
+        # Must cover: file cannot be read
+        assert "cannot be read" in prompt or "unreadable" in prompt
+        # Must cover: no real assertions (assert True / empty bodies)
+        assert "assert True" in prompt or "empty" in prompt.lower()
+        # Must explicitly state: NEVER approve without evidence
+        assert "NEVER" in prompt or "never" in prompt
+
+    def test_critic_prompt_still_has_guardrail_and_checklist(self):
+        """Guardrail policy section and verdict output format must still be present."""
+        prompt = self._critic_prompt()
+        # Verdict output format preserved
+        assert "## 驗證結果: APPROVED" in prompt
+        assert "## 驗證結果: REJECTED" in prompt
+        # Checklist still injected for unit_test description (playbook section)
+        assert "REJECT" in prompt  # playbook critic checklist has REJECT conditions
+        # 'fail-closed' label or guardrail section present
+        assert "fail-closed" in prompt.lower() or "FAIL-CLOSED" in prompt

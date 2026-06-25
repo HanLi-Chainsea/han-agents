@@ -2523,6 +2523,20 @@ PROJECT_PATH = "{project_path}"
 1. Read relevant source files
 2. Execute the task as described
 3. Output results clearly
+
+## Required Output Format (COMPACT EVIDENCE BLOCK)
+
+After completing the task, END your report with the following compact evidence
+block — exactly four lines, one per field, no extra prose. Do NOT reproduce the
+full test file or paste long output; the block replaces verbose prose:
+
+TEST_TARGETS: <relative test file path(s), comma-separated>
+RESULT: PASS <n>   (or: FAIL <n> — <one-line reason>)
+CHANGED: <files created or modified, comma-separated>
+CMD: <the exact test command you ran>
+
+You MUST still actually run the tests; the compact block records the run, it
+does not replace it. Running tests is mandatory — NEVER omit the CMD/RESULT.
 '''
     return prompt.strip()
 
@@ -2564,7 +2578,39 @@ PROJECT_PATH = "{project_path}"
 ## Validation Target
 
 Task: {description}
-Result: {critic_task.get('result', 'See code changes')}
+
+## Executor Evidence (compact block from executor)
+
+{critic_task.get('result', 'See code changes')}
+
+## Evidence Verification — MANDATORY STEPS (fail-closed)
+
+The executor's result above should end with a compact evidence block containing
+TEST_TARGETS:, RESULT:, CHANGED:, and CMD: lines.
+
+You MUST perform the following steps BEFORE rendering a verdict:
+
+1. Parse the TEST_TARGETS: line from the executor evidence above.
+2. For each path listed, resolve it relative to PROJECT_PATH (shown at the top
+   of this prompt) and READ the actual test file using your Read tool.
+3. Verify the file contains real, meaningful assertions — not just `assert True`,
+   empty test bodies, or placeholder stubs.
+4. Confirm the RESULT: line shows a PASS (not FAIL) for this execution.
+5. Confirm the CMD: line shows the actual test command that was run.
+
+FAIL-CLOSED RULE — output `## 驗證結果: REJECTED` immediately if ANY of:
+- The executor evidence has no TEST_TARGETS: line
+- A listed test file path cannot be read (file missing or unreadable)
+- The test file(s) contain no real executed assertions (e.g. only `assert True`,
+  empty test bodies, or no actual test functions)
+- The RESULT: line is absent or shows FAIL
+- The CMD: line is absent (no execution evidence)
+
+NEVER output APPROVED or CONDITIONAL without having:
+  (a) successfully read at least one actual test file listed in TEST_TARGETS:,
+  (b) confirmed it contains real assertions, AND
+  (c) seen a PASS result in the RESULT: line.
+須附執行輸出否則 REJECT（實際被執行的測試才算數）。
 
 ## Validation Criteria
 
