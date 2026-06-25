@@ -1078,7 +1078,7 @@ class TestParseJsCoverageNonDictLoc:
 class TestJSCoverageHardeningNonDictEntry:
     """When a file value in coverage-final.json is NOT a dict (e.g., a string),
     the parser must not crash — it should skip or signal schema_error instead.
-    
+
     This is a robustness fix: malformed coverage JSON must not crash the gate.
     """
 
@@ -1098,10 +1098,10 @@ class TestJSCoverageHardeningNonDictEntry:
 
         targets = [{'file_path': 'src/f.js', 'name': 'f',
                     'line_start': 1, 'line_end': 10}]
-        
+
         # Must not raise; should handle gracefully
         res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
-        
+
         # Schema error is expected (file entry is malformed)
         assert res['tool_status'] == 'schema_error', (
             f'Non-dict file entry must signal schema_error, got {res["tool_status"]}')

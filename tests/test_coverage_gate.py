@@ -1860,3 +1860,186 @@ class TestM2NoBranchesDisplay:
         assert 'n/a' in headers[0] or '無分支' in headers[0]
         # Normal with missing: fraction + ❌
         assert '1/2' in headers[1] and '❌' in headers[1]
+
+
+# =============================================================================
+# N1 — branchless function requires execution evidence (close n_total=0 false-green)
+# =============================================================================
+
+def _write_branchless_fixture(root, test_calls_add: bool):
+    """Write fixture with a branchless `add` function.
+
+    When test_calls_add=True the test calls add(); when False it only imports.
+    """
+    (root / 'math_utils.py').write_text(textwrap.dedent('''\
+        def add(a, b):
+            return a + b
+    '''))
+    if test_calls_add:
+        (root / 'test_math_utils.py').write_text(textwrap.dedent('''\
+            from math_utils import add
+            def test_add():
+                assert add(1, 2) == 3
+        '''))
+    else:
+        (root / 'test_math_utils.py').write_text(textwrap.dedent('''\
+            from math_utils import add
+            def test_unrelated():
+                assert 1 + 1 == 2
+        '''))
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessExecutionEvidence:
+    """N1: branchless function (n_total==0) requires execution evidence via
+    executed_lines. Imported-but-not-called must NOT pass the gate (false-green).
+    Called branchless function MUST pass (do not reject real branchless functions).
+    """
+
+    def test_branchless_executed_function_is_covered(self, tmp_path):
+        """N1-A: branchless add() that IS called → tool_status='ok', fully_covered=True."""
+        from servers.coverage import measure_branch_coverage
+        _write_branchless_fixture(tmp_path, test_calls_add=True)
+        targets = [{'file_path': 'math_utils.py', 'name': 'add',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_math_utils.py'], targets)
+        assert res['tool_status'] == 'ok', (
+            f"N1-A: called branchless function must pass gate, got {res['tool_status']}: "
+            f"{res.get('error')}")
+        assert res['fully_covered'] is True, (
+            f"N1-A: called branchless function must be fully_covered, got {res}")
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 0, "N1-A: add() is branchless, n_total must be 0"
+        assert pt['missing_branches'] == []
+
+    def test_branchless_imported_but_not_called_is_not_covered(self, tmp_path):
+        """N1-B (false-green regression): branchless add() that is only IMPORTED
+        but never called must NOT pass the gate (fail-closed).
+
+        Previously n_total==0 with no missing_branches was treated as fully_covered=True,
+        giving a false-green for untested functions that merely appear in coverage data
+        because they were imported.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_branchless_fixture(tmp_path, test_calls_add=False)
+        targets = [{'file_path': 'math_utils.py', 'name': 'add',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_math_utils.py'], targets)
+        # Must NOT be fully_covered (the function body was never executed)
+        assert res['fully_covered'] is False, (
+            f"N1-B: imported-but-not-called branchless function must NOT pass gate, "
+            f"got fully_covered=True (false-green!): {res}")
+        # Gate must signal fail-closed: no_targets (consistent with file-absent case)
+        assert res['tool_status'] == 'no_targets', (
+            f"N1-B: expected tool_status='no_targets', got {res['tool_status']}: "
+            f"{res.get('error')}")
+        assert res['error'] and 'add' in res['error'], (
+            f"N1-B: error message must mention target name 'add', got: {res.get('error')}")
+
+
+# =============================================================================
+# N1-unit — _attribute_targets synthetic tests for executed_lines logic
+# =============================================================================
+
+class TestAttributeTargetsBranchlessExecutionEvidence:
+    """Unit tests for _attribute_targets executed_lines check (n_total==0 path).
+
+    Uses synthetic file_index to avoid running real coverage processes.
+    """
+
+    def _make_root_and_canon(self, tmp_path, fname='x.py'):
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, fname))
+        return root, canon
+
+    def test_branchless_with_executed_line_in_range_passes(self, tmp_path):
+        """n_total==0 + executed_lines has a line in [ls,le] → ok, fully_covered=True."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [1, 2],
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is True
+        assert res['per_target'][0]['n_total'] == 0
+
+    def test_branchless_with_no_executed_line_in_range_is_no_targets(self, tmp_path):
+        """n_total==0 + no executed_lines in [ls,le] → no_targets (fail-closed)."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [10, 20],  # outside range [1,2]
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'no_targets'
+        assert res['fully_covered'] is False
+        assert res['error'] and 'add' in res['error']
+
+    def test_branchless_missing_executed_lines_key_is_schema_error(self, tmp_path):
+        """n_total==0 + executed_lines absent → schema_error (fail-closed)."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            # executed_lines key absent
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_branchless_executed_lines_not_list_is_schema_error(self, tmp_path):
+        """n_total==0 + executed_lines is not a list → schema_error."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': None,
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_branchless_bool_in_executed_lines_not_counted(self, tmp_path):
+        """n_total==0 + executed_lines contains only booleans → treated as no execution."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [True, False],  # booleans are not valid line numbers
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        # True==1 and False==0 numerically, but must be excluded (bool check)
+        # Since True == 1 and 1 is in [1,2], the bool exclusion prevents false-green
+        assert res['tool_status'] == 'no_targets'
+        assert res['fully_covered'] is False
+
+    def test_n_total_gt_0_does_not_consult_executed_lines(self, tmp_path):
+        """n_total>0 path: executed_lines is irrelevant; existing arc logic unchanged."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        # entry has branches AND executed_lines is absent (schema would error if consulted)
+        file_index = {canon: {
+            'missing_branches': [[2, 4]],
+            'executed_branches': [[2, 3]],
+            # executed_lines intentionally absent — must NOT be consulted for n_total>0
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        # Must succeed normally, not schema_error due to missing executed_lines
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is False
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 2 and pt['n_covered'] == 1

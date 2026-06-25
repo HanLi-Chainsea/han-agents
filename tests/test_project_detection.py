@@ -541,11 +541,11 @@ class TestK1bDualRunnerAndMocha:
 
 class TestL1NoJSTypeScriptLanguageDefault:
     """L1: Remove typescript and javascript from _DEFAULT_TEST_TOOLS.
-    
+
     Without explicit runner evidence (no jest/vitest import, no config),
     a JS/TS project should default to test_tool=None (fail-closed),
     not 'jest' (false-green).
-    
+
     Tests the language-default lookup: assert typescript/javascript
     keys are removed from _DEFAULT_TEST_TOOLS.
     """

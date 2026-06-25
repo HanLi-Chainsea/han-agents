@@ -68,7 +68,7 @@ def _render_coverage_row(entry) -> Optional[str]:
     - AND n_total > 0
     - AND 0 <= n_covered <= n_total
     - Otherwise render 'unknown' / '⚠️'
-    
+
     R2: entries missing n_total or with n_total==0 show 'unknown'/neutral.
     R3: non-dict entries are skipped (return None).
     """

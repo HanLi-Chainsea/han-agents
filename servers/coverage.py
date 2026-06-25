@@ -198,6 +198,13 @@ def _attribute_targets(file_index: Dict[str, Dict],
 
     防護（codex 審查）：coverage json 的 branch 欄位若非 `[[int,int], ...]`（版本格式
     異動、欄位缺漏），**不可**靜默過濾成空集合而誤判全覆蓋——回 'schema_error' 確定性退件。
+
+    n_total==0（branchless）的額外驗證：無分支不代表函式有被執行。必須確認
+    executed_lines 裡至少有一 **函式體** 行落在 (line_start, line_end] 內，才算真正呼叫到。
+    （line_start 即 `def` 行，Python import 時就會執行，不算呼叫證明；
+     body 行 ls+1..le 只有實際呼叫才會出現在 executed_lines。）
+    若 executed_lines 不是 list（欄位缺失或格式異動）→ schema_error。
+    若函式體完全未執行 → no_targets（fail-closed，不允許假綠）。
     """
     per_target = []
     for t in coverage_targets:
@@ -221,12 +228,38 @@ def _attribute_targets(file_index: Dict[str, Dict],
         in_range = lambda arc: ls <= arc[0] <= le
         missing = [a for a in mb if in_range(a)]
         executed = [a for a in eb if in_range(a)]
+        n_total = len(missing) + len(executed)
+
+        # n_total==0: branchless function — must verify execution via executed_lines.
+        # A file appearing in coverage data only proves it was imported, not called.
+        # The `def` line (ls) is always executed at import time and does NOT prove
+        # the function body ran.  Only body lines (ls+1 .. le) appear in executed_lines
+        # when the function is actually called.
+        # Fail-closed: no body-line execution evidence → reject (no_targets), not false-green.
+        if n_total == 0:
+            el = entry.get('executed_lines')
+            if not isinstance(el, list):
+                return _result('schema_error',
+                               f'coverage json 格式非預期（{fp}）：'
+                               'executed_lines 應為 list（branchless 函式需執行證明）')
+            name = t.get('name') or fp
+            # Check body lines only: strictly greater than ls (skip the def line itself).
+            executed_in_range = any(
+                isinstance(ln, int) and not isinstance(ln, bool) and ls < ln <= le
+                for ln in el
+            )
+            if not executed_in_range:
+                return _result(
+                    'no_targets',
+                    f'target 函式未被測試執行(無分支且函式體未覆蓋): {fp}::{name}',
+                )
+
         per_target.append({
             'file_path': fp, 'name': t.get('name'),
             'line_start': ls, 'line_end': le,
             'missing_branches': [{'from': a[0], 'to': a[1]} for a in missing],
             'covered_branches': [{'from': a[0], 'to': a[1]} for a in executed],
-            'n_total': len(missing) + len(executed),
+            'n_total': n_total,
             'n_covered': len(executed),
         })
 

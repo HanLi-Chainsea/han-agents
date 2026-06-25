@@ -516,10 +516,10 @@ class TestK2SummaryByValidationOutcome:
 
 class TestL2ValidCoverageMarkOnly:
     """L2: Coverage ✓ mark only for valid n_covered/n_total within range.
-    
+
     Invalid entries (n_total=-1, n_covered > n_total, non-int, etc.)
     must show 'unknown'/⚠️, never ✓.
-    
+
     This prevents false-green: malformed coverage data must not
     appear to be full coverage.
     """
