@@ -950,3 +950,122 @@ class TestSubprocessOutputSanitization:
         error = res.get('error') or ''
         assert '\x07' not in error and '\x08' not in error, (
             f'Control chars must be stripped from error message; got: {error!r}')
+
+
+# ---------------------------------------------------------------------------
+# Robustness — non-dict loc in branchMap entry → schema_error (no crash)
+# ---------------------------------------------------------------------------
+
+class TestParseJsCoverageNonDictLoc:
+    """Robustness: branchMap entry with loc that is not a dict (e.g. a string)
+    must produce 'schema_error', not raise AttributeError.
+    """
+
+    def test_loc_is_string_returns_schema_error(self, tmp_path):
+        """coverage-final.json where branchMap entry loc is a string → schema_error."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        # loc is a string (invalid schema — should not raise, should return schema_error)
+        branch_map = {
+            '0': {
+                'type': 'if',
+                'line': 2,
+                'loc': 'invalid-string-not-a-dict',  # non-dict loc
+                'locations': [],
+            },
+        }
+        b_data = {'0': [1, 0]}
+
+        data = {
+            src_abs: {
+                'path': src_abs,
+                'all': False,
+                'statementMap': {},
+                's': {},
+                'branchMap': branch_map,
+                'b': b_data,
+            }
+        }
+        with open(str(cov_json), 'w', encoding='utf-8') as fh:
+            json.dump(data, fh)
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 10}]
+        # Must NOT raise; must return schema_error
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'schema_error', (
+            f'Non-dict loc must produce schema_error, got {res["tool_status"]}: {res.get("error")}')
+        assert res['fully_covered'] is False
+
+    def test_loc_start_is_string_returns_schema_error(self, tmp_path):
+        """branchMap entry where loc.start is a string (not a dict) → schema_error."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {
+            '0': {
+                'type': 'if',
+                'line': 2,
+                'loc': {'start': 'also-a-string', 'end': {'line': 3, 'column': 0}},
+                'locations': [],
+            },
+        }
+        b_data = {'0': [1, 0]}
+
+        data = {
+            src_abs: {
+                'path': src_abs, 'all': False, 'statementMap': {}, 's': {},
+                'branchMap': branch_map, 'b': b_data,
+            }
+        }
+        with open(str(cov_json), 'w', encoding='utf-8') as fh:
+            json.dump(data, fh)
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 10}]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        # loc.start is non-dict → _branch_line returns None → J1 catches → schema_error
+        assert res['tool_status'] == 'schema_error', (
+            f'Non-dict loc.start must produce schema_error, got {res["tool_status"]}')
+        assert res['fully_covered'] is False
+
+    def test_valid_loc_after_non_dict_not_affected(self, tmp_path):
+        """Sanity: a well-formed entry with loc.start.line still parses to 'ok'."""
+        from servers.coverage_js import parse_js_coverage
+
+        cov_json = tmp_path / 'coverage-final.json'
+        src_abs = str(tmp_path / 'src' / 'f.js')
+
+        branch_map = {
+            '0': {
+                'type': 'if',
+                'line': 2,
+                'loc': {'start': {'line': 2, 'column': 0}, 'end': {'line': 3, 'column': 0}},
+                'locations': [],
+            },
+        }
+        b_data = {'0': [1, 1]}  # both arms hit
+
+        data = {
+            src_abs: {
+                'path': src_abs, 'all': False, 'statementMap': {}, 's': {},
+                'branchMap': branch_map, 'b': b_data,
+            }
+        }
+        with open(str(cov_json), 'w', encoding='utf-8') as fh:
+            json.dump(data, fh)
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 10}]
+        res = parse_js_coverage(str(cov_json), targets, str(tmp_path))
+
+        assert res['tool_status'] == 'ok', (
+            f'Well-formed loc must still parse ok, got {res["tool_status"]}')
+        assert res['fully_covered'] is True

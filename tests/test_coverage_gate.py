@@ -1583,3 +1583,175 @@ class TestRunCoverageGatePersistsCoverage:
         assert entry['n_covered'] == 1
         assert entry['n_total'] == 2
         assert entry['missing_branches'] == [{'from': 2, 'to': 5}]
+
+
+# ── K1: fail-closed on undetermined JS runner ─────────────────────────────────
+
+
+class TestK1UndeterminedJsRunner:
+    """K1: when test_tool is None/empty/mocha (not vitest/jest), gate must
+    reject fail-closed rather than defaulting to vitest and running the wrong runner.
+    """
+
+    def _setup_js_task(self, monkeypatch, test_tool_value, primary_language='typescript'):
+        """Create a done task with JS coverage_targets; mock ensure_project with test_tool_value.
+
+        primary_language defaults to 'typescript' so select_backend routes to 'js'
+        even when test_tool is None/empty — this is the scenario where a JS project
+        has no explicit test runner configured.
+        """
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {
+                                'tech_stack': {
+                                    'test_tool': test_tool_value,
+                                    'primary_language': primary_language,
+                                }
+                            })
+
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['test/f.test.js'])
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        targets = [{'file_path': 'src/f.js', 'name': 'fn',
+                    'line_start': 1, 'line_end': 10}]
+        task = create_subtask(parent_id=story, description='write js tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test/f.test.js')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_none_test_tool_rejects_not_vitest(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool=None → gate rejects (fail-closed), never runs vitest."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        # Mark npx as available to ensure it's the tool check that rejects, not npx
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool', 'unknown'))
+            return {'tool_status': 'ok', 'fully_covered': True,
+                    'error': None, 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value=None)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool=None must reject (fail-closed), got {verdict["verdict"]}')
+        assert js_calls == [], (
+            'K1: measure_branch_coverage_js must NOT be called when test_tool is None')
+        # Error message must explain the problem
+        issues_text = ' '.join(verdict.get('issues', []))
+        assert 'runner' in issues_text or 'vitest' in issues_text or 'jest' in issues_text, (
+            f'K1: rejection must explain runner ambiguity, got issues: {verdict.get("issues")}')
+
+    def test_empty_test_tool_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='' (empty string) → gate rejects, not vitest run."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool'))
+            return {'tool_status': 'ok', 'fully_covered': True,
+                    'error': None, 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool="" must reject, got {verdict["verdict"]}')
+        assert js_calls == []
+
+    def test_mocha_test_tool_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='mocha' → gate rejects (mocha is not supported)."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool'))
+            return {'tool_status': 'unavailable', 'fully_covered': False,
+                    'error': 'mocha unsupported', 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='mocha')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool=mocha must reject, got {verdict["verdict"]}')
+
+    def test_vitest_test_tool_calls_measure(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='vitest' → measure_branch_coverage_js IS called with tool='vitest'."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/f.js', 'name': 'fn',
+                                    'line_start': 1, 'line_end': 10,
+                                    'covered_branches': [{'from': 2, 'to': 0}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='vitest')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed', (
+            f'K1: vitest must proceed to measure, got {verdict["verdict"]}')
+        assert js_calls == ['vitest'], (
+            f'K1: measure must be called with tool=vitest, got {js_calls}')
+
+    def test_jest_test_tool_calls_measure(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='jest' → measure_branch_coverage_js IS called with tool='jest'."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/f.js', 'name': 'fn',
+                                    'line_start': 1, 'line_end': 10,
+                                    'covered_branches': [{'from': 2, 'to': 0}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='jest')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed', (
+            f'K1: jest must proceed to measure, got {verdict["verdict"]}')
+        assert js_calls == ['jest'], (
+            f'K1: measure must be called with tool=jest, got {js_calls}')

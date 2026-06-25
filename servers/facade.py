@@ -1939,11 +1939,15 @@ def run_coverage_gate(critic_task_id: str,
             project_path, test_targets, coverage_targets,
             test_filters=java_test_filters if java_test_filters else None)
     elif _backend == 'js':
-        # Vitest/Jest backend — tool derived from tech_stack.test_tool (or default vitest).
-        # Major: do NOT force mocha/other tools to vitest — that is a false runner.
-        # measure_branch_coverage_js returns 'unavailable' for unsupported tools,
-        # which the gate handles fail-closed below (unavailable → _gate_reject for JS).
-        _js_tool = (_ts.get('test_tool') or 'vitest').lower().strip()
+        # K1 fix: fail-closed when test_tool is undetermined (None/empty/mocha/etc.).
+        # NEVER default to vitest — a wrong runner produces false-green coverage.
+        # Only proceed when test_tool is explicitly 'vitest' or 'jest'.
+        _raw_tool = _ts.get('test_tool')
+        _js_tool = (_raw_tool or '').lower().strip()
+        if _js_tool not in ('vitest', 'jest'):
+            return _gate_reject(critic_task_id, original_task_id, [
+                '無法確定 JS 測試 runner(vitest/jest);'
+                '請在專案設定明確指定,否則無法驗證分支覆蓋'])
         res = cov_js.measure_branch_coverage_js(
             project_path, test_targets, coverage_targets, tool=_js_tool)
     else:

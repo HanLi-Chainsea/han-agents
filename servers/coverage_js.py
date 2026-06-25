@@ -66,12 +66,18 @@ def _branch_line(branch_entry: dict) -> Optional[int]:
 
     Prefer loc.start.line (precise); fall back to top-level "line".
     Returns None if neither is a valid int.
+
+    Robustness: if loc or loc.start is not a dict (e.g. a string from a
+    malformed coverage-final.json), return None rather than raising.
+    The caller treats None as schema_error (fail-closed).
     """
-    loc = branch_entry.get('loc') or {}
-    start = loc.get('start') or {}
-    line = start.get('line')
-    if isinstance(line, int) and not isinstance(line, bool) and line > 0:
-        return line
+    loc = branch_entry.get('loc')
+    if isinstance(loc, dict):
+        start = loc.get('start')
+        if isinstance(start, dict):
+            line = start.get('line')
+            if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+                return line
     # fallback
     line = branch_entry.get('line')
     if isinstance(line, int) and not isinstance(line, bool) and line > 0:
@@ -178,6 +184,7 @@ def parse_js_coverage(coverage_json_path: str,
     - b[id] = [] (zero arms)              → 'schema_error'
     - orphan b id (in b but not branchMap) within range → 'schema_error'
     - branchMap entry with unresolvable line within range → 'schema_error'
+    - branchMap entry whose loc or loc.start is not a dict → 'schema_error'
     - NEVER defaults missing data to fully-covered.
     """
     # Validate targets — reuse the same guard as python/java backends (DRY, fail-closed)
@@ -249,6 +256,20 @@ def parse_js_coverage(coverage_json_path: str,
                 return _result('schema_error',
                                f'Target {file_path}: branchMap[{bid}] is not a dict')
 
+            # Robustness: if loc is present but not a dict, treat as schema_error.
+            # The _branch_line fallback can still find a valid line via the top-level
+            # 'line' field, masking the malformed loc. We must explicitly reject this
+            # to prevent silently accepting malformed coverage data (non-dict loc).
+            _loc = bentry.get('loc')
+            if _loc is not None and not isinstance(_loc, dict):
+                return _result('schema_error',
+                               f'Target {file_path}: branchMap[{bid}].loc is not a dict '
+                               f'(got {type(_loc).__name__!r}); malformed coverage schema')
+            _loc_start = _loc.get('start') if isinstance(_loc, dict) else None
+            if _loc_start is not None and not isinstance(_loc_start, dict):
+                return _result('schema_error',
+                               f'Target {file_path}: branchMap[{bid}].loc.start is not a '
+                               f'dict (got {type(_loc_start).__name__!r}); malformed schema')
             br_line = _branch_line(bentry)
 
             # J1: Unresolvable line within range → schema_error (not skip-and-pass)
@@ -259,7 +280,8 @@ def parse_js_coverage(coverage_json_path: str,
                 return _result('schema_error',
                                f'Target {file_path}: branchMap[{bid}] has no '
                                f'resolvable line number (loc.start.line and line '
-                               f'field are both absent/invalid)')
+                               f'field are both absent/invalid or loc/loc.start '
+                               f'is not a dict)')
 
             if not (line_start <= br_line <= line_end):
                 continue

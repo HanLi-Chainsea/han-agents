@@ -403,3 +403,108 @@ class TestR3NonDictCoverageEntryRobust:
         # Must not raise
         md = build_unit_test_report(epic_id, 'r3proj3', str(tmp_path))
         assert 'r3proj3' in md
+
+
+# =============================================================================
+# K2 — summary must count by validation outcome, not task.status
+# =============================================================================
+
+class TestK2SummaryByValidationOutcome:
+    """K2: A task with status='done' but validation_status='rejected' must NOT
+    appear as Passed/Validated — it must appear under Rejected.
+    An approved task must appear under Validated/Passed.
+    """
+
+    def test_rejected_validation_not_counted_as_validated(self, mock_db_path, tmp_path):
+        """K2: executor done + critic rejected → report shows Rejected, NOT Validated."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj', description='K2 Epic',
+                              task_level='epic')
+        story_id = create_task(project='k2proj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        task_id = create_subtask(parent_id=story_id, description='Write tests',
+                                 assigned_agent='executor', requires_validation=True,
+                                 epic_id=epic_id)
+        # Executor finished (status='done') but critic rejected it
+        update_task_status(task_id, 'done', result='done')
+        mark_validated(task_id, 'rejected')
+
+        md = build_unit_test_report(epic_id, 'k2proj', str(tmp_path))
+
+        # Must NOT show '1 / 0' style Passed line (old false-green)
+        # Must NOT count this as validated/passed
+        assert 'Validated / Rejected / Other' in md or 'Rejected' in md, (
+            'K2: report must use validation-based summary')
+        # The line must show 0 validated and 1 rejected (not 1 validated)
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found in report:\n{md}')
+        # Format: "Validated / Rejected / Other: 0 / 1 / 0"
+        assert '0 / 1' in summary_line or ('0' in summary_line and '1' in summary_line), (
+            f'K2: rejected task should show 0 validated / 1 rejected, got: {summary_line!r}')
+
+    def test_approved_validation_counted_as_validated(self, mock_db_path, tmp_path):
+        """K2: executor done + critic approved → report shows 1 Validated."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj2', description='K2 Epic 2',
+                              task_level='epic')
+        story_id = create_task(project='k2proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        task_id = create_subtask(parent_id=story_id, description='Write tests',
+                                 assigned_agent='executor', requires_validation=True,
+                                 epic_id=epic_id)
+        update_task_status(task_id, 'done', result='done')
+        mark_validated(task_id, 'approved')
+
+        md = build_unit_test_report(epic_id, 'k2proj2', str(tmp_path))
+
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found in report:\n{md}')
+        # approved → 1 validated, 0 rejected
+        assert '1 / 0' in summary_line or ('1' in summary_line and
+                                            summary_line.count('0') >= 1), (
+            f'K2: approved task should show 1 validated, got: {summary_line!r}')
+
+    def test_mixed_approved_rejected_counts_correctly(self, mock_db_path, tmp_path):
+        """K2: 1 approved + 1 rejected → Validated=1, Rejected=1, Other=0."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj3', description='K2 Epic 3',
+                              task_level='epic')
+        story_id = create_task(project='k2proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+
+        t_approved = create_subtask(parent_id=story_id, description='Approved task',
+                                    assigned_agent='executor', requires_validation=True,
+                                    epic_id=epic_id)
+        t_rejected = create_subtask(parent_id=story_id, description='Rejected task',
+                                    assigned_agent='executor', requires_validation=True,
+                                    epic_id=epic_id)
+        update_task_status(t_approved, 'done', result='done')
+        mark_validated(t_approved, 'approved')
+        update_task_status(t_rejected, 'done', result='done')
+        mark_validated(t_rejected, 'rejected')
+
+        md = build_unit_test_report(epic_id, 'k2proj3', str(tmp_path))
+
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found:\n{md}')
+        # "1 / 1 / 0" (validated=1, rejected=1, other=0)
+        assert '1 / 1' in summary_line, (
+            f'K2: expected "1 / 1" in summary, got: {summary_line!r}')

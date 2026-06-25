@@ -133,11 +133,44 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
             if isinstance(scripts, dict):
                 test_script = scripts.get('test', '') or ''
 
-            # Check vitest signals first (vitest beats jest)
+            # K1b: detect mocha first (before vitest/jest checks) so it is
+            # consistently returned rather than falling through.
             if (
-                'vitest' in all_deps
-                or 'vitest' in test_script
+                'mocha' in all_deps
+                or 'mocha' in test_script
             ):
+                return 'mocha'
+
+            # K1b dual-runner guard: if BOTH jest and vitest appear in deps with
+            # no disambiguating explicit signal, return None (ambiguous) rather
+            # than silently picking vitest.
+            _vitest_dep = 'vitest' in all_deps
+            _jest_dep = 'jest' in all_deps or 'jest' in pkg
+            _vitest_script = 'vitest' in test_script
+            _jest_script = 'jest' in test_script
+
+            if _vitest_dep and _jest_dep:
+                # Both in deps: only disambiguate via explicit test_script signal
+                # (vitest.config.* / vite.config.* were already handled above)
+                if _vitest_script and not _jest_script:
+                    return 'vitest'
+                if _jest_script and not _vitest_script:
+                    # also check jest.config.* as it beats a bare jest dep
+                    _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
+                    for ext in _jest_config_exts:
+                        if (root / f"jest.config.{ext}").exists():
+                            return 'jest'
+                    return 'jest'
+                # Neither script signal nor config file → truly ambiguous → None
+                _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
+                for ext in _jest_config_exts:
+                    if (root / f"jest.config.{ext}").exists():
+                        return 'jest'
+                # Still ambiguous — return None (caller treats as undetermined)
+                return None
+
+            # Check vitest signals first (vitest beats jest when only one is present)
+            if _vitest_dep or _vitest_script:
                 return 'vitest'
 
             # jest.config.* (explicit config files for jest)
@@ -149,8 +182,8 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
             # Jest signals from package.json
             if (
                 'jest' in pkg                   # top-level jest key
-                or 'jest' in all_deps
-                or 'jest' in test_script
+                or _jest_dep
+                or _jest_script
             ):
                 return 'jest'
 

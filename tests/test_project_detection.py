@@ -438,3 +438,92 @@ class TestD4Robustness:
             "export default defineConfig({ server: { port: 3000 } });"
         )
         assert _detect_test_tool_from_config(tmp_path) is None
+
+
+# =============================================================================
+# K1b — dual-runner ambiguity + mocha detection
+# =============================================================================
+
+class TestK1bDualRunnerAndMocha:
+    """K1b: (a) both jest+vitest in devDeps with no disambiguating config → None
+            (b) mocha in deps or scripts.test → 'mocha'
+    """
+
+    def test_dual_jest_vitest_devdeps_no_config_returns_none(self, tmp_path):
+        """K1b-a: package.json devDeps contains BOTH jest and vitest, no config → None."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "vitest": "^1.0.0",
+            }
+        }))
+        # No vitest.config.*, no jest.config.* — truly ambiguous
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result is None, (
+            f'K1b: both jest+vitest in devDeps with no config → must be None, got {result!r}')
+
+    def test_dual_deps_with_vitest_script_returns_vitest(self, tmp_path):
+        """K1b-a: both jest+vitest in deps, but scripts.test says 'vitest' → 'vitest'."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "vitest": "^1.0.0",
+            },
+            "scripts": {"test": "vitest run"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'vitest', (
+            f'K1b: vitest in scripts.test disambiguates → vitest, got {result!r}')
+
+    def test_dual_deps_with_jest_config_returns_jest(self, tmp_path):
+        """K1b-a: both jest+vitest in deps, but jest.config.js present → 'jest'."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "vitest": "^1.0.0",
+            }
+        }))
+        (tmp_path / "jest.config.js").write_text("module.exports = {};")
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'jest', (
+            f'K1b: jest.config.js disambiguates dual deps → jest, got {result!r}')
+
+    def test_only_jest_devdep_still_returns_jest(self, tmp_path):
+        """K1b: only jest in devDeps (no vitest) → 'jest' unchanged."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {"jest": "^29.0.0"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'jest', f'Single jest dep must still return jest, got {result!r}'
+
+    def test_only_vitest_devdep_still_returns_vitest(self, tmp_path):
+        """K1b: only vitest in devDeps (no jest) → 'vitest' unchanged."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {"vitest": "^1.0.0"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'vitest', f'Single vitest dep must still return vitest, got {result!r}'
+
+    def test_mocha_in_devdeps_returns_mocha(self, tmp_path):
+        """K1b-b: mocha in devDependencies → 'mocha'."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {"mocha": "^10.0.0"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'mocha', f'mocha in devDeps must return mocha, got {result!r}'
+
+    def test_mocha_in_test_script_returns_mocha(self, tmp_path):
+        """K1b-b: scripts.test mentions mocha → 'mocha'."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "scripts": {"test": "mocha --recursive"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'mocha', f'mocha in scripts.test must return mocha, got {result!r}'
+
+    def test_mocha_in_dependencies_not_devdeps_returns_mocha(self, tmp_path):
+        """K1b-b: mocha in dependencies (not devDependencies) → 'mocha'."""
+        (tmp_path / "package.json").write_text(json.dumps({
+            "dependencies": {"mocha": "^10.0.0"},
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == 'mocha', f'mocha in deps must return mocha, got {result!r}'

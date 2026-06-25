@@ -99,8 +99,17 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
 
     executor_tasks = _get_executor_tasks_for_epic(epic_id)
     n_total = len(executor_tasks)
-    n_done = sum(1 for t in executor_tasks if t['status'] == 'done')
-    n_failed = sum(1 for t in executor_tasks if t['status'] == 'failed')
+
+    # K2 fix: count by VALIDATION outcome, not by task.status.
+    # A task with status='done' but validation_status='rejected' must NOT be
+    # counted as Passed — that would be a report-layer false green.
+    n_validated = sum(
+        1 for t in executor_tasks if t.get('validation_status') == 'approved'
+    )
+    n_rejected = sum(
+        1 for t in executor_tasks if t.get('validation_status') == 'rejected'
+    )
+    n_other = n_total - n_validated - n_rejected
 
     lines = []
 
@@ -110,7 +119,7 @@ def build_unit_test_report(epic_id: str, project_name: str, project_path: str) -
     lines.append(f'**Project**: {project_name}')
     lines.append(f'**Epic ID**: {epic_id}')
     lines.append(f'**Executor tasks**: {n_total}')
-    lines.append(f'**Passed / Failed**: {n_done} / {n_failed}')
+    lines.append(f'**Validated / Rejected / Other**: {n_validated} / {n_rejected} / {n_other}')
     lines.append('')
 
     # ── 2. Per-file coverage ─────────────────────────────────────────────────────
