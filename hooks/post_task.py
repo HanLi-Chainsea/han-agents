@@ -90,7 +90,9 @@ def _paths_within_root(paths: List[str], project_root: str) -> bool:
             common = os.path.commonpath([real_root, resolved])
             if common != real_root:
                 return False
-        except (ValueError, Exception):
+        except Exception:
+            # any path error (incl. commonpath ValueError on different drives)
+            # → not provably within root → fail-closed
             return False
     return True
 
