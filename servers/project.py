@@ -46,10 +46,10 @@ _FRAMEWORK_HINTS = {
 }
 
 # 語言 → 預設測試工具
+# L1 fix: removed typescript/javascript (fail-closed: JS/TS must not guess 'jest')
+# Only deterministic language defaults (python, java, rust, go)
 _DEFAULT_TEST_TOOLS = {
     'python': 'pytest',
-    'typescript': 'jest',
-    'javascript': 'jest',
     'java': 'junit',
     'rust': 'cargo test',
     'go': 'go test',

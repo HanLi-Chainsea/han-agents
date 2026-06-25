@@ -527,3 +527,43 @@ class TestK1bDualRunnerAndMocha:
         }))
         result = _detect_test_tool_from_config(tmp_path)
         assert result == 'mocha', f'mocha in deps must return mocha, got {result!r}'
+
+
+# =============================================================================
+# L1 — JS/TS language default must not guess a runner (false-green fix)
+# =============================================================================
+
+class TestL1NoJSTypeScriptLanguageDefault:
+    """L1: Remove typescript and javascript from _DEFAULT_TEST_TOOLS.
+    
+    Without explicit runner evidence (no jest/vitest import, no config),
+    a JS/TS project should default to test_tool=None (fail-closed),
+    not 'jest' (false-green).
+    
+    Tests the language-default lookup: assert typescript/javascript
+    keys are removed from _DEFAULT_TEST_TOOLS.
+    """
+
+    def test_typescript_not_in_default_tools(self):
+        """typescript language must not have a default test_tool."""
+        from servers.project import _DEFAULT_TEST_TOOLS
+        assert 'typescript' not in _DEFAULT_TEST_TOOLS, (
+            "L1 violation: typescript in _DEFAULT_TEST_TOOLS — "
+            "JS/TS must fail-closed (no guess runner)"
+        )
+
+    def test_javascript_not_in_default_tools(self):
+        """javascript language must not have a default test_tool."""
+        from servers.project import _DEFAULT_TEST_TOOLS
+        assert 'javascript' not in _DEFAULT_TEST_TOOLS, (
+            "L1 violation: javascript in _DEFAULT_TEST_TOOLS — "
+            "JS/TS must fail-closed (no guess runner)"
+        )
+
+    def test_other_language_defaults_intact(self):
+        """python, java, rust, go must still have defaults (deterministic)."""
+        from servers.project import _DEFAULT_TEST_TOOLS
+        assert _DEFAULT_TEST_TOOLS.get('python') == 'pytest'
+        assert _DEFAULT_TEST_TOOLS.get('java') == 'junit'
+        assert _DEFAULT_TEST_TOOLS.get('rust') == 'cargo test'
+        assert _DEFAULT_TEST_TOOLS.get('go') == 'go test'

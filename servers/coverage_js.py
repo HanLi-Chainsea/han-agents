@@ -231,6 +231,12 @@ def parse_js_coverage(coverage_json_path: str,
 
         file_data = raw[matched_key]
 
+        # Hardening: if file_data is not a dict (e.g., a string), fail-closed
+        if not isinstance(file_data, dict):
+            return _result('schema_error',
+                           f'Target {file_path}: coverage entry is not a dict '
+                           f'(got {type(file_data).__name__!r}); malformed coverage schema')
+
         # Validate presence of branchMap and b
         branch_map = file_data.get('branchMap')
         b_data = file_data.get('b')

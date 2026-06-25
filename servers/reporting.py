@@ -63,6 +63,12 @@ def _is_task_resolved(task: dict) -> bool:
 def _render_coverage_row(entry) -> Optional[str]:
     """Render a single coverage table row.
 
+    L2 (valid-only coverage mark):
+    - Only show ✓ when BOTH n_covered and n_total are non-bool integers
+    - AND n_total > 0
+    - AND 0 <= n_covered <= n_total
+    - Otherwise render 'unknown' / '⚠️'
+    
     R2: entries missing n_total or with n_total==0 show 'unknown'/neutral.
     R3: non-dict entries are skipped (return None).
     """
@@ -75,8 +81,17 @@ def _render_coverage_row(entry) -> Optional[str]:
     nc = entry.get('n_covered')
     nt = entry.get('n_total')
 
-    # R2: missing or zero n_total → unknown, not a false-green checkmark
-    if nt is None or nt == 0:
+    # L2: Validate both are non-bool integers
+    # (isinstance(x, int) and not isinstance(x, bool) checks for int, excluding bool)
+    is_nc_valid = isinstance(nc, int) and not isinstance(nc, bool)
+    is_nt_valid = isinstance(nt, int) and not isinstance(nt, bool)
+
+    # R2/L2: missing or zero n_total → unknown, not a false-green checkmark
+    if not is_nt_valid or nt is None or nt == 0:
+        return f'| {fp} | {name} | unknown | ⚠️ |'
+
+    # L2: n_covered invalid or out of range [0, n_total] → unknown
+    if not is_nc_valid or nc < 0 or nc > nt:
         return f'| {fp} | {name} | unknown | ⚠️ |'
 
     mark = '✓' if nc == nt else '⚠️'
