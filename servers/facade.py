@@ -1375,6 +1375,14 @@ def finish_validation(
         log_agent_action('critic', original_task_id, 'rejected',
                         json.dumps({'issues': issues or [], 'suggestions': suggestions or []}))
 
+        # Fix A: persist critic reason so executor retry prompt picks it up
+        # (same key _gate_reject writes; idempotent when called via _gate_reject)
+        reason_lines = (issues or []) + (suggestions or [])
+        if reason_lines:
+            from servers.memory import set_working_memory
+            set_working_memory(original_task_id, 'critic_suggestions',
+                               '\n'.join(str(x) for x in reason_lines))
+
         return {
             'status': 'rejected',
             'original_task_phase': 'execution',
@@ -2626,6 +2634,26 @@ You MUST output one of:
 - `## 驗證結果: APPROVED` — if the task is done correctly
 - `## 驗證結果: CONDITIONAL` — if acceptable with minor suggestions
 - `## 驗證結果: REJECTED` — if significant issues need fixing
+
+## Mandatory finish_validation Call
+
+After rendering your verdict, you MUST call finish_validation with the
+appropriate approved value.
+
+REJECTED or CONDITIONAL — you MUST pass a non-empty `issues` list with
+SPECIFIC, ACTIONABLE items naming exactly what to fix. Each issue must be
+concrete and implementable, for example:
+  - "新增 TEST_TARGETS: 一行列出測試檔"
+  - "test_foo 的斷言 `assert True` 無意義，需驗實際回傳值"
+  - "未涵蓋 null / error path"
+
+Call pattern for reject:
+  finish_validation(task_id=TASK_ID, original_task_id=ORIGINAL_TASK_ID,
+                    approved=False, issues=["具體問題1", "具體問題2"])
+
+Vague issues like "needs improvement" or "code quality" are NOT acceptable —
+the executor uses this issues list verbatim to decide what to fix on retry.
+
 '''
     return prompt.strip()
 

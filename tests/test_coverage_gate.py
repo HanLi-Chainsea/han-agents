@@ -2348,3 +2348,115 @@ class TestAstBodyStartLineUnit:
         (tmp_path / 'f.py').write_text('def f(\n   # missing close paren and body')
         result = _ast_body_start_line(str(tmp_path / 'f.py'), 'f', 1, 5)
         assert result is None
+
+
+# =============================================================================
+# TestFinishValidationPersistsCriticSuggestions
+# Covers Fix A: finish_validation must write critic_suggestions on reject so
+# that the executor retry prompt (_get_rejected_tasks / _build_executor_prompt)
+# has the reason.
+# =============================================================================
+
+class TestFinishValidationPersistsCriticSuggestions:
+    """Fix A regression guard: finish_validation persists rejection reason."""
+
+    def _setup_task(self):
+        """Create a minimal epic/story/task + critic task ready for validation."""
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story',
+                               task_level='story', requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True)
+        update_task_status(task, 'done', result='done')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_finish_validation_persists_critic_suggestions_on_reject(
+            self, mock_db_path):
+        """After a LLM-critic reject, critic_suggestions must be in working memory
+        so the executor retry prompt can surface it."""
+        from servers.facade import finish_validation
+        from servers.memory import get_working_memory
+
+        task_id, critic_id = self._setup_task()
+        finish_validation(critic_id, task_id, approved=False,
+                          issues=['新增 TEST_TARGETS: 一行列出測試檔'])
+
+        wm = get_working_memory(task_id, 'critic_suggestions')
+        assert wm is not None, 'critic_suggestions must be written on reject'
+        assert '新增 TEST_TARGETS:' in wm
+
+    def test_finish_validation_persists_issues_and_suggestions_combined(
+            self, mock_db_path):
+        """Both issues and suggestions must be persisted (joined)."""
+        from servers.facade import finish_validation
+        from servers.memory import get_working_memory
+
+        task_id, critic_id = self._setup_task()
+        finish_validation(critic_id, task_id, approved=False,
+                          issues=['問題A'],
+                          suggestions=['建議B'])
+
+        wm = get_working_memory(task_id, 'critic_suggestions')
+        assert wm is not None
+        assert '問題A' in wm
+        assert '建議B' in wm
+
+    def test_finish_validation_empty_issues_does_not_clobber_existing(
+            self, mock_db_path):
+        """If issues and suggestions are both empty, do NOT overwrite a prior
+        critic_suggestions key (e.g. one written by _gate_reject earlier)."""
+        from servers.facade import finish_validation
+        from servers.memory import get_working_memory, set_working_memory
+
+        task_id, critic_id = self._setup_task()
+        # Pre-populate a prior reason (as _gate_reject would)
+        set_working_memory(task_id, 'critic_suggestions', 'prior reason')
+
+        finish_validation(critic_id, task_id, approved=False,
+                          issues=[], suggestions=[])
+
+        wm = get_working_memory(task_id, 'critic_suggestions')
+        assert wm == 'prior reason', (
+            'empty-issues reject must not clobber an existing critic_suggestions')
+
+    def test_finish_validation_approved_does_not_write_suggestions(
+            self, mock_db_path):
+        """On approval, critic_suggestions must not be written or cleared."""
+        from servers.facade import finish_validation
+        from servers.memory import get_working_memory
+
+        task_id, critic_id = self._setup_task()
+        finish_validation(critic_id, task_id, approved=True)
+
+        wm = get_working_memory(task_id, 'critic_suggestions')
+        # No write: key should be absent (None) not set to anything
+        assert wm is None, (
+            'approved path must not write critic_suggestions')
+
+    def test_rejected_executor_retry_prompt_contains_critic_reason(
+            self, mock_db_path):
+        """End-to-end: after finish_validation reject, _get_rejected_tasks
+        surfaces the critic reason and _build_executor_prompt includes it."""
+        from servers.facade import finish_validation, _get_rejected_tasks
+        from servers.tasks import get_task
+
+        task_id, critic_id = self._setup_task()
+
+        # Get story parent for _get_rejected_tasks
+        task = get_task(task_id)
+        parent_id = task['parent_id']
+
+        result = finish_validation(critic_id, task_id, approved=False,
+                                   issues=['test_foo 的斷言 assert True 無意義'])
+
+        assert result['status'] == 'rejected'
+
+        rejected = _get_rejected_tasks(parent_id)
+        assert rejected, '_get_rejected_tasks must return the rejected task'
+        ctx = rejected[0].get('_rejection_context', '')
+        assert ctx, '_rejection_context must be populated from working memory'
+        assert 'assert True' in ctx, (
+            'critic reason must appear in rejection context for executor retry')

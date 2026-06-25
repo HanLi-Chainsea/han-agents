@@ -344,3 +344,49 @@ class TestCompactEvidenceBlock:
         assert "REJECT" in prompt  # playbook critic checklist has REJECT conditions
         # 'fail-closed' label or guardrail section present
         assert "fail-closed" in prompt.lower() or "FAIL-CLOSED" in prompt
+
+
+class TestCriticPromptInstructsActionableIssues:
+    """Fix B regression guard: critic prompt must instruct finish_validation
+    with specific, actionable issues on REJECT/CONDITIONAL."""
+
+    def _critic_prompt(self):
+        from servers.facade import _build_critic_prompt
+        critic_task = {
+            "id": "c-fv1", "original_task_id": "t-fv1",
+            "original_description": "Write unit tests for servers/memory.py",
+            "result": "TEST_TARGETS: tests/test_x.py\nRESULT: PASS 3\nCHANGED: tests/test_x.py\nCMD: pytest tests/test_x.py"
+        }
+        return _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+
+    def test_critic_prompt_instructs_finish_validation_with_actionable_issues(self):
+        """Critic prompt must explicitly instruct calling finish_validation with
+        a specific, actionable issues list on REJECT (not vague labels)."""
+        prompt = self._critic_prompt()
+        prompt_lower = prompt.lower()
+
+        # Must mention finish_validation call
+        assert 'finish_validation' in prompt, (
+            'critic prompt must instruct calling finish_validation')
+
+        # Must show approved=False pattern for reject
+        assert 'approved=False' in prompt, (
+            'critic prompt must show approved=False for reject')
+
+        # Must include issues= parameter instruction
+        assert 'issues=' in prompt, (
+            'critic prompt must instruct passing issues= to finish_validation')
+
+        # Must warn against vague issues
+        assert 'vague' in prompt_lower or 'not acceptable' in prompt_lower, (
+            'critic prompt must warn that vague issues are not acceptable')
+
+        # Must instruct actionable / specific items
+        assert ('actionable' in prompt_lower or 'specific' in prompt_lower
+                or 'concrete' in prompt_lower), (
+            'critic prompt must instruct specific/actionable issues')
+
+        # Existing content still intact
+        assert '## 驗證結果: APPROVED' in prompt
+        assert '## 驗證結果: REJECTED' in prompt
+        assert 'finish_validation' in prompt
