@@ -205,6 +205,11 @@ _RESULT_LINE = re.compile(
     r'^\s*RESULT:',
     re.IGNORECASE,
 )
+# CMD: line with at least one non-whitespace character after CMD:
+_CMD_LINE = re.compile(
+    r'^\s*CMD:\s*(\S.*)$',
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _check_test_evidence(result_text: str, project_root: str):
@@ -212,29 +217,32 @@ def _check_test_evidence(result_text: str, project_root: str):
 
     Exhaustive evidence checks:
     - Collect ALL TEST_TARGETS: lines and ALL paths across them (comma or
-      space separated).  EVERY path must be within project_root.  ANY path
-      escaping the root → REJECT.
+      space separated).  EVERY path must be within project_root AND exist on
+      disk as a regular file.  ANY path escaping the root, not existing, or
+      being a directory -> REJECT.
     - Collect ALL RESULT: lines (including bare 'RESULT:' with nothing after).
       Parse each line with STRICT whole-line patterns:
         PASS pattern: ^\\s*RESULT:\\s*PASS(?:\\s+\\d+)?\\s*$
         FAIL pattern: ^\\s*RESULT:\\s*FAIL(?:\\s+\\d+)?(?:\\s+.*)?\\s*$
-      Any RESULT: line matching NEITHER → MALFORMED → evidence INVALID → REJECT.
+      Any RESULT: line matching NEITHER -> MALFORMED -> evidence INVALID -> REJECT.
       Rules:
-        - ANY malformed RESULT: line → evidence INVALID → REJECT
+        - ANY malformed RESULT: line -> evidence INVALID -> REJECT
         - At least one clean RESULT: PASS required
-        - Zero clean RESULT: FAIL allowed; any FAIL → REJECT
+        - Zero clean RESULT: FAIL allowed; any FAIL -> REJECT
       So:
-        'RESULT: PASS FAIL'      → malformed → REJECT
-        'RESULT: PASS / FAIL'    → malformed → REJECT
-        'RESULT: PASS - FAIL 1'  → malformed → REJECT
-        'RESULT: PASS tests failed' → malformed → REJECT (non-digit after PASS token)
-        'RESULT:'                → malformed (bare, no PASS/FAIL) → REJECT
-        'RESULT: PASS 3'         → valid PASS
-        'RESULT: PASSIVE'        → malformed (not PASS or FAIL token) → REJECT
+        'RESULT: PASS FAIL'      -> malformed -> REJECT
+        'RESULT: PASS / FAIL'    -> malformed -> REJECT
+        'RESULT: PASS - FAIL 1'  -> malformed -> REJECT
+        'RESULT: PASS tests failed' -> malformed -> REJECT (non-digit after PASS token)
+        'RESULT:'                -> malformed (bare, no PASS/FAIL) -> REJECT
+        'RESULT: PASS 3'         -> valid PASS
+        'RESULT: PASSIVE'        -> malformed (not PASS or FAIL token) -> REJECT
+    - A non-empty CMD: line must be present: ^\\s*CMD:\\s*(\\S.*)$
+      Missing or empty CMD -> evidence INVALID -> REJECT.
 
     Returns (ok: bool, reason: str):
-    - ok=True  → evidence is present and valid
-    - ok=False → missing/malformed evidence or path escape
+    - ok=True  -> evidence is present and valid
+    - ok=False -> missing/malformed evidence, path escape, non-existent file, or missing CMD
     """
     if not result_text:
         return False, "缺可信 evidence: result 為空，需含 TEST_TARGETS + RESULT: PASS，且測試檔須在專案內"
@@ -271,15 +279,33 @@ def _check_test_evidence(result_text: str, project_root: str):
             "需含 RESULT: PASS，且測試檔須在專案內"
         )
 
-    # ALL paths must be within project root — any escape → REJECT
+    # ALL paths must be within project root -- any escape -> REJECT
     if not _paths_within_root(all_paths, project_root):
         return False, (
             "缺可信 evidence: TEST_TARGETS 中含路徑逸出（絕對路徑或 ../ 穿透），"
             "測試檔必須在專案目錄內"
         )
 
-    # ── Collect ALL RESULT: lines (including bare RESULT:) ───────────────────
-    # We must find every line starting with RESULT: — including bare ones with
+    # ALL paths must exist on disk and be regular files (not directories).
+    # A non-existent or directory target means the executor's PASS claim is
+    # unverifiable -- reject immediately.
+    if project_root:
+        try:
+            real_root = os.path.realpath(project_root)
+            for p in all_paths:
+                real = os.path.realpath(os.path.join(real_root, p))
+                if not os.path.isfile(real):
+                    return False, (
+                        "缺可信 evidence: TEST_TARGETS 路徑不存在或非一般檔案："
+                        f" {p!r}（路徑不存在或為目錄，無法驗證 PASS 聲稱）"
+                    )
+        except Exception as exc:
+            return False, (
+                f"缺可信 evidence: 驗證 TEST_TARGETS 路徑時發生錯誤：{exc}"
+            )
+
+    # ── Collect ALL RESULT: lines (including bare RESULT:) ─────────────────
+    # We must find every line starting with RESULT: -- including bare ones with
     # nothing after the colon (e.g. "RESULT:").
     # Split into lines and check each line.
     all_lines = result_text.splitlines()
@@ -291,13 +317,13 @@ def _check_test_evidence(result_text: str, project_root: str):
     for line in all_lines:
         if not _RESULT_LINE.match(line):
             continue
-        # This line starts with RESULT: — classify it strictly
+        # This line starts with RESULT: -- classify it strictly
         if _RESULT_PASS.match(line):
             pass_count += 1
         elif _RESULT_FAIL.match(line):
             fail_count += 1
         else:
-            # Matches RESULT: prefix but not PASS or FAIL pattern → MALFORMED
+            # Matches RESULT: prefix but not PASS or FAIL pattern -> MALFORMED
             malformed_count += 1
 
     if malformed_count > 0:
@@ -318,8 +344,16 @@ def _check_test_evidence(result_text: str, project_root: str):
             "存在任何 FAIL 即不可 APPROVED"
         )
 
-    return True, ""
+    # ── CMD: line must be present and non-empty ─────────────────────
+    # The executor must report the test command it ran.  A missing or empty CMD
+    # means the PASS claim cannot be attributed to any real run.
+    if not _CMD_LINE.search(result_text):
+        return False, (
+            "缺可信 evidence: 缺少 CMD: 行（需含測試指令，如 CMD: pytest tests/...），"
+            "無法確認 executor 實際執行了測試"
+        )
 
+    return True, ""
 
 def _handle_guardrail_event(input_data: Dict[str, Any]) -> Optional[Dict]:
     tool_name = input_data.get("tool_name", "")

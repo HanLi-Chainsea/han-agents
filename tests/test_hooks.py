@@ -1666,3 +1666,139 @@ def test_full_hook_clean_heading_verdict_with_pass_3_approved(mock_db_path, tmp_
         f"Clean heading verdict + valid evidence must be APPROVED. "
         f"validation_status={task.get('validation_status')!r}"
     )
+
+
+# =============================================================================
+# Fix 4 — Evidence gate: file existence + isfile + CMD required
+# =============================================================================
+
+def test_evidence_nonexistent_target_rejected(tmp_path):
+    """TEST_TARGETS points to a file that does NOT exist on disk + RESULT: PASS + CMD
+    present -> hook _check_test_evidence returns invalid (non-existent target)."""
+    hook = _load_post_task()
+
+    # Do NOT create the file -- it must not exist
+    result_text = (
+        "TEST_TARGETS: tests/does-not-exist.py\n"
+        "RESULT: PASS 1\n"
+        "CMD: pytest tests/does-not-exist.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"Non-existent TEST_TARGETS path must be INVALID. reason={reason!r}"
+    )
+    assert (
+        "不存在" in reason
+        or "non-existent" in reason.lower()
+        or "isfile" in reason.lower()
+        or "路徑" in reason
+    ), f"Reason must mention path problem. reason={reason!r}"
+
+
+def test_evidence_directory_target_rejected(tmp_path):
+    """TEST_TARGETS points to an existing DIRECTORY (not a file) -> rejected."""
+    hook = _load_post_task()
+
+    # Create a directory at the target path
+    target_dir = tmp_path / "tests"
+    target_dir.mkdir()
+
+    result_text = (
+        "TEST_TARGETS: tests\n"
+        "RESULT: PASS 1\n"
+        "CMD: pytest tests\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"Directory in TEST_TARGETS must be INVALID (not a regular file). reason={reason!r}"
+    )
+    assert (
+        "目錄" in reason
+        or "directory" in reason.lower()
+        or "路徑" in reason
+        or "非一般檔案" in reason
+        or "isfile" in reason.lower()
+    ), f"Reason must mention directory/file problem. reason={reason!r}"
+
+
+def test_evidence_missing_cmd_rejected(tmp_path):
+    """A real existing test file + RESULT: PASS but NO CMD: line -> rejected."""
+    hook = _load_post_task()
+
+    # Create a real test file
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_real.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/test_real.py\n"
+        "RESULT: PASS 1\n"
+        # NO CMD: line intentionally omitted
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"Missing CMD: line must make evidence INVALID. reason={reason!r}"
+    )
+    assert (
+        "CMD" in reason
+        or "cmd" in reason.lower()
+    ), f"Reason must mention CMD. reason={reason!r}"
+
+
+def test_evidence_valid_existing_file_with_cmd_approved(tmp_path):
+    """A real existing test file within root + RESULT: PASS 3 + CMD: pytest ...
+    + clean -> ok=True (no override)."""
+    hook = _load_post_task()
+
+    # Create a real test file
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_real.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/test_real.py\n"
+        "RESULT: PASS 3\n"
+        "CMD: pytest tests/test_real.py -q\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is True, (
+        f"Valid existing file + PASS + CMD must be VALID. reason={reason!r}"
+    )
+
+
+def test_evidence_nonexistent_target_full_hook_overrides_approved(mock_db_path, tmp_path):
+    """Integration: TEST_TARGETS non-existent file + RESULT: PASS + CMD + LLM APPROVED
+    -> hook overrides to REJECTED (self-claimed PASS on missing tests)."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for servers/auth.py',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    # File does NOT exist in tmp_path
+    result_text = (
+        "Ran the tests.\n"
+        "TEST_TARGETS: tests/does-not-exist.py\n"
+        "RESULT: PASS 1\n"
+        "CMD: pytest tests/does-not-exist.py\n"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {"output": "## 驗證結果: APPROVED\n\nTests pass."},
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"Non-existent TEST_TARGETS must force REJECTED (no self-claimed PASS). "
+        f"validation_status={task.get('validation_status')!r}"
+    )
