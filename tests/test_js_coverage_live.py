@@ -9,7 +9,6 @@ This test intentionally runs npm/npx. Do NOT include in the default pytest suite
 """
 import os
 import shutil
-import tempfile
 
 import pytest
 
@@ -27,13 +26,16 @@ _LIVE = (
     reason='Set HAN_RUN_JS_LIVE=1, ensure npx is on PATH, and /tmp/vitest-spike exists',
 )
 class TestMeasureBranchCoverageJsLive:
-    def test_vitest_spike_partial_coverage(self, tmp_path):
-        """Copy /tmp/vitest-spike to tmp_path, run vitest coverage, assert partial result."""
+    def test_vitest_spike_partial_coverage(self):
+        """Run vitest coverage against the spike fixture in place.
+
+        We do NOT copytree the fixture: copying node_modules breaks the
+        .bin symlinks, so `npx vitest` can't resolve. The backend writes
+        coverage to a tempdir (non-invasive), so running in place is safe.
+        """
         from servers.coverage_js import measure_branch_coverage_js
 
-        # Copy spike fixture to isolated tmp_path (preserves node_modules)
-        proj = tmp_path / 'vitest-spike'
-        shutil.copytree(_SPIKE_DIR, str(proj), symlinks=False)
+        proj = _SPIKE_DIR
 
         test_targets = ['test/classify.test.js']
         coverage_targets = [{
@@ -44,7 +46,7 @@ class TestMeasureBranchCoverageJsLive:
         }]
 
         res = measure_branch_coverage_js(
-            str(proj),
+            proj,
             test_targets,
             coverage_targets,
             tool='vitest',
