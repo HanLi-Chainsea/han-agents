@@ -6,6 +6,8 @@ HAN System - 專案初始化（Lazy）
 
 import os
 import json
+from pathlib import Path
+from typing import Optional
 
 from servers import managed_connection
 
@@ -50,8 +52,184 @@ _DEFAULT_TEST_TOOLS = {
 }
 
 
-def _detect_tech_stack(project_name):
+def _detect_test_tool_from_config(project_path) -> Optional[str]:
+    """Read project config files to determine the test runner.
+
+    Detection rules (first match wins, higher priority first):
+    1. vitest.config.{ts,js,mts,mjs,cts,cjs}  → 'vitest'
+    2. vite.config.* containing 'test:'         → 'vitest'
+    3. package.json devDeps/deps containing vitest OR scripts.test mentioning vitest → 'vitest'
+    4. jest.config.{js,ts,cjs,mjs,json}        → 'jest'
+    5. package.json top-level 'jest' key OR devDeps 'jest' OR scripts.test 'jest' → 'jest'
+    6. pyproject.toml with [tool.pytest         → 'pytest'
+    7. pytest.ini                               → 'pytest'
+    8. tox.ini with [pytest]                    → 'pytest'
+    9. setup.cfg with [tool:pytest]             → 'pytest'
+    10. pom.xml                                 → 'maven'
+    11. build.gradle / build.gradle.kts / settings.gradle → 'gradle'
+    12. Cargo.toml                              → 'cargo test'
+    13. go.mod                                  → 'go test'
+
+    Vitest always beats Jest when both are present (explicit vitest config is
+    stronger signal than a jest dependency).
+
+    Returns:
+        Tool name string, or None if no config matched.
+        Never raises — malformed/missing files are silently skipped.
+    """
+    if project_path is None:
+        return None
+
+    root = Path(project_path)
+
+    # ------------------------------------------------------------------
+    # 1. vitest.config.* (explicit vitest config — strongest signal)
+    # ------------------------------------------------------------------
+    _vitest_config_exts = ('ts', 'js', 'mts', 'mjs', 'cts', 'cjs')
+    for ext in _vitest_config_exts:
+        if (root / f"vitest.config.{ext}").exists():
+            return 'vitest'
+
+    # ------------------------------------------------------------------
+    # 2. vite.config.* containing 'test:'
+    # ------------------------------------------------------------------
+    for vite_cfg in root.glob("vite.config.*"):
+        try:
+            if 'test:' in vite_cfg.read_text(encoding='utf-8', errors='replace'):
+                return 'vitest'
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 3 & 5. package.json — parse once, check vitest first then jest
+    # ------------------------------------------------------------------
+    pkg_path = root / "package.json"
+    if pkg_path.exists():
+        try:
+            pkg = json.loads(pkg_path.read_text(encoding='utf-8', errors='replace'))
+        except (json.JSONDecodeError, OSError, ValueError):
+            pkg = None
+
+        if pkg is not None and isinstance(pkg, dict):
+            # Collect all dependency keys (devDeps + deps)
+            all_deps = set()
+            for section in ('devDependencies', 'dependencies'):
+                section_data = pkg.get(section)
+                if isinstance(section_data, dict):
+                    all_deps.update(section_data.keys())
+
+            test_script = ''
+            scripts = pkg.get('scripts')
+            if isinstance(scripts, dict):
+                test_script = scripts.get('test', '') or ''
+
+            # Check vitest signals first (vitest beats jest)
+            if (
+                'vitest' in all_deps
+                or 'vitest' in test_script
+            ):
+                return 'vitest'
+
+            # jest.config.* (explicit config files for jest)
+            _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
+            for ext in _jest_config_exts:
+                if (root / f"jest.config.{ext}").exists():
+                    return 'jest'
+
+            # Jest signals from package.json
+            if (
+                'jest' in pkg                   # top-level jest key
+                or 'jest' in all_deps
+                or 'jest' in test_script
+            ):
+                return 'jest'
+
+            # package.json existed but gave no signal — fall through
+        # malformed pkg — fall through to other checks
+    else:
+        # No package.json — check jest.config.* standalone
+        _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
+        for ext in _jest_config_exts:
+            if (root / f"jest.config.{ext}").exists():
+                return 'jest'
+
+    # ------------------------------------------------------------------
+    # 6. pyproject.toml containing [tool.pytest
+    # ------------------------------------------------------------------
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text(encoding='utf-8', errors='replace')
+            if '[tool.pytest' in content:
+                return 'pytest'
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 7. pytest.ini
+    # ------------------------------------------------------------------
+    if (root / "pytest.ini").exists():
+        return 'pytest'
+
+    # ------------------------------------------------------------------
+    # 8. tox.ini with [pytest] section
+    # ------------------------------------------------------------------
+    tox_ini = root / "tox.ini"
+    if tox_ini.exists():
+        try:
+            content = tox_ini.read_text(encoding='utf-8', errors='replace')
+            if '[pytest]' in content:
+                return 'pytest'
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 9. setup.cfg with [tool:pytest] section
+    # ------------------------------------------------------------------
+    setup_cfg = root / "setup.cfg"
+    if setup_cfg.exists():
+        try:
+            content = setup_cfg.read_text(encoding='utf-8', errors='replace')
+            if '[tool:pytest]' in content:
+                return 'pytest'
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # 10. pom.xml → maven
+    # ------------------------------------------------------------------
+    if (root / "pom.xml").exists():
+        return 'maven'
+
+    # ------------------------------------------------------------------
+    # 11. Gradle → gradle
+    # ------------------------------------------------------------------
+    for gradle_file in ('build.gradle', 'build.gradle.kts', 'settings.gradle'):
+        if (root / gradle_file).exists():
+            return 'gradle'
+
+    # ------------------------------------------------------------------
+    # 12. Cargo.toml → cargo test
+    # ------------------------------------------------------------------
+    if (root / "Cargo.toml").exists():
+        return 'cargo test'
+
+    # ------------------------------------------------------------------
+    # 13. go.mod → go test
+    # ------------------------------------------------------------------
+    if (root / "go.mod").exists():
+        return 'go test'
+
+    return None
+
+
+def _detect_tech_stack(project_name, project_path=None):
     """從 Code Graph 偵測專案技術棧
+
+    Args:
+        project_name: 專案名稱（用於查詢 Code Graph）
+        project_path: 專案根目錄（若提供則執行 config-file pass 並以其結果覆蓋
+                      import heuristic；預設 None 表示跳過 config-file pass）
 
     Returns:
         {
@@ -110,6 +288,11 @@ def _detect_tech_stack(project_name):
                 result['primary_language']
             )
 
+    # 4. Config-file pass overrides import heuristic (if project_path given)
+    config_tool = _detect_test_tool_from_config(project_path)
+    if config_tool is not None:
+        result['test_tool'] = config_tool
+
     return result
 
 
@@ -159,8 +342,8 @@ def ensure_project(project_name, project_path=None):
     from servers.facade import sync
     result['sync_result'] = sync(project_path, project_name, incremental=True)
 
-    # 2. 偵測技術棧
-    tech_stack = _detect_tech_stack(project_name)
+    # 2. 偵測技術棧（thread project_path so config-file pass runs）
+    tech_stack = _detect_tech_stack(project_name, project_path=project_path)
     result['tech_stack'] = tech_stack
 
     # 3. 存 DB（真正的 upsert：更新已有 Tech Stack 或建新的）
