@@ -2257,6 +2257,46 @@ class TestSinglePhysicalLineBranchless:
             f'got {res["tool_status"]}: {res.get("error")}')
 
 
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessClosingParenBody:
+    """codex feat2 r8 suggestion: `def f(\\n): return 1` — body on the
+    closing-paren line (line 2), a multi-line-signature variant. Import-only
+    must NOT be reported fully_covered (the body return runs only on call)."""
+
+    def test_closing_paren_body_import_only_not_covered(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        (tmp_path / 'cp.py').write_text('def f(\n): return 1\n')
+        (tmp_path / 'test_cp.py').write_text(
+            'import cp\ndef test_imports_only():\n    assert cp is not None\n')
+        # f: def on line 1, body (return) on line 2
+        targets = [{'file_path': 'cp.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_cp.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'closing-paren-body import-only must NOT be fully_covered '
+            f'(false-green!): {res}')
+
+    def test_closing_paren_body_called_is_fail_closed_not_false_green(
+            self, tmp_path):
+        """`def f(\\n): return 1` where the body shares the closing-paren line:
+        coverage does NOT mark that line on call, so even a real call cannot be
+        proven. Deliberately fail-closed (conservative, no false green) — same
+        safe over-strictness as the single-physical-line case. The dangerous
+        direction (import-only → green) is closed; this just escalates an oddly
+        formatted but legit function rather than auto-passing it."""
+        from servers.coverage import measure_branch_coverage
+        (tmp_path / 'cp.py').write_text('def f(\n): return 1\n')
+        (tmp_path / 'test_cp.py').write_text(
+            'import cp\ndef test_calls_f():\n    assert cp.f() == 1\n')
+        targets = [{'file_path': 'cp.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_cp.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'must never false-green: {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'conservative fail-closed expected, got {res["tool_status"]}')
+
+
 class TestAstBodyStartLineUnit:
     """Unit tests for _ast_body_start_line helper.
 
