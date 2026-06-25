@@ -7,6 +7,7 @@ branch arc 歸因到本次 target 函式。非侵入：隔離 data file、不寫
 屬偏保守的過度涵蓋（要求多測、不會漏算）。AST 精確 scope 留待 v2。
 """
 
+import ast
 import json
 import os
 import re
@@ -95,6 +96,42 @@ def _valid_arc(arc) -> bool:
     """
     return (isinstance(arc, (list, tuple)) and len(arc) == 2
             and all(isinstance(x, int) and not isinstance(x, bool) for x in arc))
+
+
+def _ast_body_start_line(abs_path: str, name: str,
+                         line_start: int, line_end: int) -> Optional[int]:
+    """Return the first body-statement line of the named function/method.
+
+    Finds the FunctionDef/AsyncFunctionDef whose name matches and whose lineno
+    is within [line_start, line_end], picking the closest to line_start when
+    multiple match.  Searches ClassDef bodies via ast.walk (handles methods).
+
+    Returns node.body[0].lineno (the first real statement — after the signature,
+    default args, and annotations, which all have lineno < body[0].lineno for
+    multi-line signatures).
+
+    Returns None on any failure (file unreadable, parse error, no matching node,
+    empty body).  Caller must treat None as fail-closed (reject).
+    """
+    try:
+        with open(abs_path, encoding='utf-8', errors='replace') as fh:
+            source = fh.read()
+        tree = ast.parse(source, filename=abs_path)
+    except Exception:
+        return None
+
+    candidates = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == name and line_start <= node.lineno <= line_end:
+                candidates.append(node)
+    if not candidates:
+        return None
+    # Pick the node whose lineno is closest to line_start (usually the exact match).
+    best = min(candidates, key=lambda n: abs(n.lineno - line_start))
+    if not best.body:
+        return None
+    return best.body[0].lineno
 
 
 def measure_branch_coverage(project_path: str,
@@ -198,6 +235,13 @@ def _attribute_targets(file_index: Dict[str, Dict],
 
     防護（codex 審查）：coverage json 的 branch 欄位若非 `[[int,int], ...]`（版本格式
     異動、欄位缺漏），**不可**靜默過濾成空集合而誤判全覆蓋——回 'schema_error' 確定性退件。
+
+    n_total==0（branchless）的額外驗證：無分支不代表函式有被執行。必須確認
+    executed_lines 裡至少有一 **函式體** 行落在 (line_start, line_end] 內，才算真正呼叫到。
+    （line_start 即 `def` 行，Python import 時就會執行，不算呼叫證明；
+     body 行 ls+1..le 只有實際呼叫才會出現在 executed_lines。）
+    若 executed_lines 不是 list（欄位缺失或格式異動）→ schema_error。
+    若函式體完全未執行 → no_targets（fail-closed，不允許假綠）。
     """
     per_target = []
     for t in coverage_targets:
@@ -221,12 +265,73 @@ def _attribute_targets(file_index: Dict[str, Dict],
         in_range = lambda arc: ls <= arc[0] <= le
         missing = [a for a in mb if in_range(a)]
         executed = [a for a in eb if in_range(a)]
+        n_total = len(missing) + len(executed)
+
+        # n_total==0: branchless function — must verify execution via executed_lines.
+        # A file appearing in coverage data only proves it was imported, not called.
+        # The `def` line (ls) is always executed at import time and does NOT prove
+        # the function body ran.
+        #
+        # AST-based body-start line (D2g fix):
+        # A multi-line function signature with a side-effecting default arg executes
+        # that default-arg line at import time — it falls in (ls, le] but is NOT in
+        # the function body.  We use AST to find the first real body-statement line
+        # (node.body[0].lineno) so that only lines >= body_start count as execution
+        # evidence.  This closes the multiline-signature false-green.
+        #
+        # Fail-closed invariants:
+        # - executed_lines not a list → schema_error
+        # - AST lookup fails (file unreadable / parse error / no matching node /
+        #   empty body) → schema_error (reject; when in doubt, reject)
+        # - body_start_line <= line_start (single-physical-line function,
+        #   e.g. `def f(): return 1`) → no_targets (D2h: line coverage cannot
+        #   distinguish import-time def-execution from an actual call; fail-closed)
+        # - no executed line >= body_start_line in [body_start, le] → no_targets
+        if n_total == 0:
+            el = entry.get('executed_lines')
+            if not isinstance(el, list):
+                return _result('schema_error',
+                               f'coverage json 格式非預期（{fp}）：'
+                               'executed_lines 應為 list（branchless 函式需執行證明）')
+            name = t.get('name') or fp
+            # AST: find the first body-statement line so default-arg lines are excluded.
+            body_start = _ast_body_start_line(canon, name, ls, le) if canon else None
+            if body_start is None:
+                return _result(
+                    'schema_error',
+                    f'無法確認函式體起始行（AST 解析失敗或找不到函式定義）: {fp}::{name}',
+                )
+            # D2h: single-physical-line function (`def f(): return 1`).
+            # body_start <= ls means FunctionDef.lineno == body[0].lineno — the
+            # def and its body are on the same physical line.  Coverage marks that
+            # line executed at import time (defining f runs the def line), so we
+            # CANNOT distinguish "def executed at import" from "f() actually called".
+            # Line coverage genuinely cannot prove a call here → fail-closed.
+            if body_start <= ls:
+                return _result(
+                    'no_targets',
+                    f'單行 branchless 函式無法以行覆蓋證明執行(def 與 body 同行),'
+                    f'退回人工確認: {fp}::{name}',
+                )
+            # Execution evidence: at least one executed line in [body_start, le].
+            # (body_start > ls is guaranteed here — multi-line function only.)
+            executed_in_range = any(
+                isinstance(ln, int) and not isinstance(ln, bool)
+                and body_start <= ln <= le
+                for ln in el
+            )
+            if not executed_in_range:
+                return _result(
+                    'no_targets',
+                    f'target 函式未被測試執行(無分支且函式體未覆蓋): {fp}::{name}',
+                )
+
         per_target.append({
             'file_path': fp, 'name': t.get('name'),
             'line_start': ls, 'line_end': le,
             'missing_branches': [{'from': a[0], 'to': a[1]} for a in missing],
             'covered_branches': [{'from': a[0], 'to': a[1]} for a in executed],
-            'n_total': len(missing) + len(executed),
+            'n_total': n_total,
             'n_covered': len(executed),
         })
 
@@ -319,6 +424,13 @@ def format_coverage_summary(per_target: List[Dict]) -> List[str]:
     lines = []
     for pt in per_target:
         n_cov, n_tot = pt['n_covered'], pt['n_total']
+        if n_tot == 0:
+            # M2: branchless function — neutral display; gate still proceeds (not a fail)
+            lines.append(
+                f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} "
+                f"〇 無分支 (n/a)"
+            )
+            continue
         mark = '✅' if not pt['missing_branches'] else '❌'
         lines.append(
             f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} "

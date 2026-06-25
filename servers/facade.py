@@ -1891,13 +1891,22 @@ def run_coverage_gate(critic_task_id: str,
 
     # ── C5: Select backend FIRST, then check per-backend availability ──────────
     # Resolve tech_stack from the project record (same approach as recipes.py).
-    # select_backend: 'java' → JaCoCo/Gradle backend; 'python' or 'unknown' → pytest/coverage.
+    # select_backend: 'java' → JaCoCo/Gradle; 'js' → Vitest/Jest; 'python'/'unknown' → pytest.
     from servers import coverage_java as cov_java
     from servers import project as _proj
     _ts = (_proj.ensure_project(project_name, project_path).get('tech_stack') or {})
     _backend = cov_java.select_backend(_ts)
 
-    if _backend != 'java':
+    if _backend == 'js':
+        from servers import coverage_js as cov_js
+        # J2: JS availability = npx resolvable (node present).
+        # Absent → fail-closed reject (JS test runner is a project dependency;
+        # absence means we cannot verify coverage → must not proceed).
+        if not cov_js._js_available():
+            return _gate_reject(critic_task_id, original_task_id, [
+                'JS coverage runner 不可用：請確認專案已安裝 vitest/jest；'
+                '無法驗證分支覆蓋,不予放行'])
+    elif _backend != 'java':
         # Python / unknown stack: check python-coverage availability (infra check).
         # Java stack does NOT go through this check — gradlew absence is handled
         # fail-closed by measure_branch_coverage_java itself (returns test_run_error).
@@ -1929,6 +1938,18 @@ def run_coverage_gate(critic_task_id: str,
         res = cov_java.measure_branch_coverage_java(
             project_path, test_targets, coverage_targets,
             test_filters=java_test_filters if java_test_filters else None)
+    elif _backend == 'js':
+        # K1 fix: fail-closed when test_tool is undetermined (None/empty/mocha/etc.).
+        # NEVER default to vitest — a wrong runner produces false-green coverage.
+        # Only proceed when test_tool is explicitly 'vitest' or 'jest'.
+        _raw_tool = _ts.get('test_tool')
+        _js_tool = (_raw_tool or '').lower().strip()
+        if _js_tool not in ('vitest', 'jest'):
+            return _gate_reject(critic_task_id, original_task_id, [
+                '無法確定 JS 測試 runner(vitest/jest);'
+                '請在專案設定明確指定,否則無法驗證分支覆蓋'])
+        res = cov_js.measure_branch_coverage_js(
+            project_path, test_targets, coverage_targets, tool=_js_tool)
     else:
         # 'python' or 'unknown' → existing Python backend (safe default)
         res = cov.measure_branch_coverage(project_path, test_targets, coverage_targets)
@@ -1940,6 +1961,20 @@ def run_coverage_gate(critic_task_id: str,
         summary = cov.format_coverage_summary(res['per_target'])
         for line in summary:
             sys.stderr.write(line + '\n')
+        # Part A：把 per_target 精簡格式持久化到 working_memory，
+        # 讓收尾報告（reporting.py）可以讀取，不再只存 stderr。
+        try:
+            import json as _json
+            from servers.memory import set_working_memory as _swm
+            _compact = [
+                {'file_path': t.get('file_path', ''), 'name': t.get('name', ''),
+                 'n_covered': t.get('n_covered', 0), 'n_total': t.get('n_total', 0),
+                 'missing_branches': t.get('missing_branches', [])}
+                for t in res['per_target']
+            ]
+            _swm(original_task_id, 'coverage', _json.dumps(_compact))
+        except Exception:
+            pass  # 不影響 gate 判斷
         if res['fully_covered']:
             # 同時把摘要回傳：stderr 是即時的、迴圈結束後就消失；回傳值讓 dispatch
             # 迴圈攔得到，最後能寫進收尾的人類報告（不只 stderr）。
@@ -1948,9 +1983,10 @@ def run_coverage_gate(critic_task_id: str,
         issues.append('若為真正不可達/防禦性分支，請用 `# pragma: no cover` 並在回報說明理由。')
         return _gate_reject(critic_task_id, original_task_id, issues)
 
-    # 唯一 fail-open：coverage 套件缺失（真正 infra；measure 回 'unavailable'）。
-    # 此時回退人工逐分支核對（playbook critic checklist 已涵蓋）。
-    if status == 'unavailable':
+    # fail-open 只給 Python backend coverage 套件缺失（真正 infra）。
+    # JS backend 的 unavailable (npx not found / mocha unsupported) 已在上方 early check
+    # 或 measure 回傳後走 fail-closed；不能讓 JS unavailable 進這裡 fail-open。
+    if status == 'unavailable' and _backend != 'js':
         return {'verdict': 'proceed',
                 'warn': f"⚠️ 分支覆蓋率工具未量到（{res.get('error')}），本任務回退人工逐分支核對。"}
 

@@ -1,0 +1,701 @@
+"""Tests for the unit-test run report builder (Part B + Part A coverage persistence)."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class TestReportHasSummaryAndCoverage:
+    """build_unit_test_report returns markdown with project name, coverage table, file names."""
+
+    def test_report_has_summary_and_coverage(self, mock_db_path, tmp_path):
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        # Build a minimal epic with two done executor tasks
+        epic_id = create_task(project='myproj', description='Unit Test Epic',
+                              task_level='epic')
+        story_id = create_task(project='myproj', description='Story for x.py',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests for src/x.py',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        t2 = create_subtask(parent_id=story_id, description='Write tests for src/y.py',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done\nTEST_TARGETS: tests/test_x.py')
+        update_task_status(t2, 'done', result='done\nTEST_TARGETS: tests/test_y.py')
+
+        # Persist coverage data on the epic (as if the gate stored it)
+        coverage_data = [
+            {'file_path': 'src/x.py', 'name': 'foo',
+             'n_covered': 3, 'n_total': 4, 'missing_branches': [{'from': 2, 'to': 5}]},
+            {'file_path': 'src/y.py', 'name': 'bar',
+             'n_covered': 2, 'n_total': 2, 'missing_branches': []},
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'myproj', str(tmp_path))
+
+        # Summary section
+        assert 'myproj' in md
+        assert 'executor' in md.lower() or '2' in md  # 2 executor tasks
+
+        # Coverage table must have file names and n/total
+        assert 'src/x.py' in md
+        assert 'src/y.py' in md
+        assert '3/4' in md
+        assert '2/2' in md
+
+
+class TestReportListsUnresolvedCriticSuggestionsWithCount:
+    """Tasks with critic_suggestions working-memory show up in the report with a count."""
+
+    def test_report_lists_unresolved_critic_suggestions_with_count(
+            self, mock_db_path, tmp_path):
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='myproj', description='Unit Test Epic',
+                              task_level='epic')
+        story_id = create_task(project='myproj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests for src/z.py',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        # Critic left suggestions on this task (task is done but not yet approved)
+        set_working_memory(t1, 'critic_suggestions',
+                           'Missing edge case for None input\nAdd negative value test')
+
+        md = build_unit_test_report(epic_id, 'myproj', str(tmp_path))
+
+        assert 'Missing edge case' in md
+        assert 'Add negative value test' in md
+        # Must also show a count
+        assert '2' in md  # 2 suggestions
+
+
+class TestReportSourceTestMappingFromMarker:
+    """A task whose result has TEST_TARGETS: line maps source file to test file."""
+
+    def test_report_source_test_mapping_from_marker(self, mock_db_path, tmp_path):
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='myproj', description='Unit Test Epic',
+                              task_level='epic')
+        story_id = create_task(project='myproj', description='Story for src/a.py',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests for src/a.py',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done',
+                           result='Tests written.\nTEST_TARGETS: tests/test_a.py')
+
+        md = build_unit_test_report(epic_id, 'myproj', str(tmp_path))
+
+        # Source-to-test mapping section
+        assert 'tests/test_a.py' in md
+        assert 'src/a.py' in md
+
+
+class TestWriteReportCreatesFile:
+    """write_unit_test_report writes docs/han-unit-test-run-report.md under project_path."""
+
+    def test_write_report_creates_file(self, mock_db_path, tmp_path):
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.reporting import write_unit_test_report
+
+        epic_id = create_task(project='myproj', description='Unit Test Epic',
+                              task_level='epic')
+        story_id = create_task(project='myproj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests for src/b.py',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        path = write_unit_test_report(epic_id, 'myproj', str(tmp_path))
+
+        expected = os.path.join(str(tmp_path), 'docs', 'han-unit-test-run-report.md')
+        assert path == expected
+        assert os.path.isfile(expected)
+        content = open(expected).read()
+        assert 'myproj' in content
+
+
+# =============================================================================
+# R1 — Done/approved tasks must NOT contribute to unresolved suggestions
+# =============================================================================
+
+class TestR1ApprovedTaskSuggestionsExcluded:
+    """R1: critic_suggestions on an approved/done task must NOT appear as unresolved."""
+
+    def test_approved_task_suggestions_not_in_unresolved(self, mock_db_path, tmp_path):
+        """R1: task validated as 'approved' → its critic_suggestions excluded."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r1proj', description='Epic R1',
+                              task_level='epic')
+        story_id = create_task(project='r1proj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        approved_task = create_subtask(
+            parent_id=story_id, description='Write tests for src/approved.py',
+            assigned_agent='executor', requires_validation=True,
+            epic_id=epic_id
+        )
+        update_task_status(approved_task, 'done', result='done')
+        mark_validated(approved_task, 'approved')
+
+        # Leftover suggestions from a previous critic round — now resolved
+        set_working_memory(approved_task, 'critic_suggestions',
+                           'Old suggestion that was fixed\nAnother old suggestion')
+
+        md = build_unit_test_report(epic_id, 'r1proj', str(tmp_path))
+
+        # Approved task's suggestions must NOT appear as unresolved
+        assert 'Old suggestion that was fixed' not in md
+        assert 'Another old suggestion' not in md
+
+    def test_rejected_task_suggestions_included(self, mock_db_path, tmp_path):
+        """R1: task with validation_status='rejected' → its suggestions ARE included."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r1proj2', description='Epic R1b',
+                              task_level='epic')
+        story_id = create_task(project='r1proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        rejected_task = create_subtask(
+            parent_id=story_id, description='Write tests for src/rejected.py',
+            assigned_agent='executor', requires_validation=True,
+            epic_id=epic_id
+        )
+        update_task_status(rejected_task, 'done', result='done')
+        mark_validated(rejected_task, 'rejected')
+
+        set_working_memory(rejected_task, 'critic_suggestions',
+                           'Still unresolved: add null check\nCheck boundary condition')
+
+        md = build_unit_test_report(epic_id, 'r1proj2', str(tmp_path))
+
+        assert 'Still unresolved: add null check' in md
+        assert 'Check boundary condition' in md
+
+    def test_approved_and_rejected_mixed(self, mock_db_path, tmp_path):
+        """R1: mix of approved + rejected tasks → only rejected suggestions shown."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r1proj3', description='Epic R1c',
+                              task_level='epic')
+        story_id = create_task(project='r1proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+
+        approved_task = create_subtask(
+            parent_id=story_id, description='Approved task',
+            assigned_agent='executor', requires_validation=True,
+            epic_id=epic_id
+        )
+        rejected_task = create_subtask(
+            parent_id=story_id, description='Rejected task',
+            assigned_agent='executor', requires_validation=True,
+            epic_id=epic_id
+        )
+        update_task_status(approved_task, 'done', result='done')
+        mark_validated(approved_task, 'approved')
+        set_working_memory(approved_task, 'critic_suggestions',
+                           'Resolved suggestion — should not appear')
+
+        update_task_status(rejected_task, 'done', result='done')
+        mark_validated(rejected_task, 'rejected')
+        set_working_memory(rejected_task, 'critic_suggestions',
+                           'Open issue: needs retry logic')
+
+        md = build_unit_test_report(epic_id, 'r1proj3', str(tmp_path))
+
+        assert 'Resolved suggestion' not in md
+        assert 'Open issue: needs retry logic' in md
+
+
+# =============================================================================
+# R2 — Missing/invalid coverage data → 'unknown', NOT '0/0 ✓'
+# =============================================================================
+
+class TestR2MissingCoverageNotFalseGreen:
+    """R2: entries missing n_total or n_total==0 must show 'unknown'/neutral, not ✓."""
+
+    def test_missing_n_total_shows_unknown_not_checkmark(self, mock_db_path, tmp_path):
+        """R2: coverage entry without n_total → report shows 'unknown', never '0/0 ✓'."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r2proj', description='Epic R2',
+                              task_level='epic')
+        story_id = create_task(project='r2proj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        # Entry missing n_total key entirely
+        coverage_data = [
+            {'file_path': 'src/mystery.py', 'name': 'unknown_func'},
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'r2proj', str(tmp_path))
+
+        # Must NOT show '0/0' with a checkmark (false-green)
+        assert '0/0' not in md or '✓' not in md.split('0/0')[1][:5] if '0/0' in md else True
+        # Must show 'unknown' or a neutral marker
+        assert 'unknown' in md.lower() or '—' in md or '⚠' in md
+
+    def test_n_total_zero_shows_unknown(self, mock_db_path, tmp_path):
+        """R2: n_total==0 → 'unknown'/neutral, not '0/0 ✓'."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r2proj2', description='Epic R2b',
+                              task_level='epic')
+        story_id = create_task(project='r2proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        coverage_data = [
+            {'file_path': 'src/empty.py', 'name': 'empty_func',
+             'n_covered': 0, 'n_total': 0},
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'r2proj2', str(tmp_path))
+
+        # Must NOT show checkmark for 0/0
+        assert '0/0 ✓' not in md and '0/0 | ✓' not in md
+        # Must show 'unknown' or neutral marker
+        assert 'unknown' in md.lower() or '—' in md or '⚠' in md
+
+    def test_valid_coverage_still_shows_checkmark(self, mock_db_path, tmp_path):
+        """R2: valid entry with n_covered==n_total > 0 still shows ✓."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r2proj3', description='Epic R2c',
+                              task_level='epic')
+        story_id = create_task(project='r2proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        coverage_data = [
+            {'file_path': 'src/good.py', 'name': 'good_func',
+             'n_covered': 5, 'n_total': 5},
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'r2proj3', str(tmp_path))
+
+        assert '5/5' in md
+        assert '✓' in md
+
+
+# =============================================================================
+# R3 — Non-dict coverage entries must not crash the report
+# =============================================================================
+
+class TestR3NonDictCoverageEntryRobust:
+    """R3: non-dict in coverage list → report builds without crash; entry flagged/skipped."""
+
+    def test_string_in_coverage_list_no_crash(self, mock_db_path, tmp_path):
+        """R3: coverage list containing a string → report builds, doesn't raise."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r3proj', description='Epic R3',
+                              task_level='epic')
+        story_id = create_task(project='r3proj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        # Malformed coverage: list contains a string (non-dict)
+        coverage_data = [
+            "this is not a dict",
+            {'file_path': 'src/valid.py', 'name': 'valid_func',
+             'n_covered': 3, 'n_total': 5},
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        # Must NOT raise
+        md = build_unit_test_report(epic_id, 'r3proj', str(tmp_path))
+
+        # Report must build successfully
+        assert 'r3proj' in md
+        # Valid entry should still appear
+        assert 'src/valid.py' in md
+
+    def test_integer_in_coverage_list_no_crash(self, mock_db_path, tmp_path):
+        """R3: coverage list containing an integer → report builds, invalid entry skipped."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r3proj2', description='Epic R3b',
+                              task_level='epic')
+        story_id = create_task(project='r3proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        coverage_data = [42, None, {'file_path': 'src/ok.py', 'name': 'ok',
+                                     'n_covered': 1, 'n_total': 1}]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'r3proj2', str(tmp_path))
+
+        assert 'r3proj2' in md
+        assert 'src/ok.py' in md
+
+    def test_all_non_dict_coverage_list_no_crash(self, mock_db_path, tmp_path):
+        """R3: coverage list with only non-dict entries → no section or empty section, no crash."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='r3proj3', description='Epic R3c',
+                              task_level='epic')
+        story_id = create_task(project='r3proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t1 = create_subtask(parent_id=story_id, description='Write tests',
+                            assigned_agent='executor', requires_validation=True,
+                            epic_id=epic_id)
+        update_task_status(t1, 'done', result='done')
+
+        coverage_data = ["bad1", "bad2", 99]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        # Must not raise
+        md = build_unit_test_report(epic_id, 'r3proj3', str(tmp_path))
+        assert 'r3proj3' in md
+
+
+# =============================================================================
+# K2 — summary must count by validation outcome, not task.status
+# =============================================================================
+
+class TestK2SummaryByValidationOutcome:
+    """K2: A task with status='done' but validation_status='rejected' must NOT
+    appear as Passed/Validated — it must appear under Rejected.
+    An approved task must appear under Validated/Passed.
+    """
+
+    def test_rejected_validation_not_counted_as_validated(self, mock_db_path, tmp_path):
+        """K2: executor done + critic rejected → report shows Rejected, NOT Validated."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj', description='K2 Epic',
+                              task_level='epic')
+        story_id = create_task(project='k2proj', description='Story',
+                               task_level='story', epic_id=epic_id)
+        task_id = create_subtask(parent_id=story_id, description='Write tests',
+                                 assigned_agent='executor', requires_validation=True,
+                                 epic_id=epic_id)
+        # Executor finished (status='done') but critic rejected it
+        update_task_status(task_id, 'done', result='done')
+        mark_validated(task_id, 'rejected')
+
+        md = build_unit_test_report(epic_id, 'k2proj', str(tmp_path))
+
+        # Must NOT show '1 / 0' style Passed line (old false-green)
+        # Must NOT count this as validated/passed
+        assert 'Validated / Rejected / Other' in md or 'Rejected' in md, (
+            'K2: report must use validation-based summary')
+        # The line must show 0 validated and 1 rejected (not 1 validated)
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found in report:\n{md}')
+        # Format: "Validated / Rejected / Other: 0 / 1 / 0"
+        assert '0 / 1' in summary_line or ('0' in summary_line and '1' in summary_line), (
+            f'K2: rejected task should show 0 validated / 1 rejected, got: {summary_line!r}')
+
+    def test_approved_validation_counted_as_validated(self, mock_db_path, tmp_path):
+        """K2: executor done + critic approved → report shows 1 Validated."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj2', description='K2 Epic 2',
+                              task_level='epic')
+        story_id = create_task(project='k2proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        task_id = create_subtask(parent_id=story_id, description='Write tests',
+                                 assigned_agent='executor', requires_validation=True,
+                                 epic_id=epic_id)
+        update_task_status(task_id, 'done', result='done')
+        mark_validated(task_id, 'approved')
+
+        md = build_unit_test_report(epic_id, 'k2proj2', str(tmp_path))
+
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found in report:\n{md}')
+        # approved → 1 validated, 0 rejected
+        assert '1 / 0' in summary_line or ('1' in summary_line and
+                                            summary_line.count('0') >= 1), (
+            f'K2: approved task should show 1 validated, got: {summary_line!r}')
+
+    def test_mixed_approved_rejected_counts_correctly(self, mock_db_path, tmp_path):
+        """K2: 1 approved + 1 rejected → Validated=1, Rejected=1, Other=0."""
+        from servers.tasks import (create_task, create_subtask, update_task_status,
+                                   mark_validated)
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='k2proj3', description='K2 Epic 3',
+                              task_level='epic')
+        story_id = create_task(project='k2proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+
+        t_approved = create_subtask(parent_id=story_id, description='Approved task',
+                                    assigned_agent='executor', requires_validation=True,
+                                    epic_id=epic_id)
+        t_rejected = create_subtask(parent_id=story_id, description='Rejected task',
+                                    assigned_agent='executor', requires_validation=True,
+                                    epic_id=epic_id)
+        update_task_status(t_approved, 'done', result='done')
+        mark_validated(t_approved, 'approved')
+        update_task_status(t_rejected, 'done', result='done')
+        mark_validated(t_rejected, 'rejected')
+
+        md = build_unit_test_report(epic_id, 'k2proj3', str(tmp_path))
+
+        lines = md.split('\n')
+        summary_line = next(
+            (l for l in lines if 'Validated' in l and 'Rejected' in l), None)
+        assert summary_line is not None, (
+            f'K2: no Validated/Rejected summary line found:\n{md}')
+        # "1 / 1 / 0" (validated=1, rejected=1, other=0)
+        assert '1 / 1' in summary_line, (
+            f'K2: expected "1 / 1" in summary, got: {summary_line!r}')
+
+
+# =============================================================================
+# L2 — Report ✓ only for valid coverage (false-green fix)
+# =============================================================================
+
+class TestL2ValidCoverageMarkOnly:
+    """L2: Coverage ✓ mark only for valid n_covered/n_total within range.
+
+    Invalid entries (n_total=-1, n_covered > n_total, non-int, etc.)
+    must show 'unknown'/⚠️, never ✓.
+
+    This prevents false-green: malformed coverage data must not
+    appear to be full coverage.
+    """
+
+    def test_negative_n_total_shows_unknown(self, mock_db_path, tmp_path):
+        """n_total=-1 → unknown mark, not ✓."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj1', description='L2 Epic 1',
+                              task_level='epic')
+        story_id = create_task(project='l2proj1', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # Malformed: n_total=-1, n_covered=-1
+        coverage_data = [
+            {'file_path': 'src/bad.py', 'name': 'fn', 'n_covered': -1, 'n_total': -1}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj1', str(tmp_path))
+
+        # Must show 'unknown' or ⚠️, never ✓
+        assert '✓' not in md, (
+            "L2 violation: ✓ mark shown for n_total=-1 (malformed coverage)")
+        assert 'unknown' in md or '⚠️' in md, (
+            f"L2: expected 'unknown' or ⚠️ in coverage table for malformed data:\n{md}")
+
+    def test_covered_greater_than_total_shows_unknown(self, mock_db_path, tmp_path):
+        """n_covered > n_total → unknown, not ✓."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj2', description='L2 Epic 2',
+                              task_level='epic')
+        story_id = create_task(project='l2proj2', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # Malformed: covered (5) > total (3)
+        coverage_data = [
+            {'file_path': 'src/bad2.py', 'name': 'fn2', 'n_covered': 5, 'n_total': 3}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj2', str(tmp_path))
+
+        # Must NOT show ✓ (which would indicate full coverage)
+        assert '✓' not in md, (
+            "L2 violation: ✓ mark shown for n_covered > n_total")
+        assert 'unknown' in md or '⚠️' in md, (
+            f"L2: expected 'unknown' or ⚠️ for out-of-range coverage:\n{md}")
+
+    def test_valid_coverage_shows_mark(self, mock_db_path, tmp_path):
+        """n_covered=3, n_total=4 → shows '3/4' with ⚠️ (not ✓)."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj3', description='L2 Epic 3',
+                              task_level='epic')
+        story_id = create_task(project='l2proj3', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # Valid: 3/4
+        coverage_data = [
+            {'file_path': 'src/good.py', 'name': 'fn', 'n_covered': 3, 'n_total': 4}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj3', str(tmp_path))
+
+        # Must show the actual ratio
+        assert '3/4' in md, (
+            f"L2: expected '3/4' in coverage table:\n{md}")
+        # Partial coverage → ⚠️, not ✓
+        assert '⚠️' in md, (
+            f"L2: expected ⚠️ mark for partial coverage (3/4):\n{md}")
+
+    def test_full_coverage_shows_checkmark(self, mock_db_path, tmp_path):
+        """n_covered=4, n_total=4 → shows '4/4' with ✓."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj4', description='L2 Epic 4',
+                              task_level='epic')
+        story_id = create_task(project='l2proj4', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # Full coverage: 4/4
+        coverage_data = [
+            {'file_path': 'src/full.py', 'name': 'fn', 'n_covered': 4, 'n_total': 4}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj4', str(tmp_path))
+
+        # Must show the actual ratio
+        assert '4/4' in md, (
+            f"L2: expected '4/4' in coverage table:\n{md}")
+        # Full coverage → ✓
+        assert '✓' in md, (
+            f"L2: expected ✓ mark for full coverage (4/4):\n{md}")
+
+    def test_non_integer_n_total_shows_unknown(self, mock_db_path, tmp_path):
+        """n_total is a string or None → unknown, never ✓."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj5', description='L2 Epic 5',
+                              task_level='epic')
+        story_id = create_task(project='l2proj5', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # Invalid: n_total is None
+        coverage_data = [
+            {'file_path': 'src/none.py', 'name': 'fn', 'n_covered': 3, 'n_total': None}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj5', str(tmp_path))
+
+        # Must NOT show ✓
+        assert '✓' not in md, (
+            "L2 violation: ✓ mark shown for n_total=None")
+        assert 'unknown' in md or '⚠️' in md, (
+            f"L2: expected 'unknown' or ⚠️ for missing n_total:\n{md}")
+
+    def test_zero_n_total_shows_unknown(self, mock_db_path, tmp_path):
+        """n_total=0 → unknown (no branches means no coverage data, not full coverage)."""
+        from servers.tasks import create_task, create_subtask, update_task_status
+        from servers.memory import set_working_memory
+        from servers.reporting import build_unit_test_report
+
+        epic_id = create_task(project='l2proj6', description='L2 Epic 6',
+                              task_level='epic')
+        story_id = create_task(project='l2proj6', description='Story',
+                               task_level='story', epic_id=epic_id)
+        t = create_subtask(parent_id=story_id, description='Test task',
+                          assigned_agent='executor', requires_validation=True,
+                          epic_id=epic_id)
+        update_task_status(t, 'done', result='done')
+
+        # No branches: n_total=0, n_covered=0
+        coverage_data = [
+            {'file_path': 'src/zero.py', 'name': 'fn', 'n_covered': 0, 'n_total': 0}
+        ]
+        set_working_memory(epic_id, 'coverage', json.dumps(coverage_data))
+
+        md = build_unit_test_report(epic_id, 'l2proj6', str(tmp_path))
+
+        # Must NOT show ✓ (0/0 is not full coverage, it's "unknown")
+        assert '✓' not in md, (
+            "L2 violation: ✓ mark shown for n_total=0 (no branches)")
+        assert 'unknown' in md or '⚠️' in md, (
+            f"L2: expected 'unknown' or ⚠️ for zero branches:\n{md}")

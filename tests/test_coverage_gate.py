@@ -777,16 +777,28 @@ class TestFormatCoverageSummary:
         assert '1/2' in out and 'L2→4' in out and '✗' in out
         assert '✓' not in out
 
-    def test_branchless_target_shows_zero_with_no_branch_lines(self):
-        """無分支函式：0/0、標 ✅、不列任何分支行（不該出現 ✓/✗）。"""
+    def test_branchless_target_shows_neutral_not_green(self):
+        """M2: n_total=0 → neutral display 〇/n/a, NOT 0/0 or ✅.
+
+        A genuinely branchless function legitimately passes — the gate must NOT
+        reject it — but the DISPLAY must not show a misleading green ✅ or "0/0
+        covered" fraction. Only the summary string changes; verdict is unaffected.
+        """
         from servers.coverage import format_coverage_summary
         per_target = [{'file_path': 'x.py', 'name': 'noop', 'line_start': 1, 'line_end': 2,
                        'covered_branches': [], 'missing_branches': [],
                        'n_total': 0, 'n_covered': 0}]
         lines = format_coverage_summary(per_target)
-        assert len(lines) == 1                 # 只有標頭，無分支行
-        assert '0/0' in lines[0] and '✅' in lines[0]
-        assert '✓' not in lines[0] and '✗' not in lines[0]
+        assert len(lines) == 1, "branchless: only header line, no branch sub-lines"
+        header = lines[0]
+        # M2: must NOT show misleading green or fraction
+        assert '✅' not in header, "M2: branchless must not render ✅ (misleading green)"
+        assert '0/0' not in header, "M2: branchless must not show '0/0' as a coverage count"
+        # Must show a neutral marker (n/a or no-branch indicator)
+        assert ('n/a' in header or '無分支' in header or 'no branch' in header.lower()), (
+            f"M2: branchless must show neutral 'n/a'/'無分支' marker, got: {header!r}")
+        # Must still not have ✓/✗ branch sub-lines
+        assert '✓' not in header and '✗' not in header
 
     def test_branches_listed_in_line_order(self):
         """分支不論覆蓋與否，一律依行號排序，方便對照原始碼由上而下核對。"""
@@ -1354,3 +1366,985 @@ class TestC4JavaTestFilters:
         facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
         assert 'com.example.BarTest' in captured_filters
         assert 'com.example.BazSpec' in captured_filters
+
+
+# ── JS stack routing (Vitest/Jest) ────────────────────────────────────────────
+
+
+class TestJsStackRouting:
+    """Gate routes vitest/jest/mocha tech_stack to measure_branch_coverage_js.
+
+    The JS backend is monkeypatched; test asserts it is called and only it is called.
+    """
+
+    def _setup_done_task(self, cov_targets, result):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def _fake_ok(self):
+        return {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'src/classify.js', 'name': 'classify',
+                            'line_start': 1, 'line_end': 5,
+                            'covered_branches': [{'from': 2, 'to': 0}],
+                            'missing_branches': [], 'n_total': 1, 'n_covered': 1}],
+        }
+
+    def test_vitest_stack_routes_to_js_backend(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/classify.js', 'name': 'classify',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: test/classify.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'vitest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['test/classify.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+        python_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return self._fake_ok()
+
+        def fake_python(project_path, test_targets, coverage_targets):
+            python_calls.append(1)
+            return self._fake_ok()
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+        monkeypatch.setattr(cov, 'measure_branch_coverage', fake_python)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(js_calls) == 1, 'JS backend must be called exactly once'
+        assert js_calls[0] == 'vitest', f'tool should be vitest, got {js_calls[0]}'
+        assert len(python_calls) == 0, 'Python backend must NOT be called for vitest stack'
+
+    def test_jest_stack_routes_to_js_backend_with_jest_tool(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: src/f.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'jest'}})
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['src/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return self._fake_ok()
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed'
+        assert len(js_calls) == 1
+        assert js_calls[0] == 'jest', f'tool should be jest, got {js_calls[0]}'
+
+    def test_js_npx_unavailable_rejects_fail_closed(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """J2: When npx is not found, gate must fail-CLOSED (reject, not proceed)."""
+        import servers.coverage as cov
+        import servers.coverage_js as cov_js
+        import servers.project as project
+        import servers.facade as facade
+
+        targets = [{'file_path': 'src/f.js', 'name': 'f',
+                    'line_start': 1, 'line_end': 5}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: src/f.test.js')
+
+        monkeypatch.setattr(project, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'vitest'}})
+        monkeypatch.setattr(cov, 'derive_test_targets', lambda *a, **k: ['src/f.test.js'])
+        monkeypatch.setattr(cov_js, '_js_available', lambda: False)
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        # J2 fix: JS runner absence is NOT an infra carve-out → must reject, not proceed.
+        assert verdict['verdict'] == 'rejected', (
+            f'J2: JS runner absence must reject (fail-closed), got {verdict["verdict"]}' )
+        assert '不予放行' in ' '.join(verdict.get('issues', []))
+
+
+# ── Part A: coverage gate persists per_target data to working_memory ──────────
+
+
+class TestRunCoverageGatePersistsCoverage:
+    """After run_coverage_gate measures coverage (status=ok), the original task's
+    'coverage' working-memory key must be populated with per_target compact data."""
+
+    def _setup_done_task(self, cov_targets, result):
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        task = create_subtask(parent_id=story, description='write tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': cov_targets})
+        update_task_status(task, 'done', result=result)
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_fully_covered_persists_coverage_to_working_memory(
+            self, mock_db_path, tmp_path, monkeypatch):
+        import json
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+
+        targets = [{'file_path': 'src/x.py', 'name': 'foo',
+                    'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: tests/test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['tests/test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': True, 'error': None,
+            'per_target': [{'file_path': 'src/x.py', 'name': 'foo',
+                            'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}],
+                            'missing_branches': [], 'n_total': 2, 'n_covered': 2}],
+        })
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'proceed'
+
+        raw = get_working_memory(task, 'coverage')
+        assert raw is not None, 'coverage working-memory must be set after ok measurement'
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(data, list) and len(data) == 1
+        entry = data[0]
+        assert entry['file_path'] == 'src/x.py'
+        assert entry['name'] == 'foo'
+        assert entry['n_covered'] == 2
+        assert entry['n_total'] == 2
+        assert entry['missing_branches'] == []
+
+    def test_partially_covered_also_persists_coverage_before_reject(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """Gate must persist coverage data even for the reject path (partial coverage)."""
+        import json
+        import servers.coverage as cov
+        import servers.facade as facade
+        from servers.memory import get_working_memory
+
+        targets = [{'file_path': 'src/x.py', 'name': 'foo',
+                    'line_start': 1, 'line_end': 9}]
+        task, critic_id = self._setup_done_task(
+            targets, 'done\nTEST_TARGETS: tests/test_x.py')
+        monkeypatch.setattr(cov, '_coverage_available', lambda: True)
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['tests/test_x.py'])
+        monkeypatch.setattr(cov, 'measure_branch_coverage', lambda *a, **k: {
+            'tool_status': 'ok', 'fully_covered': False, 'error': None,
+            'per_target': [{'file_path': 'src/x.py', 'name': 'foo',
+                            'line_start': 1, 'line_end': 9,
+                            'covered_branches': [{'from': 2, 'to': 3}],
+                            'missing_branches': [{'from': 2, 'to': 5}],
+                            'n_total': 2, 'n_covered': 1}],
+        })
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {'tech_stack': {'test_tool': 'pytest'}})
+
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+        assert verdict['verdict'] == 'rejected'
+
+        raw = get_working_memory(task, 'coverage')
+        assert raw is not None, 'coverage working-memory must be set even on reject path'
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        assert isinstance(data, list) and len(data) == 1
+        entry = data[0]
+        assert entry['n_covered'] == 1
+        assert entry['n_total'] == 2
+        assert entry['missing_branches'] == [{'from': 2, 'to': 5}]
+
+
+# ── K1: fail-closed on undetermined JS runner ─────────────────────────────────
+
+
+class TestK1UndeterminedJsRunner:
+    """K1: when test_tool is None/empty/mocha (not vitest/jest), gate must
+    reject fail-closed rather than defaulting to vitest and running the wrong runner.
+    """
+
+    def _setup_js_task(self, monkeypatch, test_tool_value, primary_language='typescript'):
+        """Create a done task with JS coverage_targets; mock ensure_project with test_tool_value.
+
+        primary_language defaults to 'typescript' so select_backend routes to 'js'
+        even when test_tool is None/empty — this is the scenario where a JS project
+        has no explicit test runner configured.
+        """
+        import servers.project as _proj
+        monkeypatch.setattr(_proj, 'ensure_project',
+                            lambda *a, **k: {
+                                'tech_stack': {
+                                    'test_tool': test_tool_value,
+                                    'primary_language': primary_language,
+                                }
+                            })
+
+        from servers.tasks import (create_task, create_subtask,
+                                   update_task_status, reserve_critic_task)
+        import servers.coverage as cov
+        monkeypatch.setattr(cov, 'derive_test_targets',
+                            lambda *a, **k: ['test/f.test.js'])
+
+        epic = create_task(project='proj', description='epic', task_level='epic')
+        story = create_subtask(parent_id=epic, description='story', task_level='story',
+                               requires_validation=False)
+        targets = [{'file_path': 'src/f.js', 'name': 'fn',
+                    'line_start': 1, 'line_end': 10}]
+        task = create_subtask(parent_id=story, description='write js tests',
+                              requires_validation=True,
+                              metadata={'coverage_targets': targets})
+        update_task_status(task, 'done', result='done\nTEST_TARGETS: test/f.test.js')
+        critic = reserve_critic_task(task)
+        return task, critic['id']
+
+    def test_none_test_tool_rejects_not_vitest(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool=None → gate rejects (fail-closed), never runs vitest."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        # Mark npx as available to ensure it's the tool check that rejects, not npx
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool', 'unknown'))
+            return {'tool_status': 'ok', 'fully_covered': True,
+                    'error': None, 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value=None)
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool=None must reject (fail-closed), got {verdict["verdict"]}')
+        assert js_calls == [], (
+            'K1: measure_branch_coverage_js must NOT be called when test_tool is None')
+        # Error message must explain the problem
+        issues_text = ' '.join(verdict.get('issues', []))
+        assert 'runner' in issues_text or 'vitest' in issues_text or 'jest' in issues_text, (
+            f'K1: rejection must explain runner ambiguity, got issues: {verdict.get("issues")}')
+
+    def test_empty_test_tool_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='' (empty string) → gate rejects, not vitest run."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool'))
+            return {'tool_status': 'ok', 'fully_covered': True,
+                    'error': None, 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool="" must reject, got {verdict["verdict"]}')
+        assert js_calls == []
+
+    def test_mocha_test_tool_rejects(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='mocha' → gate rejects (mocha is not supported)."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(*a, **k):
+            js_calls.append(k.get('tool'))
+            return {'tool_status': 'unavailable', 'fully_covered': False,
+                    'error': 'mocha unsupported', 'per_target': []}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='mocha')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'rejected', (
+            f'K1: test_tool=mocha must reject, got {verdict["verdict"]}')
+
+    def test_vitest_test_tool_calls_measure(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='vitest' → measure_branch_coverage_js IS called with tool='vitest'."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/f.js', 'name': 'fn',
+                                    'line_start': 1, 'line_end': 10,
+                                    'covered_branches': [{'from': 2, 'to': 0}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='vitest')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed', (
+            f'K1: vitest must proceed to measure, got {verdict["verdict"]}')
+        assert js_calls == ['vitest'], (
+            f'K1: measure must be called with tool=vitest, got {js_calls}')
+
+    def test_jest_test_tool_calls_measure(
+            self, mock_db_path, tmp_path, monkeypatch):
+        """K1: test_tool='jest' → measure_branch_coverage_js IS called with tool='jest'."""
+        import servers.coverage_js as cov_js
+        import servers.facade as facade
+
+        monkeypatch.setattr(cov_js, '_js_available', lambda: True)
+        js_calls = []
+
+        def fake_js(project_path, test_targets, coverage_targets, *, tool='vitest'):
+            js_calls.append(tool)
+            return {'tool_status': 'ok', 'fully_covered': True, 'error': None,
+                    'per_target': [{'file_path': 'src/f.js', 'name': 'fn',
+                                    'line_start': 1, 'line_end': 10,
+                                    'covered_branches': [{'from': 2, 'to': 0}],
+                                    'missing_branches': [], 'n_total': 1, 'n_covered': 1}]}
+
+        monkeypatch.setattr(cov_js, 'measure_branch_coverage_js', fake_js)
+
+        task, critic_id = self._setup_js_task(monkeypatch, test_tool_value='jest')
+        verdict = facade.run_coverage_gate(critic_id, task, 'proj', str(tmp_path))
+
+        assert verdict['verdict'] == 'proceed', (
+            f'K1: jest must proceed to measure, got {verdict["verdict"]}')
+        assert js_calls == ['jest'], (
+            f'K1: measure must be called with tool=jest, got {js_calls}')
+
+
+# =============================================================================
+# M2 — n_total=0 must not render as green ✅ (display honesty)
+# =============================================================================
+
+class TestM2NoBranchesDisplay:
+    """M2: format_coverage_summary with n_total=0 must show neutral marker,
+    NOT ✅ and NOT '0/0'. Gate verdict is unaffected (branchless functions
+    legitimately pass; this is a display-only fix).
+    """
+
+    def test_zero_total_no_green_check_mark(self):
+        """M2 primary: n_total=0 → ✅ absent, 0/0 absent, neutral marker present."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'utils.py', 'name': 'noop',
+                       'line_start': 5, 'line_end': 6,
+                       'covered_branches': [], 'missing_branches': [],
+                       'n_total': 0, 'n_covered': 0}]
+        lines = format_coverage_summary(per_target)
+        assert lines, "Must produce at least one output line"
+        header = lines[0]
+        assert '✅' not in header, f"M2: ✅ must not appear for branchless: {header!r}"
+        assert '0/0' not in header, f"M2: '0/0' must not appear for branchless: {header!r}"
+        assert 'n/a' in header or '無分支' in header, (
+            f"M2: neutral marker (n/a or 無分支) must appear: {header!r}")
+
+    def test_zero_total_no_branch_sub_lines(self):
+        """M2: branchless → only the header line, no ✓/✗ sub-lines."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'utils.py', 'name': 'noop',
+                       'line_start': 5, 'line_end': 6,
+                       'covered_branches': [], 'missing_branches': [],
+                       'n_total': 0, 'n_covered': 0}]
+        lines = format_coverage_summary(per_target)
+        assert len(lines) == 1, (
+            f"M2: branchless must emit only header line, got {len(lines)}: {lines}")
+
+    def test_normal_partial_still_shows_fraction_and_marks(self):
+        """M2 regression: n_total>0 with missing branches → ❌ and fraction unchanged."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'compute',
+                       'line_start': 1, 'line_end': 8,
+                       'covered_branches': [{'from': 2, 'to': 3}],
+                       'missing_branches': [{'from': 2, 'to': 4},
+                                            {'from': 4, 'to': 5},
+                                            {'from': 4, 'to': 6}],
+                       'n_total': 4, 'n_covered': 1}]
+        lines = format_coverage_summary(per_target)
+        header = lines[0]
+        assert '1/4' in header, f"Normal partial must show fraction 1/4: {header!r}"
+        assert '❌' in header, f"Normal partial must show ❌: {header!r}"
+        assert '✅' not in header
+        # Branch sub-lines present
+        arc_lines = [ln for ln in lines if 'L' in ln and '→' in ln]
+        assert len(arc_lines) == 4, f"Expect 4 branch lines, got {len(arc_lines)}"
+
+    def test_full_coverage_nonzero_still_shows_green(self):
+        """M2 regression: n_total>0, fully covered → ✅ unchanged."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'compute',
+                       'line_start': 1, 'line_end': 5,
+                       'covered_branches': [{'from': 2, 'to': 3},
+                                            {'from': 2, 'to': 4}],
+                       'missing_branches': [],
+                       'n_total': 2, 'n_covered': 2}]
+        lines = format_coverage_summary(per_target)
+        header = lines[0]
+        assert '2/2' in header, f"Full coverage must show 2/2: {header!r}"
+        assert '✅' in header, f"Full coverage must show ✅: {header!r}"
+
+    def test_mixed_branchless_and_normal_in_same_summary(self):
+        """M2: multiple targets where one is branchless, other normal → each correct."""
+        from servers.coverage import format_coverage_summary
+        per_target = [
+            {'file_path': 'a.py', 'name': 'noop',
+             'line_start': 1, 'line_end': 2,
+             'covered_branches': [], 'missing_branches': [],
+             'n_total': 0, 'n_covered': 0},
+            {'file_path': 'b.py', 'name': 'compute',
+             'line_start': 1, 'line_end': 5,
+             'covered_branches': [{'from': 2, 'to': 3}],
+             'missing_branches': [{'from': 2, 'to': 4}],
+             'n_total': 2, 'n_covered': 1},
+        ]
+        lines = format_coverage_summary(per_target)
+        headers = [ln for ln in lines if ln.startswith('📊')]
+        assert len(headers) == 2
+        # Branchless: neutral
+        assert '✅' not in headers[0] and '0/0' not in headers[0]
+        assert 'n/a' in headers[0] or '無分支' in headers[0]
+        # Normal with missing: fraction + ❌
+        assert '1/2' in headers[1] and '❌' in headers[1]
+
+
+# =============================================================================
+# N1 — branchless function requires execution evidence (close n_total=0 false-green)
+# =============================================================================
+
+def _write_branchless_fixture(root, test_calls_add: bool):
+    """Write fixture with a branchless `add` function.
+
+    When test_calls_add=True the test calls add(); when False it only imports.
+    """
+    (root / 'math_utils.py').write_text(textwrap.dedent('''\
+        def add(a, b):
+            return a + b
+    '''))
+    if test_calls_add:
+        (root / 'test_math_utils.py').write_text(textwrap.dedent('''\
+            from math_utils import add
+            def test_add():
+                assert add(1, 2) == 3
+        '''))
+    else:
+        (root / 'test_math_utils.py').write_text(textwrap.dedent('''\
+            from math_utils import add
+            def test_unrelated():
+                assert 1 + 1 == 2
+        '''))
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessExecutionEvidence:
+    """N1: branchless function (n_total==0) requires execution evidence via
+    executed_lines. Imported-but-not-called must NOT pass the gate (false-green).
+    Called branchless function MUST pass (do not reject real branchless functions).
+    """
+
+    def test_branchless_executed_function_is_covered(self, tmp_path):
+        """N1-A: branchless add() that IS called → tool_status='ok', fully_covered=True."""
+        from servers.coverage import measure_branch_coverage
+        _write_branchless_fixture(tmp_path, test_calls_add=True)
+        targets = [{'file_path': 'math_utils.py', 'name': 'add',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_math_utils.py'], targets)
+        assert res['tool_status'] == 'ok', (
+            f"N1-A: called branchless function must pass gate, got {res['tool_status']}: "
+            f"{res.get('error')}")
+        assert res['fully_covered'] is True, (
+            f"N1-A: called branchless function must be fully_covered, got {res}")
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 0, "N1-A: add() is branchless, n_total must be 0"
+        assert pt['missing_branches'] == []
+
+    def test_branchless_imported_but_not_called_is_not_covered(self, tmp_path):
+        """N1-B (false-green regression): branchless add() that is only IMPORTED
+        but never called must NOT pass the gate (fail-closed).
+
+        Previously n_total==0 with no missing_branches was treated as fully_covered=True,
+        giving a false-green for untested functions that merely appear in coverage data
+        because they were imported.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_branchless_fixture(tmp_path, test_calls_add=False)
+        targets = [{'file_path': 'math_utils.py', 'name': 'add',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_math_utils.py'], targets)
+        # Must NOT be fully_covered (the function body was never executed)
+        assert res['fully_covered'] is False, (
+            f"N1-B: imported-but-not-called branchless function must NOT pass gate, "
+            f"got fully_covered=True (false-green!): {res}")
+        # Gate must signal fail-closed: no_targets (consistent with file-absent case)
+        assert res['tool_status'] == 'no_targets', (
+            f"N1-B: expected tool_status='no_targets', got {res['tool_status']}: "
+            f"{res.get('error')}")
+        assert res['error'] and 'add' in res['error'], (
+            f"N1-B: error message must mention target name 'add', got: {res.get('error')}")
+
+
+# =============================================================================
+# N1-unit — _attribute_targets synthetic tests for executed_lines logic
+# =============================================================================
+
+class TestAttributeTargetsBranchlessExecutionEvidence:
+    """Unit tests for _attribute_targets executed_lines check (n_total==0 path).
+
+    Uses synthetic file_index to avoid running real coverage processes.
+    """
+
+    def _make_root_and_canon(self, tmp_path, fname='x.py'):
+        root = str(tmp_path)
+        canon = os.path.realpath(os.path.join(root, fname))
+        return root, canon
+
+    def test_branchless_with_executed_line_in_range_passes(self, tmp_path):
+        """n_total==0 + executed_lines has a body line → ok, fully_covered=True.
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        def add(a, b): body starts at line 2; executed_lines=[1,2] includes line 2.
+        """
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it.
+        # def add is at line 1; body (return a + b) is at line 2.
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [1, 2],  # line 2 = body_start; counts as execution
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is True
+        assert res['per_target'][0]['n_total'] == 0
+
+    def test_branchless_with_no_executed_line_in_range_is_no_targets(self, tmp_path):
+        """n_total==0 + no executed_lines in body range → no_targets (fail-closed).
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        Lines 10,20 are outside [body_start=2, le=2] → no execution evidence.
+        """
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it (body_start=2).
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [10, 20],  # outside body range [2,2]
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'no_targets'
+        assert res['fully_covered'] is False
+        assert res['error'] and 'add' in res['error']
+
+    def test_branchless_missing_executed_lines_key_is_schema_error(self, tmp_path):
+        """n_total==0 + executed_lines absent → schema_error (fail-closed)."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            # executed_lines key absent
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_branchless_executed_lines_not_list_is_schema_error(self, tmp_path):
+        """n_total==0 + executed_lines is not a list → schema_error."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': None,
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        assert res['tool_status'] == 'schema_error'
+        assert res['fully_covered'] is False
+
+    def test_branchless_bool_in_executed_lines_not_counted(self, tmp_path):
+        """n_total==0 + executed_lines contains only booleans → treated as no execution.
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        True/False are excluded by isinstance(ln, bool) check; no real line passes.
+        """
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it (body_start=2).
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
+        file_index = {canon: {
+            'missing_branches': [],
+            'executed_branches': [],
+            'executed_lines': [True, False],  # booleans are not valid line numbers
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
+        res = _attribute_targets(file_index, targets, root)
+        # True==1 and False==0 numerically, but bool check excludes them.
+        # With body_start=2, True (==1) is also < body_start, doubly excluded.
+        assert res['tool_status'] == 'no_targets'
+        assert res['fully_covered'] is False
+
+    def test_n_total_gt_0_does_not_consult_executed_lines(self, tmp_path):
+        """n_total>0 path: executed_lines is irrelevant; existing arc logic unchanged."""
+        from servers.coverage import _attribute_targets
+        root, canon = self._make_root_and_canon(tmp_path)
+        # entry has branches AND executed_lines is absent (schema would error if consulted)
+        file_index = {canon: {
+            'missing_branches': [[2, 4]],
+            'executed_branches': [[2, 3]],
+            # executed_lines intentionally absent — must NOT be consulted for n_total>0
+        }}
+        targets = [{'file_path': 'x.py', 'name': 'f', 'line_start': 1, 'line_end': 9}]
+        res = _attribute_targets(file_index, targets, root)
+        # Must succeed normally, not schema_error due to missing executed_lines
+        assert res['tool_status'] == 'ok'
+        assert res['fully_covered'] is False
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 2 and pt['n_covered'] == 1
+
+
+# =============================================================================
+# D2g — multiline-signature default-arg false-green (AST body-line fix)
+# =============================================================================
+
+
+def _write_multiline_sig_fixture(root, test_calls_branchless: bool):
+    """Fixture: branchless function with multi-line signature and side-effecting default.
+
+    _side_effect() runs at import time (line 2 of the function, inside the signature).
+    The function body starts at line 4 (return value).
+
+    Structure of multiline_sig.py:
+        line 1: def _side_effect():
+        line 2:     return 42
+        line 3: def branchless(
+        line 4:     value=_side_effect(),   # executes at import; in signature, not body
+        line 5: ):
+        line 6:     return value            # body_start_line = 6
+    """
+    (root / 'multiline_sig.py').write_text(
+        'def _side_effect():\n'
+        '    return 42\n'
+        'def branchless(\n'
+        '    value=_side_effect(),\n'
+        '):\n'
+        '    return value\n'
+    )
+    if test_calls_branchless:
+        (root / 'test_multiline_sig.py').write_text(
+            'from multiline_sig import branchless\n'
+            'def test_called():\n'
+            '    assert branchless() == 42\n'
+        )
+    else:
+        # Only imports the module (triggers _side_effect at import time) but never calls branchless
+        (root / 'test_multiline_sig.py').write_text(
+            'import multiline_sig\n'
+            'def test_unrelated():\n'
+            '    assert 1 + 1 == 2\n'
+        )
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessMultilineSignature:
+    """D2g: multi-line function signature with side-effecting default arg.
+
+    The default-arg expression runs at import time on a line INSIDE the signature
+    range (ls+1..le) but NOT inside the function body.  The old heuristic (ls+1..le)
+    falsely accepted import-time execution as proof of a call.  The AST fix uses
+    body[0].lineno (the first body statement) so only actual calls pass.
+    """
+
+    def test_branchless_multiline_signature_default_import_only_not_covered(
+            self, tmp_path):
+        """D2g regression: multiline-sig function that is only IMPORTED (default-arg
+        executed at import) must NOT pass the gate → no_targets (fail-closed).
+
+        This is the codex false-green: previously the signature line (with the default
+        arg call) fell in ls+1..le and was counted as body execution → false proceed.
+        With the AST fix the body starts later and import-only is correctly rejected.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_multiline_sig_fixture(tmp_path, test_calls_branchless=False)
+        # branchless starts at line 3, ends at line 6
+        targets = [{'file_path': 'multiline_sig.py', 'name': 'branchless',
+                    'line_start': 3, 'line_end': 6}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_multiline_sig.py'], targets)
+        # Must NOT be fully_covered — function body was never executed
+        assert res['fully_covered'] is False, (
+            f'D2g: import-only multiline-sig must NOT pass gate (false-green!): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2g: expected no_targets, got {res["tool_status"]}: {res.get("error")}')
+        assert res['error'] and 'branchless' in res['error'], (
+            f'D2g: error must mention target name, got: {res.get("error")}')
+
+    def test_branchless_multiline_signature_called_is_covered(self, tmp_path):
+        """D2g: same multiline-sig function but actually CALLED → fully_covered=True.
+
+        Confirms the fix does not break legitimate branchless function coverage.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_multiline_sig_fixture(tmp_path, test_calls_branchless=True)
+        targets = [{'file_path': 'multiline_sig.py', 'name': 'branchless',
+                    'line_start': 3, 'line_end': 6}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_multiline_sig.py'], targets)
+        assert res['tool_status'] == 'ok', (
+            f'D2g: called multiline-sig must pass gate, got {res["tool_status"]}: '
+            f'{res.get("error")}')
+        assert res['fully_covered'] is True, (
+            f'D2g: called multiline-sig must be fully_covered: {res}')
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 0, 'D2g: branchless() has no branches'
+        assert pt['missing_branches'] == []
+
+
+# =============================================================================
+# D2h — single-physical-line branchless function (def and body on same line)
+# =============================================================================
+
+
+def _write_single_physical_line_fixture(root, test_calls_f: bool):
+    """Fixture: `def f(): return 1` — def and body on the SAME physical line.
+
+    FunctionDef.lineno == body[0].lineno == 1 for this function.
+    Coverage marks line 1 as executed at import time (defining f runs that
+    line), so we CANNOT prove f() was actually called via line coverage alone.
+    """
+    (root / 'single_line.py').write_text('def f(): return 1\n')
+    if test_calls_f:
+        (root / 'test_single_line.py').write_text(
+            'from single_line import f\n'
+            'def test_calls_f():\n'
+            '    assert f() == 1\n'
+        )
+    else:
+        # Only imports the module (triggers def at import) but never calls f()
+        (root / 'test_single_line.py').write_text(
+            'import single_line\n'
+            'def test_unrelated():\n'
+            '    assert 1 + 1 == 2\n'
+        )
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestSinglePhysicalLineBranchless:
+    """D2h: branchless function whose def and body share one physical line.
+
+    `def f(): return 1` has FunctionDef.lineno == body[0].lineno.  Coverage
+    marks that line as executed at import time, so the execution-evidence check
+    (body_start > ls AND executed line in range) cannot prove a call was made.
+
+    Fix: when body_start <= line_start → fail-closed (no_targets) regardless
+    of whether f() was actually called.  This is the deliberate conservative
+    behavior — no false green.
+    """
+
+    def test_single_physical_line_branchless_import_only_not_covered(
+            self, tmp_path):
+        """D2h: `def f(): return 1` — test only imports, never calls f().
+
+        Must fail-closed: no_targets (line coverage cannot prove f() was called
+        even in the import-only case, so we definitely should not green-light).
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_single_physical_line_fixture(tmp_path, test_calls_f=False)
+        # f is on line 1, starts and ends at line 1 (single physical line)
+        targets = [{'file_path': 'single_line.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 1}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_single_line.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'D2h: single-physical-line import-only must NOT be fully_covered '
+            f'(false-green!): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2h: expected no_targets, got {res["tool_status"]}: '
+            f'{res.get("error")}')
+        assert res['error'] and 'f' in res['error'], (
+            f'D2h: error must mention target name, got: {res.get("error")}')
+        assert '同行' in (res['error'] or '') or '單行' in (res['error'] or ''), (
+            f'D2h: error must describe single-physical-line reason, got: '
+            f'{res.get("error")}')
+
+    def test_single_physical_line_branchless_even_when_called_is_fail_closed(
+            self, tmp_path):
+        """D2h: `def f(): return 1` — test DOES call f() — STILL fail-closed.
+
+        This is the deliberate conservative behavior: line coverage marks line 1
+        as executed at both import time AND call time, so we cannot distinguish
+        the two cases.  We conservatively reject (no false green) even when f()
+        was actually called.
+
+        INTENTIONAL: no_targets here does NOT mean "untested" — it means "line
+        coverage cannot prove the call, escalate to retry/critic/human rather
+        than auto-passing".
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_single_physical_line_fixture(tmp_path, test_calls_f=True)
+        targets = [{'file_path': 'single_line.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 1}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_single_line.py'], targets)
+        # DELIBERATE: even with f() called, single-physical-line is fail-closed.
+        # Line coverage cannot distinguish import-time def from a real call.
+        assert res['fully_covered'] is False, (
+            f'D2h: single-physical-line must be fail-closed even when called '
+            f'(conservative, no false green): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2h: expected no_targets (fail-closed) even when called, '
+            f'got {res["tool_status"]}: {res.get("error")}')
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessClosingParenBody:
+    """codex feat2 r8 suggestion: `def f(\\n): return 1` — body on the
+    closing-paren line (line 2), a multi-line-signature variant. Import-only
+    must NOT be reported fully_covered (the body return runs only on call)."""
+
+    def test_closing_paren_body_import_only_not_covered(self, tmp_path):
+        from servers.coverage import measure_branch_coverage
+        (tmp_path / 'cp.py').write_text('def f(\n): return 1\n')
+        (tmp_path / 'test_cp.py').write_text(
+            'import cp\ndef test_imports_only():\n    assert cp is not None\n')
+        # f: def on line 1, body (return) on line 2
+        targets = [{'file_path': 'cp.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_cp.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'closing-paren-body import-only must NOT be fully_covered '
+            f'(false-green!): {res}')
+
+    def test_closing_paren_body_called_is_fail_closed_not_false_green(
+            self, tmp_path):
+        """`def f(\\n): return 1` where the body shares the closing-paren line:
+        coverage does NOT mark that line on call, so even a real call cannot be
+        proven. Deliberately fail-closed (conservative, no false green) — same
+        safe over-strictness as the single-physical-line case. The dangerous
+        direction (import-only → green) is closed; this just escalates an oddly
+        formatted but legit function rather than auto-passing it."""
+        from servers.coverage import measure_branch_coverage
+        (tmp_path / 'cp.py').write_text('def f(\n): return 1\n')
+        (tmp_path / 'test_cp.py').write_text(
+            'import cp\ndef test_calls_f():\n    assert cp.f() == 1\n')
+        targets = [{'file_path': 'cp.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 2}]
+        res = measure_branch_coverage(str(tmp_path), ['test_cp.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'must never false-green: {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'conservative fail-closed expected, got {res["tool_status"]}')
+
+
+class TestAstBodyStartLineUnit:
+    """Unit tests for _ast_body_start_line helper.
+
+    These tests do NOT require coverage to be installed.
+    """
+
+    def test_two_line_def_body_start(self, tmp_path):
+        """Two-physical-line def (def on line 1, body on line 2): body_start=2."""
+        from servers.coverage import _ast_body_start_line
+        src = 'def add(a, b):\n    return a + b\n'
+        (tmp_path / 'f.py').write_text(src)
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'add', 1, 2)
+        assert result == 2
+
+    def test_multiline_sig_body_start(self, tmp_path):
+        """Multi-line signature: body starts after the closing paren."""
+        from servers.coverage import _ast_body_start_line
+        src = 'def branchless(\n    value=42,\n):\n    return value\n'
+        (tmp_path / 'f.py').write_text(src)
+        # def at line 1, body at line 4
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'branchless', 1, 4)
+        assert result == 4
+
+    def test_method_in_class_body_start(self, tmp_path):
+        """Method inside a class: ast.walk finds it; body_start correct."""
+        from servers.coverage import _ast_body_start_line
+        src = 'class Foo:\n    def bar(self):\n        return 1\n'
+        (tmp_path / 'f.py').write_text(src)
+        # bar is at line 2, body at line 3
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'bar', 2, 3)
+        assert result == 3
+
+    def test_nonexistent_file_returns_none(self, tmp_path):
+        """If file doesn't exist, returns None (caller must fail-closed)."""
+        from servers.coverage import _ast_body_start_line
+        result = _ast_body_start_line(str(tmp_path / 'nonexistent.py'), 'f', 1, 5)
+        assert result is None
+
+    def test_name_not_found_returns_none(self, tmp_path):
+        """Function name not in file → None."""
+        from servers.coverage import _ast_body_start_line
+        (tmp_path / 'f.py').write_text('def other(): return 1\n')
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'missing_fn', 1, 2)
+        assert result is None
+
+    def test_parse_error_returns_none(self, tmp_path):
+        """Syntax error → ast.parse fails → None (fail-closed)."""
+        from servers.coverage import _ast_body_start_line
+        (tmp_path / 'f.py').write_text('def f(\n   # missing close paren and body')
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'f', 1, 5)
+        assert result is None
