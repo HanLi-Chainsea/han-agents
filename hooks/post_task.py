@@ -103,26 +103,26 @@ def _parse_verdict(response_text: str):
     """Parse the critic verdict from response_text.
 
     Collects ALL verdict markers from two sources:
-      1. '驗證結果: X' pattern (inline or heading) — requires word boundary
-         after the verdict token so 'APPROVEDLY' or 'APPROVED-but...' do NOT
-         match (they are not a clean verdict and should be treated as unparseable
-         → fail-closed REJECTED).
-      2. '^#+ X$' standalone heading markers (unchanged — already exact-line match).
+      1. '驗證結果: X' pattern (inline or heading) — the verdict token must be
+         followed by only optional whitespace to END OF LINE (re.MULTILINE).
+         Anything after the token on the same line ('APPROVEDLY', 'APPROVED-but',
+         'APPROVED LY', etc.) means the token is not clean → no match →
+         unparseable → fail-closed REJECTED.
+      2. '^#+ X$' standalone heading markers — verdict token must be the ONLY
+         content on the line (optional surrounding whitespace allowed).
 
-    Fix 2: Both patterns now require \\b (word boundary) after the verdict token.
-    This means the character immediately following the token must NOT be a word
-    character (i.e. [A-Za-z0-9_]).  So:
-        '驗證結果: APPROVED'         → APPROVED  (end of string)
-        '## 驗證結果: APPROVED'       → APPROVED
-        '驗證結果: APPROVEDLY'        → no match (word continues)
-        '驗證結果: APPROVED-but...'   → no match (hyphen is non-word but the
-                                         re.search stops at 'D' and \\b checks
-                                         the following '-' — actually '-' IS a
-                                         non-word char so \\b would match there).
-    To cover 'APPROVED-but...' (letters after hyphen make it clearly not a clean
-    token) we additionally require that what follows is end-of-line or
-    whitespace/punctuation only — no more letters.  We use a negative lookahead
-    (?![A-Za-z]) after \\b to ensure no more letters follow the token boundary.
+    Pattern 1: 驗證結果\\s*[:：]\\s*(APPROVED|CONDITIONAL|REJECTED)\\s*$
+        with re.MULTILINE | re.IGNORECASE
+
+        '驗證結果: APPROVED'              → APPROVED  (end of string)
+        '## 驗證結果: APPROVED'            → APPROVED  (newline follows)
+        '驗證結果: APPROVED   '            → APPROVED  (trailing spaces then EOL)
+        '驗證結果: APPROVEDLY'             → no match  (extra letters → not \\s*$)
+        '驗證結果: APPROVED-but malformed' → no match  ('-but' → not \\s*$)
+        '驗證結果: APPROVEDL'              → no match  ('L' → not \\s*$)
+
+    Pattern 2: ^#+\\s*(APPROVED|CONDITIONAL|REJECTED)\\s*$
+        with re.MULTILINE | re.IGNORECASE (standalone heading, no 驗證結果 prefix)
 
     Returns (verdict: str, unparseable: bool):
     - ZERO matches → ('REJECTED', True)   — unparseable, fail-closed
@@ -132,19 +132,24 @@ def _parse_verdict(response_text: str):
     verdicts_found = set()
 
     # Pattern 1: 驗證結果: VERDICT
-    # Requires \b after token AND no further letters (prevents APPROVEDLY,
-    # APPROVED-but-actually-malformed, etc. from matching).
+    # The verdict token must be followed by only optional whitespace to end-of-line.
+    # We handle two forms of "end of line":
+    #   a) Real newline (\n) — for plain strings passed directly to _parse_verdict
+    #   b) Literal \n escape sequence — produced by str(dict) in the hook, where
+    #      the tool_response dict's newlines become the two-char sequence "\\n"
+    # Lookahead: (?=\s*(?:\\n|\\r|$)) means: after optional whitespace, the next
+    # thing is either a literal backslash-n, backslash-r, or end-of-string/line.
+    # This rejects APPROVEDLY, APPROVED-but..., APPROVEDL, etc. in both forms.
     for m in re.finditer(
-        r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)\b(?![A-Za-z])',
+        r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)(?=\s*(?:\\n|\\r|$))',
         response_text,
-        re.IGNORECASE,
+        re.MULTILINE | re.IGNORECASE,
     ):
         verdicts_found.add(m.group(1).upper())
 
-    # Pattern 2: ^#+ VERDICT$ (markdown headings) — exact-line match is
-    # already tight; keep as-is but add \b for consistency.
+    # Pattern 2: ^#+ VERDICT$ (markdown headings — standalone verdict on its own line)
     for m in re.finditer(
-        r'^#+\s*(APPROVED|CONDITIONAL|REJECTED)\b(?![A-Za-z])\s*$',
+        r'^#+\s*(APPROVED|CONDITIONAL|REJECTED)\s*$',
         response_text,
         re.MULTILINE | re.IGNORECASE,
     ):
@@ -167,14 +172,23 @@ def _parse_verdict(response_text: str):
 def _check_test_evidence(result_text: str, project_root: str):
     """Check that executor result contains valid test evidence.
 
-    Fix 1 — Exhaustive evidence checks:
+    Exhaustive evidence checks:
     - Collect ALL TEST_TARGETS: lines and ALL paths across them (comma or
       space separated).  EVERY path must be within project_root.  ANY path
       escaping the root → REJECT.
-    - Collect ALL RESULT: lines.  Match with full-token regex so 'PASSIVE'
-      (containing substring 'PASS') does NOT count as PASS.  The result is
-      valid only when there is at least one RESULT: PASS AND zero RESULT: FAIL
-      lines.  Any FAIL present, or PASS+FAIL conflict → REJECT.
+    - Collect ALL RESULT: lines.  Parse each line with a STRICT full-line
+      pattern: PASS or FAIL as a whole token, optionally followed by
+      whitespace + extra content (like a count 'PASS 3'), to end of line.
+      Any character immediately following PASS/FAIL that is not whitespace
+      or end-of-line makes the RESULT line MALFORMED.
+      Rules:
+        - ANY malformed RESULT: line → evidence INVALID → REJECT
+        - At least one clean RESULT: PASS required
+        - Zero clean RESULT: FAIL allowed; any FAIL → REJECT
+      So 'RESULT: PASS-FAIL' → malformed → REJECT.
+         'RESULT: PASS/FAIL' → malformed → REJECT.
+         'RESULT: PASS 3'    → valid PASS.
+         'RESULT: PASSIVE'   → malformed → REJECT.
 
     Returns (ok: bool, reason: str):
     - ok=True  → evidence is present and valid
@@ -222,27 +236,50 @@ def _check_test_evidence(result_text: str, project_root: str):
             "測試檔必須在專案目錄內"
         )
 
-    # ── Collect ALL RESULT: lines with full-token match ──────────────────────
-    # Use \b so 'PASSIVE' (contains 'PASS' as substring) does NOT match PASS.
-    # Also use case-insensitive so 'pass' / 'fail' are accepted.
-    pass_matches = re.findall(
-        r'^\s*RESULT:\s*PASS\b',
-        result_text,
-        re.MULTILINE | re.IGNORECASE,
-    )
-    fail_matches = re.findall(
-        r'^\s*RESULT:\s*FAIL\b',
+    # ── Collect ALL RESULT: lines and parse each strictly ────────────────────
+    # First, find every line that starts with RESULT: (any content after colon).
+    all_result_lines = re.findall(
+        r'^\s*RESULT:\s*.+$',
         result_text,
         re.MULTILINE | re.IGNORECASE,
     )
 
-    if not pass_matches:
+    # Strict full-line pattern: PASS or FAIL as a whole token, optionally
+    # followed by whitespace + extra content (e.g. a count), to end of line.
+    # The character immediately after PASS/FAIL must be whitespace or EOL —
+    # so 'PASS-FAIL', 'PASS/FAIL', 'PASSIVE' are all MALFORMED.
+    _STRICT_RESULT = re.compile(
+        r'^\s*RESULT:\s*(PASS|FAIL)(?:\s+\S.*)?\s*$',
+        re.IGNORECASE,
+    )
+
+    pass_count = 0
+    fail_count = 0
+    malformed_count = 0
+    for line in all_result_lines:
+        m = _STRICT_RESULT.match(line)
+        if m:
+            tok = m.group(1).upper()
+            if tok == 'PASS':
+                pass_count += 1
+            else:
+                fail_count += 1
+        else:
+            malformed_count += 1
+
+    if malformed_count > 0:
+        return False, (
+            "缺可信 evidence: RESULT: 行格式不合法（如 PASS-FAIL、PASS/FAIL、PASSIVE），"
+            "RESULT 必須為 PASS 或 FAIL 加可選數量，不可含其他連接字元"
+        )
+
+    if pass_count == 0:
         return False, (
             "缺可信 evidence: result 含 TEST_TARGETS 但缺 RESULT: PASS，"
             "測試必須真正通過才能 APPROVED"
         )
 
-    if fail_matches:
+    if fail_count > 0:
         return False, (
             "缺可信 evidence: result 含 RESULT: FAIL（或同時含 PASS 與 FAIL），"
             "存在任何 FAIL 即不可 APPROVED"

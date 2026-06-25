@@ -962,28 +962,23 @@ def test_parse_verdict_approvedly_not_approved():
 
 
 def test_parse_verdict_approved_but_suffix_not_approved():
-    """'驗證結果: APPROVED-but actually malformed' → NOT approved → REJECTED."""
+    """'驗證結果: APPROVED-but actually malformed' → NOT approved → REJECTED.
+
+    Uses the EXACT string 'APPROVED-but actually malformed' as specified by codex.
+    The prior version of this test mistakenly used 'APPROVEDLY' as the input;
+    that case is covered by the separate test_parse_verdict_approvedly_not_approved.
+    With the end-of-line anchor (\\s*$), 'APPROVED-but actually malformed' leaves
+    non-whitespace after the token on the same line → no match → unparseable → REJECTED.
+    """
     hook = _load_post_task()
-    # 'APPROVED-but' — hyphen is non-word char so \b fires, but '-but' follows.
-    # Our (?![A-Za-z]) negative lookahead requires no letters immediately after
-    # the boundary, but '-but' has no letter at position 0 after the hyphen...
-    # Actually '-' is fine, but 'but' is letters. The negative lookahead checks
-    # the character AFTER the token boundary — '-' is not [A-Za-z] so it passes.
-    # But we explicitly check for this suffix in the test to catch it.
-    # The key requirement is: APPROVED followed immediately by a hyphen and more
-    # text should NOT be accepted as a clean APPROVED.
-    # The (?![A-Za-z]) only blocks letters immediately after the token.
-    # Hyphens followed by letters are NOT blocked by (?![A-Za-z]).
-    # So we rely on the requirement that the token be followed by only
-    # whitespace/punctuation — but hyphen IS punctuation. This is a hard case.
-    # We address it by ensuring 'APPROVED-but' does not appear as clean:
-    # This test validates the behavior described in the spec.
     verdict, unparseable = hook._parse_verdict(
-        "驗證結果: APPROVEDLY\n\nMalformed suffix verdict."
+        "驗證結果: APPROVED-but actually malformed"
     )
-    # APPROVEDLY must not match
     assert verdict == "REJECTED", (
-        f"APPROVEDLY must not match. verdict={verdict!r}"
+        f"'APPROVED-but actually malformed' must not parse as APPROVED. verdict={verdict!r}"
+    )
+    assert unparseable is True, (
+        f"No valid verdict found → unparseable must be True. unparseable={unparseable!r}"
     )
 
 
@@ -1005,6 +1000,165 @@ def test_parse_verdict_approved_no_suffix_whitespace():
     )
     assert verdict == "APPROVED", f"Trailing whitespace after APPROVED must still parse. verdict={verdict!r}"
     assert unparseable is False
+
+
+# =============================================================================
+# Fix 2 — Strict RESULT line parsing: malformed lines must reject
+# =============================================================================
+
+def test_check_test_evidence_result_pass_dash_fail_malformed(tmp_path):
+    """RESULT: PASS-FAIL is malformed → evidence INVALID → rejected.
+
+    The '\\b' boundary on PASS allowed PASS-FAIL to slip through before this fix.
+    The strict pattern requires the next char after PASS/FAIL to be whitespace or EOL.
+    """
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS-FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"'RESULT: PASS-FAIL' must be INVALID (malformed). reason={reason!r}"
+    )
+
+
+def test_check_test_evidence_result_pass_slash_fail_malformed(tmp_path):
+    """RESULT: PASS/FAIL is malformed → evidence INVALID → rejected."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS/FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"'RESULT: PASS/FAIL' must be INVALID (malformed). reason={reason!r}"
+    )
+
+
+def test_check_test_evidence_result_pass_with_count_valid(tmp_path):
+    """RESULT: PASS 3 (clean token with count) → evidence VALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS 3\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is True, (
+        f"'RESULT: PASS 3' must be VALID (clean token with count). reason={reason!r}"
+    )
+
+
+def test_check_test_evidence_result_pass_then_fail_count_invalid(tmp_path):
+    """RESULT: PASS then RESULT: FAIL 1 → INVALID (FAIL present)."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS\n"
+        "RESULT: FAIL 1\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"PASS + FAIL 1 must be INVALID (FAIL present). reason={reason!r}"
+    )
+
+
+def test_full_hook_result_pass_dash_fail_overrides_approved(mock_db_path, tmp_path):
+    """Integration: RESULT: PASS-FAIL in executor result → hook overrides APPROVED to REJECTED."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for auth module',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): pass")
+
+    result_text = (
+        "Completed tests.\n"
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS-FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {"output": "## 驗證結果: APPROVED\n\nTests pass."},
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"RESULT: PASS-FAIL must force REJECTED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+def test_full_hook_result_pass_slash_fail_overrides_approved(mock_db_path, tmp_path):
+    """Integration: RESULT: PASS/FAIL in executor result → hook overrides APPROVED to REJECTED."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for auth module',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): pass")
+
+    result_text = (
+        "Completed tests.\n"
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS/FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {"output": "## 驗證結果: APPROVED\n\nTests pass."},
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"RESULT: PASS/FAIL must force REJECTED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
 
 
 # =============================================================================
