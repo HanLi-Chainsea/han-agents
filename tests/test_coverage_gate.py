@@ -2161,14 +2161,110 @@ class TestBranchlessMultilineSignature:
         assert pt['missing_branches'] == []
 
 
+# =============================================================================
+# D2h — single-physical-line branchless function (def and body on same line)
+# =============================================================================
+
+
+def _write_single_physical_line_fixture(root, test_calls_f: bool):
+    """Fixture: `def f(): return 1` — def and body on the SAME physical line.
+
+    FunctionDef.lineno == body[0].lineno == 1 for this function.
+    Coverage marks line 1 as executed at import time (defining f runs that
+    line), so we CANNOT prove f() was actually called via line coverage alone.
+    """
+    (root / 'single_line.py').write_text('def f(): return 1\n')
+    if test_calls_f:
+        (root / 'test_single_line.py').write_text(
+            'from single_line import f\n'
+            'def test_calls_f():\n'
+            '    assert f() == 1\n'
+        )
+    else:
+        # Only imports the module (triggers def at import) but never calls f()
+        (root / 'test_single_line.py').write_text(
+            'import single_line\n'
+            'def test_unrelated():\n'
+            '    assert 1 + 1 == 2\n'
+        )
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestSinglePhysicalLineBranchless:
+    """D2h: branchless function whose def and body share one physical line.
+
+    `def f(): return 1` has FunctionDef.lineno == body[0].lineno.  Coverage
+    marks that line as executed at import time, so the execution-evidence check
+    (body_start > ls AND executed line in range) cannot prove a call was made.
+
+    Fix: when body_start <= line_start → fail-closed (no_targets) regardless
+    of whether f() was actually called.  This is the deliberate conservative
+    behavior — no false green.
+    """
+
+    def test_single_physical_line_branchless_import_only_not_covered(
+            self, tmp_path):
+        """D2h: `def f(): return 1` — test only imports, never calls f().
+
+        Must fail-closed: no_targets (line coverage cannot prove f() was called
+        even in the import-only case, so we definitely should not green-light).
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_single_physical_line_fixture(tmp_path, test_calls_f=False)
+        # f is on line 1, starts and ends at line 1 (single physical line)
+        targets = [{'file_path': 'single_line.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 1}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_single_line.py'], targets)
+        assert res['fully_covered'] is False, (
+            f'D2h: single-physical-line import-only must NOT be fully_covered '
+            f'(false-green!): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2h: expected no_targets, got {res["tool_status"]}: '
+            f'{res.get("error")}')
+        assert res['error'] and 'f' in res['error'], (
+            f'D2h: error must mention target name, got: {res.get("error")}')
+        assert '同行' in (res['error'] or '') or '單行' in (res['error'] or ''), (
+            f'D2h: error must describe single-physical-line reason, got: '
+            f'{res.get("error")}')
+
+    def test_single_physical_line_branchless_even_when_called_is_fail_closed(
+            self, tmp_path):
+        """D2h: `def f(): return 1` — test DOES call f() — STILL fail-closed.
+
+        This is the deliberate conservative behavior: line coverage marks line 1
+        as executed at both import time AND call time, so we cannot distinguish
+        the two cases.  We conservatively reject (no false green) even when f()
+        was actually called.
+
+        INTENTIONAL: no_targets here does NOT mean "untested" — it means "line
+        coverage cannot prove the call, escalate to retry/critic/human rather
+        than auto-passing".
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_single_physical_line_fixture(tmp_path, test_calls_f=True)
+        targets = [{'file_path': 'single_line.py', 'name': 'f',
+                    'line_start': 1, 'line_end': 1}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_single_line.py'], targets)
+        # DELIBERATE: even with f() called, single-physical-line is fail-closed.
+        # Line coverage cannot distinguish import-time def from a real call.
+        assert res['fully_covered'] is False, (
+            f'D2h: single-physical-line must be fail-closed even when called '
+            f'(conservative, no false green): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2h: expected no_targets (fail-closed) even when called, '
+            f'got {res["tool_status"]}: {res.get("error")}')
+
+
 class TestAstBodyStartLineUnit:
     """Unit tests for _ast_body_start_line helper.
 
     These tests do NOT require coverage to be installed.
     """
 
-    def test_single_line_def_body_start(self, tmp_path):
-        """Single-line def: body starts at line 2."""
+    def test_two_line_def_body_start(self, tmp_path):
+        """Two-physical-line def (def on line 1, body on line 2): body_start=2."""
         from servers.coverage import _ast_body_start_line
         src = 'def add(a, b):\n    return a + b\n'
         (tmp_path / 'f.py').write_text(src)

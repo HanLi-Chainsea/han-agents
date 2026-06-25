@@ -283,6 +283,9 @@ def _attribute_targets(file_index: Dict[str, Dict],
         # - executed_lines not a list → schema_error
         # - AST lookup fails (file unreadable / parse error / no matching node /
         #   empty body) → schema_error (reject; when in doubt, reject)
+        # - body_start_line <= line_start (single-physical-line function,
+        #   e.g. `def f(): return 1`) → no_targets (D2h: line coverage cannot
+        #   distinguish import-time def-execution from an actual call; fail-closed)
         # - no executed line >= body_start_line in [body_start, le] → no_targets
         if n_total == 0:
             el = entry.get('executed_lines')
@@ -298,7 +301,20 @@ def _attribute_targets(file_index: Dict[str, Dict],
                     'schema_error',
                     f'無法確認函式體起始行（AST 解析失敗或找不到函式定義）: {fp}::{name}',
                 )
+            # D2h: single-physical-line function (`def f(): return 1`).
+            # body_start <= ls means FunctionDef.lineno == body[0].lineno — the
+            # def and its body are on the same physical line.  Coverage marks that
+            # line executed at import time (defining f runs the def line), so we
+            # CANNOT distinguish "def executed at import" from "f() actually called".
+            # Line coverage genuinely cannot prove a call here → fail-closed.
+            if body_start <= ls:
+                return _result(
+                    'no_targets',
+                    f'單行 branchless 函式無法以行覆蓋證明執行(def 與 body 同行),'
+                    f'退回人工確認: {fp}::{name}',
+                )
             # Execution evidence: at least one executed line in [body_start, le].
+            # (body_start > ls is guaranteed here — multi-line function only.)
             executed_in_range = any(
                 isinstance(ln, int) and not isinstance(ln, bool)
                 and body_start <= ln <= le
