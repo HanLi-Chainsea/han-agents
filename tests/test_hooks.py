@@ -375,3 +375,352 @@ def test_agent_output_text_extraction():
 
     # non-str, non-dict (e.g. None): falls back to str()
     assert fn(None) == "None"
+
+
+# =============================================================================
+# Task-type-aware deterministic evidence gate tests
+# =============================================================================
+
+def _make_critic_prompt_with_path(critic_task_id: str, original_task_id: str,
+                                   project_path: str = "/tmp/testproj") -> str:
+    return (
+        f'TASK_ID = "{critic_task_id}"\n'
+        f'ORIGINAL_TASK_ID = "{original_task_id}"\n'
+        f'PROJECT_PATH = "{project_path}"\n'
+        f'Critic reviewing task.'
+    )
+
+
+def _setup_tasks(mock_db_path, original_description: str):
+    """Helper: create parent, original task (with description), and critic task."""
+    from servers.tasks import create_task, update_task_status, advance_task_phase, update_task
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', original_description, parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+    update_task_status(original_task_id, 'done', result='done')
+    advance_task_phase(original_task_id, 'validation')
+    return parent_id, original_task_id, critic_task_id
+
+
+# ── Fix 2: key false-green regression ────────────────────────────────────────
+
+def test_critic_approved_without_evidence_is_overridden_rejected(mock_db_path, tmp_path):
+    """THE key false-green regression test.
+
+    A TEST task whose saved result has NO TEST_TARGETS/RESULT, and the critic
+    outputs APPROVED → hook MUST override to REJECTED.
+    """
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase, update_task
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for servers/memory.py',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    # Executor result has NO TEST_TARGETS or RESULT: PASS
+    update_task_status(original_task_id, 'done', result='I wrote some tests and they look good.')
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "I reviewed the tests carefully.\n"
+                "## 驗證結果: APPROVED\n\n"
+                "Everything looks great, tests are comprehensive."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"LLM APPROVED without evidence must be OVERRIDDEN to rejected. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+def test_critic_conflicting_verdicts_rejected(mock_db_path, tmp_path):
+    """Response containing both APPROVED and REJECTED → rejected (conflicting)."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase, update_task
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for auth module',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+    update_task_status(original_task_id, 'done',
+                       result='TEST_TARGETS: tests/test_auth.py\nRESULT: PASS 5\nCMD: pytest')
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "## 驗證結果: APPROVED\n\n"
+                "Actually wait, there are issues.\n"
+                "## 驗證結果: REJECTED\n\n"
+                "Missing coverage."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"Conflicting verdicts must result in REJECTED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+def test_critic_approved_with_valid_evidence_passes(mock_db_path, tmp_path):
+    """TEST task with valid evidence (TEST_TARGETS + RESULT: PASS, path within root)
+    + APPROVED → approved."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase, update_task
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for servers/memory.py',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    # Create the test file so path containment passes
+    test_file = tmp_path / "tests" / "test_x.py"
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text("def test_foo(): assert 1 == 1")
+
+    result_text = (
+        "Completed the tests.\n"
+        "TEST_TARGETS: tests/test_x.py\n"
+        "RESULT: PASS 3\n"
+        "CHANGED: tests/test_x.py\n"
+        "CMD: pytest tests/test_x.py -q"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "I verified the tests.\n"
+                "## 驗證結果: APPROVED\n\n"
+                "All assertions are real and RESULT shows PASS."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') == 'approved', (
+        f"Valid evidence + APPROVED should stay approved. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+def test_test_targets_path_escape_rejected(mock_db_path, tmp_path):
+    """TEST_TARGETS with ../escape or absolute path + APPROVED → rejected (path escape)."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase, update_task
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for auth module',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    result_text = (
+        "Completed the tests.\n"
+        "TEST_TARGETS: ../../etc/passwd\n"
+        "RESULT: PASS 3\n"
+        "CMD: pytest ../../etc/passwd"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "## 驗證結果: APPROVED\n\nTests pass."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"Path escape in TEST_TARGETS must force REJECTED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+def test_non_test_task_approved_without_test_evidence_passes(mock_db_path, tmp_path):
+    """A code_review/docs task (non-test), critic APPROVED, no TEST_TARGETS → APPROVED.
+
+    This proves the regression is fixed: non-test tasks must NOT be blocked
+    by the evidence gate.
+    """
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    # code_review description → resolves to code_review playbook (non-test)
+    original_task_id = create_task('test', 'Code review the diff against main',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    # Executor result has NO TEST_TARGETS (correct for non-test task)
+    update_task_status(original_task_id, 'done',
+                       result='Reviewed the diff. Found 2 style issues.')
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "The code review findings are solid.\n"
+                "## 驗證結果: APPROVED\n\n"
+                "The reviewer correctly identified the issues."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') == 'approved', (
+        f"Non-test task with APPROVED and no TEST_TARGETS must remain APPROVED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
+
+
+# ── Verdict parsing unit tests ────────────────────────────────────────────────
+
+def test_parse_verdict_single_approved():
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict("## 驗證結果: APPROVED\n\nAll good.")
+    assert verdict == "APPROVED"
+    assert unparseable is False
+
+
+def test_parse_verdict_single_rejected():
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict("## 驗證結果: REJECTED\n\nMissing tests.")
+    assert verdict == "REJECTED"
+    assert unparseable is False
+
+
+def test_parse_verdict_unparseable():
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict("It looks fine, no issues found.")
+    assert verdict == "REJECTED"
+    assert unparseable is True
+
+
+def test_parse_verdict_conflicting():
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict(
+        "## 驗證結果: APPROVED\n\nBut wait: ## 驗證結果: REJECTED"
+    )
+    assert verdict == "REJECTED"
+    assert unparseable is False
+
+
+def test_parse_verdict_heading_pattern():
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict("# REJECTED\n\nMissing coverage.")
+    assert verdict == "REJECTED"
+    assert unparseable is False
+
+
+# ── Path containment unit tests ───────────────────────────────────────────────
+
+def test_paths_within_root_ok(tmp_path):
+    hook = _load_post_task()
+    assert hook._paths_within_root(["tests/test_x.py", "tests/test_y.py"],
+                                    str(tmp_path)) is True
+
+
+def test_paths_within_root_dotdot_escape(tmp_path):
+    hook = _load_post_task()
+    assert hook._paths_within_root(["../../etc/passwd"], str(tmp_path)) is False
+
+
+def test_paths_within_root_absolute_escape(tmp_path):
+    hook = _load_post_task()
+    assert hook._paths_within_root(["/etc/passwd"], str(tmp_path)) is False
+
+
+def test_paths_within_root_empty_root():
+    hook = _load_post_task()
+    assert hook._paths_within_root(["tests/test_x.py"], "") is False
+
+
+# ── Absolute path escape in TEST_TARGETS ─────────────────────────────────────
+
+def test_test_targets_absolute_path_rejected(mock_db_path, tmp_path):
+    """TEST_TARGETS with absolute path + APPROVED → rejected."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for servers/memory.py',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    result_text = (
+        "Completed the tests.\n"
+        "TEST_TARGETS: /etc/passwd\n"
+        "RESULT: PASS 3\n"
+        "CMD: pytest /etc/passwd"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {"output": "## 驗證結果: APPROVED\n\nTests pass."},
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') != 'approved', (
+        f"Absolute path in TEST_TARGETS must force REJECTED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )

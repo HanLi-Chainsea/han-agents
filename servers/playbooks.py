@@ -23,6 +23,15 @@ _PLAYBOOK_DIR = os.path.join(_BASE_DIR, "reference", "playbooks")
 
 _CACHE: Optional[Dict[str, "Playbook"]] = None
 
+# Test-type playbook names: these tasks require actual test execution evidence.
+# refactor is included because it requires characterization tests.
+_TEST_TASK_PLAYBOOK_NAMES = frozenset({
+    "unit_test",
+    "integration_test",
+    "e2e_test",
+    "refactor",
+})
+
 
 @dataclass
 class Playbook:
@@ -133,6 +142,24 @@ def resolve_playbook(description: str) -> Optional[Playbook]:
                 best = pb
                 best_len = len(kw)
     return best
+
+
+def is_test_task(description: str) -> bool:
+    """Return True if the task description resolves to a test-type playbook.
+
+    Test-type playbooks: unit_test, integration_test, e2e_test, refactor.
+    Refactor is included because it requires characterization tests.
+
+    fail-open: if playbook resolution fails or returns None → False
+    (non-test path is safe; only test tasks need evidence gating).
+    """
+    try:
+        pb = resolve_playbook(description)
+        if pb is None:
+            return False
+        return pb.name in _TEST_TASK_PLAYBOOK_NAMES
+    except Exception:
+        return False
 
 
 def executor_section(pb: Playbook) -> str:

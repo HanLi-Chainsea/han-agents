@@ -383,3 +383,107 @@ class TestCriticPromptInstructsActionableIssues:
         # Output format lines must still be present
         assert '## 驗證結果: APPROVED' in prompt
         assert '## 驗證結果: REJECTED' in prompt
+
+
+class TestIsTestTask:
+    """Tests for the is_test_task() helper in servers/playbooks.py."""
+
+    def test_unit_test_is_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Write unit tests for servers/memory.py") is True
+
+    def test_integration_test_is_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Write integration tests for auth module") is True
+
+    def test_e2e_test_is_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Write E2E tests for the checkout journey") is True
+
+    def test_refactor_is_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Refactor for testability: apply Extract Method to foo") is True
+
+    def test_characterization_is_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task(
+            "Write characterization tests pinning current behavior of foo"
+        ) is True
+
+    def test_code_review_is_not_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Code review the diff against main") is False
+
+    def test_docs_task_is_not_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Update the API documentation for auth endpoints") is False
+
+    def test_bug_fix_is_not_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("Fix bug in parser logic") is False
+
+    def test_empty_description_is_not_test_task(self):
+        from servers.playbooks import is_test_task
+        assert is_test_task("") is False
+
+    def test_none_like_empty_is_not_test_task(self):
+        from servers.playbooks import is_test_task
+        # Analysis task that doesn't match any test playbook
+        assert is_test_task("Analyse the performance of the auth module") is False
+
+
+class TestTaskTypeAwarePromptBuilders:
+    """Verify that prompt builders only inject evidence blocks for test tasks."""
+
+    def test_executor_prompt_no_test_evidence_for_non_test_task(self):
+        """Non-test tasks must NOT get TEST_TARGETS requirement in executor prompt."""
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t-nr1", "description": "Code review the diff against main",
+                "assigned_agent": "executor"}
+        prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
+        assert "TEST_TARGETS:" not in prompt, (
+            "Non-test task executor prompt must NOT require TEST_TARGETS"
+        )
+
+    def test_executor_prompt_has_test_evidence_for_unit_test_task(self):
+        """Unit test tasks MUST get TEST_TARGETS requirement in executor prompt."""
+        from servers.facade import _build_executor_prompt
+        task = {"id": "t-nr2", "description": "Write unit tests for servers/memory.py",
+                "assigned_agent": "executor"}
+        prompt = _build_executor_prompt(task, "proj", "/tmp/proj")
+        assert "TEST_TARGETS:" in prompt, (
+            "Unit test executor prompt must include TEST_TARGETS requirement"
+        )
+        assert "RESULT:" in prompt
+        assert "CMD:" in prompt
+
+    def test_critic_prompt_no_test_target_requirement_for_non_test_task(self):
+        """Non-test tasks must NOT get fail-closed-on-missing-TEST_TARGETS in critic prompt."""
+        from servers.facade import _build_critic_prompt
+        critic_task = {
+            "id": "c-nr1", "original_task_id": "t-nr1",
+            "original_description": "Code review the diff against main",
+            "result": "Reviewed the code. Found 2 issues."
+        }
+        prompt = _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+        # The TEST_TARGETS fail-closed rule must NOT be in non-test critic prompts
+        assert "no TEST_TARGETS" not in prompt.lower(), (
+            "Non-test critic prompt must NOT have fail-closed TEST_TARGETS rule"
+        )
+        # But verdict format must still be present
+        assert "## 驗證結果: APPROVED" in prompt
+        assert "## 驗證結果: REJECTED" in prompt
+
+    def test_critic_prompt_has_test_target_requirement_for_unit_test_task(self):
+        """Unit test tasks MUST get fail-closed evidence section in critic prompt."""
+        from servers.facade import _build_critic_prompt
+        critic_task = {
+            "id": "c-nr2", "original_task_id": "t-nr2",
+            "original_description": "Write unit tests for servers/memory.py",
+            "result": "TEST_TARGETS: tests/test_x.py\nRESULT: PASS 3\nCMD: pytest"
+        }
+        prompt = _build_critic_prompt(critic_task, "proj", "/tmp/proj")
+        assert "TEST_TARGETS" in prompt
+        assert "FAIL-CLOSED" in prompt or "fail-closed" in prompt.lower()
+        assert "## 驗證結果: APPROVED" in prompt
+        assert "## 驗證結果: REJECTED" in prompt

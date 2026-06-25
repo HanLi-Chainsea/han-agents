@@ -2508,12 +2508,45 @@ Please address the issues above in this retry.
     # Playbook 原則注入（依描述分類；未命中則為空，fail-open）
     playbook_section = ""
     try:
-        from servers.playbooks import resolve_playbook, executor_section
+        from servers.playbooks import resolve_playbook, executor_section, is_test_task
         pb = resolve_playbook(description)
         if pb:
             playbook_section = "\n" + executor_section(pb)
     except Exception:
         playbook_section = ""
+
+    # Only inject the compact TEST_TARGETS evidence block for test-type tasks.
+    # Non-test tasks (code_review, docs, analysis) must NOT be required to supply
+    # TEST_TARGETS — that would block them unconditionally (regression fix).
+    try:
+        from servers.playbooks import is_test_task as _is_test
+        _need_evidence = _is_test(description)
+    except Exception:
+        _need_evidence = False
+
+    if _need_evidence:
+        output_format_section = """
+## Required Output Format (COMPACT EVIDENCE BLOCK)
+
+After completing the task, END your report with the following compact evidence
+block — exactly four lines, one per field, no extra prose. Do NOT reproduce the
+full test file or paste long output; the block replaces verbose prose:
+
+TEST_TARGETS: <relative test file path(s), comma-separated>
+RESULT: PASS <n>   (or: FAIL <n> — <one-line reason>)
+CHANGED: <files created or modified, comma-separated>
+CMD: <the exact test command you ran>
+
+You MUST still actually run the tests; the compact block records the run, it
+does not replace it. Running tests is mandatory — NEVER omit the CMD/RESULT.
+"""
+    else:
+        output_format_section = """
+## Required Output Format
+
+After completing the task, summarise what was done clearly and concisely.
+Include: what was changed or produced, any key findings or decisions made.
+"""
 
     prompt = f'''TASK_ID = "{task_id}"
 PROJECT = "{project_name}"
@@ -2531,21 +2564,7 @@ PROJECT_PATH = "{project_path}"
 1. Read relevant source files
 2. Execute the task as described
 3. Output results clearly
-
-## Required Output Format (COMPACT EVIDENCE BLOCK)
-
-After completing the task, END your report with the following compact evidence
-block — exactly four lines, one per field, no extra prose. Do NOT reproduce the
-full test file or paste long output; the block replaces verbose prose:
-
-TEST_TARGETS: <relative test file path(s), comma-separated>
-RESULT: PASS <n>   (or: FAIL <n> — <one-line reason>)
-CHANGED: <files created or modified, comma-separated>
-CMD: <the exact test command you ran>
-
-You MUST still actually run the tests; the compact block records the run, it
-does not replace it. Running tests is mandatory — NEVER omit the CMD/RESULT.
-'''
+{output_format_section}'''
     return prompt.strip()
 
 
@@ -2555,6 +2574,12 @@ def _build_critic_prompt(
     project_path: str
 ) -> str:
     """建構 Critic agent 的完整 prompt
+
+    Task-type-aware: only injects the TEST_TARGETS evidence-verification block
+    for test-type tasks (unit_test / integration_test / e2e_test / refactor).
+    Non-test tasks (code_review, docs, analysis) get the standard checklist
+    without the fail-closed-on-missing-TEST_TARGETS rule — they would otherwise
+    be unconditionally blocked (regression fix).
 
     Args:
         critic_task: reserve_critic_task() 返回的 dict
@@ -2578,19 +2603,15 @@ def _build_critic_prompt(
     except Exception:
         playbook_section = ""
 
-    prompt = f'''TASK_ID = "{critic_task_id}"
-ORIGINAL_TASK_ID = "{original_task_id}"
-PROJECT = "{project_name}"
-PROJECT_PATH = "{project_path}"
+    # Determine if this is a test-type task that requires evidence gating.
+    try:
+        from servers.playbooks import is_test_task as _is_test
+        _need_evidence = _is_test(description)
+    except Exception:
+        _need_evidence = False
 
-## Validation Target
-
-Task: {description}
-
-## Executor Evidence (compact block from executor)
-
-{critic_task.get('result', 'See code changes')}
-
+    if _need_evidence:
+        evidence_section = """
 ## Evidence Verification — MANDATORY STEPS (fail-closed)
 
 The executor's result above should end with a compact evidence block containing
@@ -2619,7 +2640,23 @@ NEVER output APPROVED or CONDITIONAL without having:
   (b) confirmed it contains real assertions, AND
   (c) seen a PASS result in the RESULT: line.
 須附執行輸出否則 REJECT（實際被執行的測試才算數）。
+"""
+    else:
+        evidence_section = ""
 
+    prompt = f'''TASK_ID = "{critic_task_id}"
+ORIGINAL_TASK_ID = "{original_task_id}"
+PROJECT = "{project_name}"
+PROJECT_PATH = "{project_path}"
+
+## Validation Target
+
+Task: {description}
+
+## Executor Evidence
+
+{critic_task.get('result', 'See code changes')}
+{evidence_section}
 ## Validation Criteria
 
 1. Does the output match the task description?
