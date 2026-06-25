@@ -7,6 +7,7 @@ branch arc 歸因到本次 target 函式。非侵入：隔離 data file、不寫
 屬偏保守的過度涵蓋（要求多測、不會漏算）。AST 精確 scope 留待 v2。
 """
 
+import ast
 import json
 import os
 import re
@@ -95,6 +96,42 @@ def _valid_arc(arc) -> bool:
     """
     return (isinstance(arc, (list, tuple)) and len(arc) == 2
             and all(isinstance(x, int) and not isinstance(x, bool) for x in arc))
+
+
+def _ast_body_start_line(abs_path: str, name: str,
+                         line_start: int, line_end: int) -> Optional[int]:
+    """Return the first body-statement line of the named function/method.
+
+    Finds the FunctionDef/AsyncFunctionDef whose name matches and whose lineno
+    is within [line_start, line_end], picking the closest to line_start when
+    multiple match.  Searches ClassDef bodies via ast.walk (handles methods).
+
+    Returns node.body[0].lineno (the first real statement — after the signature,
+    default args, and annotations, which all have lineno < body[0].lineno for
+    multi-line signatures).
+
+    Returns None on any failure (file unreadable, parse error, no matching node,
+    empty body).  Caller must treat None as fail-closed (reject).
+    """
+    try:
+        with open(abs_path, encoding='utf-8', errors='replace') as fh:
+            source = fh.read()
+        tree = ast.parse(source, filename=abs_path)
+    except Exception:
+        return None
+
+    candidates = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name == name and line_start <= node.lineno <= line_end:
+                candidates.append(node)
+    if not candidates:
+        return None
+    # Pick the node whose lineno is closest to line_start (usually the exact match).
+    best = min(candidates, key=lambda n: abs(n.lineno - line_start))
+    if not best.body:
+        return None
+    return best.body[0].lineno
 
 
 def measure_branch_coverage(project_path: str,
@@ -233,9 +270,20 @@ def _attribute_targets(file_index: Dict[str, Dict],
         # n_total==0: branchless function — must verify execution via executed_lines.
         # A file appearing in coverage data only proves it was imported, not called.
         # The `def` line (ls) is always executed at import time and does NOT prove
-        # the function body ran.  Only body lines (ls+1 .. le) appear in executed_lines
-        # when the function is actually called.
-        # Fail-closed: no body-line execution evidence → reject (no_targets), not false-green.
+        # the function body ran.
+        #
+        # AST-based body-start line (D2g fix):
+        # A multi-line function signature with a side-effecting default arg executes
+        # that default-arg line at import time — it falls in (ls, le] but is NOT in
+        # the function body.  We use AST to find the first real body-statement line
+        # (node.body[0].lineno) so that only lines >= body_start count as execution
+        # evidence.  This closes the multiline-signature false-green.
+        #
+        # Fail-closed invariants:
+        # - executed_lines not a list → schema_error
+        # - AST lookup fails (file unreadable / parse error / no matching node /
+        #   empty body) → schema_error (reject; when in doubt, reject)
+        # - no executed line >= body_start_line in [body_start, le] → no_targets
         if n_total == 0:
             el = entry.get('executed_lines')
             if not isinstance(el, list):
@@ -243,9 +291,17 @@ def _attribute_targets(file_index: Dict[str, Dict],
                                f'coverage json 格式非預期（{fp}）：'
                                'executed_lines 應為 list（branchless 函式需執行證明）')
             name = t.get('name') or fp
-            # Check body lines only: strictly greater than ls (skip the def line itself).
+            # AST: find the first body-statement line so default-arg lines are excluded.
+            body_start = _ast_body_start_line(canon, name, ls, le) if canon else None
+            if body_start is None:
+                return _result(
+                    'schema_error',
+                    f'無法確認函式體起始行（AST 解析失敗或找不到函式定義）: {fp}::{name}',
+                )
+            # Execution evidence: at least one executed line in [body_start, le].
             executed_in_range = any(
-                isinstance(ln, int) and not isinstance(ln, bool) and ls < ln <= le
+                isinstance(ln, int) and not isinstance(ln, bool)
+                and body_start <= ln <= le
                 for ln in el
             )
             if not executed_in_range:

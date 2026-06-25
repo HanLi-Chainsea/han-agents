@@ -1953,13 +1953,20 @@ class TestAttributeTargetsBranchlessExecutionEvidence:
         return root, canon
 
     def test_branchless_with_executed_line_in_range_passes(self, tmp_path):
-        """n_total==0 + executed_lines has a line in [ls,le] → ok, fully_covered=True."""
+        """n_total==0 + executed_lines has a body line → ok, fully_covered=True.
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        def add(a, b): body starts at line 2; executed_lines=[1,2] includes line 2.
+        """
         from servers.coverage import _attribute_targets
         root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it.
+        # def add is at line 1; body (return a + b) is at line 2.
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
         file_index = {canon: {
             'missing_branches': [],
             'executed_branches': [],
-            'executed_lines': [1, 2],
+            'executed_lines': [1, 2],  # line 2 = body_start; counts as execution
         }}
         targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
         res = _attribute_targets(file_index, targets, root)
@@ -1968,13 +1975,19 @@ class TestAttributeTargetsBranchlessExecutionEvidence:
         assert res['per_target'][0]['n_total'] == 0
 
     def test_branchless_with_no_executed_line_in_range_is_no_targets(self, tmp_path):
-        """n_total==0 + no executed_lines in [ls,le] → no_targets (fail-closed)."""
+        """n_total==0 + no executed_lines in body range → no_targets (fail-closed).
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        Lines 10,20 are outside [body_start=2, le=2] → no execution evidence.
+        """
         from servers.coverage import _attribute_targets
         root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it (body_start=2).
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
         file_index = {canon: {
             'missing_branches': [],
             'executed_branches': [],
-            'executed_lines': [10, 20],  # outside range [1,2]
+            'executed_lines': [10, 20],  # outside body range [2,2]
         }}
         targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
         res = _attribute_targets(file_index, targets, root)
@@ -2011,9 +2024,15 @@ class TestAttributeTargetsBranchlessExecutionEvidence:
         assert res['fully_covered'] is False
 
     def test_branchless_bool_in_executed_lines_not_counted(self, tmp_path):
-        """n_total==0 + executed_lines contains only booleans → treated as no execution."""
+        """n_total==0 + executed_lines contains only booleans → treated as no execution.
+
+        AST fix (D2g): source file must exist so AST can determine body_start_line.
+        True/False are excluded by isinstance(ln, bool) check; no real line passes.
+        """
         from servers.coverage import _attribute_targets
         root, canon = self._make_root_and_canon(tmp_path)
+        # Write source file so _ast_body_start_line can parse it (body_start=2).
+        (tmp_path / 'x.py').write_text('def add(a, b):\n    return a + b\n')
         file_index = {canon: {
             'missing_branches': [],
             'executed_branches': [],
@@ -2021,8 +2040,8 @@ class TestAttributeTargetsBranchlessExecutionEvidence:
         }}
         targets = [{'file_path': 'x.py', 'name': 'add', 'line_start': 1, 'line_end': 2}]
         res = _attribute_targets(file_index, targets, root)
-        # True==1 and False==0 numerically, but must be excluded (bool check)
-        # Since True == 1 and 1 is in [1,2], the bool exclusion prevents false-green
+        # True==1 and False==0 numerically, but bool check excludes them.
+        # With body_start=2, True (==1) is also < body_start, doubly excluded.
         assert res['tool_status'] == 'no_targets'
         assert res['fully_covered'] is False
 
@@ -2043,3 +2062,153 @@ class TestAttributeTargetsBranchlessExecutionEvidence:
         assert res['fully_covered'] is False
         pt = res['per_target'][0]
         assert pt['n_total'] == 2 and pt['n_covered'] == 1
+
+
+# =============================================================================
+# D2g — multiline-signature default-arg false-green (AST body-line fix)
+# =============================================================================
+
+
+def _write_multiline_sig_fixture(root, test_calls_branchless: bool):
+    """Fixture: branchless function with multi-line signature and side-effecting default.
+
+    _side_effect() runs at import time (line 2 of the function, inside the signature).
+    The function body starts at line 4 (return value).
+
+    Structure of multiline_sig.py:
+        line 1: def _side_effect():
+        line 2:     return 42
+        line 3: def branchless(
+        line 4:     value=_side_effect(),   # executes at import; in signature, not body
+        line 5: ):
+        line 6:     return value            # body_start_line = 6
+    """
+    (root / 'multiline_sig.py').write_text(
+        'def _side_effect():\n'
+        '    return 42\n'
+        'def branchless(\n'
+        '    value=_side_effect(),\n'
+        '):\n'
+        '    return value\n'
+    )
+    if test_calls_branchless:
+        (root / 'test_multiline_sig.py').write_text(
+            'from multiline_sig import branchless\n'
+            'def test_called():\n'
+            '    assert branchless() == 42\n'
+        )
+    else:
+        # Only imports the module (triggers _side_effect at import time) but never calls branchless
+        (root / 'test_multiline_sig.py').write_text(
+            'import multiline_sig\n'
+            'def test_unrelated():\n'
+            '    assert 1 + 1 == 2\n'
+        )
+
+
+@pytest.mark.skipif(not _coverage_importable(), reason="coverage not installed")
+class TestBranchlessMultilineSignature:
+    """D2g: multi-line function signature with side-effecting default arg.
+
+    The default-arg expression runs at import time on a line INSIDE the signature
+    range (ls+1..le) but NOT inside the function body.  The old heuristic (ls+1..le)
+    falsely accepted import-time execution as proof of a call.  The AST fix uses
+    body[0].lineno (the first body statement) so only actual calls pass.
+    """
+
+    def test_branchless_multiline_signature_default_import_only_not_covered(
+            self, tmp_path):
+        """D2g regression: multiline-sig function that is only IMPORTED (default-arg
+        executed at import) must NOT pass the gate → no_targets (fail-closed).
+
+        This is the codex false-green: previously the signature line (with the default
+        arg call) fell in ls+1..le and was counted as body execution → false proceed.
+        With the AST fix the body starts later and import-only is correctly rejected.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_multiline_sig_fixture(tmp_path, test_calls_branchless=False)
+        # branchless starts at line 3, ends at line 6
+        targets = [{'file_path': 'multiline_sig.py', 'name': 'branchless',
+                    'line_start': 3, 'line_end': 6}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_multiline_sig.py'], targets)
+        # Must NOT be fully_covered — function body was never executed
+        assert res['fully_covered'] is False, (
+            f'D2g: import-only multiline-sig must NOT pass gate (false-green!): {res}')
+        assert res['tool_status'] == 'no_targets', (
+            f'D2g: expected no_targets, got {res["tool_status"]}: {res.get("error")}')
+        assert res['error'] and 'branchless' in res['error'], (
+            f'D2g: error must mention target name, got: {res.get("error")}')
+
+    def test_branchless_multiline_signature_called_is_covered(self, tmp_path):
+        """D2g: same multiline-sig function but actually CALLED → fully_covered=True.
+
+        Confirms the fix does not break legitimate branchless function coverage.
+        """
+        from servers.coverage import measure_branch_coverage
+        _write_multiline_sig_fixture(tmp_path, test_calls_branchless=True)
+        targets = [{'file_path': 'multiline_sig.py', 'name': 'branchless',
+                    'line_start': 3, 'line_end': 6}]
+        res = measure_branch_coverage(
+            str(tmp_path), ['test_multiline_sig.py'], targets)
+        assert res['tool_status'] == 'ok', (
+            f'D2g: called multiline-sig must pass gate, got {res["tool_status"]}: '
+            f'{res.get("error")}')
+        assert res['fully_covered'] is True, (
+            f'D2g: called multiline-sig must be fully_covered: {res}')
+        pt = res['per_target'][0]
+        assert pt['n_total'] == 0, 'D2g: branchless() has no branches'
+        assert pt['missing_branches'] == []
+
+
+class TestAstBodyStartLineUnit:
+    """Unit tests for _ast_body_start_line helper.
+
+    These tests do NOT require coverage to be installed.
+    """
+
+    def test_single_line_def_body_start(self, tmp_path):
+        """Single-line def: body starts at line 2."""
+        from servers.coverage import _ast_body_start_line
+        src = 'def add(a, b):\n    return a + b\n'
+        (tmp_path / 'f.py').write_text(src)
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'add', 1, 2)
+        assert result == 2
+
+    def test_multiline_sig_body_start(self, tmp_path):
+        """Multi-line signature: body starts after the closing paren."""
+        from servers.coverage import _ast_body_start_line
+        src = 'def branchless(\n    value=42,\n):\n    return value\n'
+        (tmp_path / 'f.py').write_text(src)
+        # def at line 1, body at line 4
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'branchless', 1, 4)
+        assert result == 4
+
+    def test_method_in_class_body_start(self, tmp_path):
+        """Method inside a class: ast.walk finds it; body_start correct."""
+        from servers.coverage import _ast_body_start_line
+        src = 'class Foo:\n    def bar(self):\n        return 1\n'
+        (tmp_path / 'f.py').write_text(src)
+        # bar is at line 2, body at line 3
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'bar', 2, 3)
+        assert result == 3
+
+    def test_nonexistent_file_returns_none(self, tmp_path):
+        """If file doesn't exist, returns None (caller must fail-closed)."""
+        from servers.coverage import _ast_body_start_line
+        result = _ast_body_start_line(str(tmp_path / 'nonexistent.py'), 'f', 1, 5)
+        assert result is None
+
+    def test_name_not_found_returns_none(self, tmp_path):
+        """Function name not in file → None."""
+        from servers.coverage import _ast_body_start_line
+        (tmp_path / 'f.py').write_text('def other(): return 1\n')
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'missing_fn', 1, 2)
+        assert result is None
+
+    def test_parse_error_returns_none(self, tmp_path):
+        """Syntax error → ast.parse fails → None (fail-closed)."""
+        from servers.coverage import _ast_body_start_line
+        (tmp_path / 'f.py').write_text('def f(\n   # missing close paren and body')
+        result = _ast_body_start_line(str(tmp_path / 'f.py'), 'f', 1, 5)
+        assert result is None
