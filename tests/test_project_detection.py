@@ -449,8 +449,14 @@ class TestK1bDualRunnerAndMocha:
             (b) mocha in deps or scripts.test → 'mocha'
     """
 
-    def test_dual_jest_vitest_devdeps_no_config_returns_none(self, tmp_path):
-        """K1b-a: package.json devDeps contains BOTH jest and vitest, no config → None."""
+    def test_dual_jest_vitest_devdeps_no_config_returns_ambiguous(self, tmp_path):
+        """K1b-a / M1: package.json devDeps has BOTH jest and vitest, no config → AMBIGUOUS.
+
+        The sentinel AMBIGUOUS (not None) lets _detect_tech_stack distinguish
+        "no config found" (None → keep import heuristic) from "config is contradictory"
+        (AMBIGUOUS → clear the heuristic → test_tool = None → fail-closed).
+        """
+        from servers.project import AMBIGUOUS
         (tmp_path / "package.json").write_text(json.dumps({
             "devDependencies": {
                 "jest": "^29.0.0",
@@ -459,8 +465,8 @@ class TestK1bDualRunnerAndMocha:
         }))
         # No vitest.config.*, no jest.config.* — truly ambiguous
         result = _detect_test_tool_from_config(tmp_path)
-        assert result is None, (
-            f'K1b: both jest+vitest in devDeps with no config → must be None, got {result!r}')
+        assert result == AMBIGUOUS, (
+            f'M1/K1b: both jest+vitest in devDeps with no config → AMBIGUOUS, got {result!r}')
 
     def test_dual_deps_with_vitest_script_returns_vitest(self, tmp_path):
         """K1b-a: both jest+vitest in deps, but scripts.test says 'vitest' → 'vitest'."""
@@ -567,3 +573,115 @@ class TestL1NoJSTypeScriptLanguageDefault:
         assert _DEFAULT_TEST_TOOLS.get('java') == 'junit'
         assert _DEFAULT_TEST_TOOLS.get('rust') == 'cargo test'
         assert _DEFAULT_TEST_TOOLS.get('go') == 'go test'
+
+
+# =============================================================================
+# M1 — config-detected AMBIGUITY must clear the import heuristic
+# =============================================================================
+
+class TestM1AmbiguityClearsHeuristic:
+    """M1: AMBIGUOUS sentinel from _detect_test_tool_from_config forces test_tool=None
+    in _detect_tech_stack, even if the import heuristic found a stray 'jest' import.
+
+    This prevents the false-green where a TypeScript project with both jest+vitest
+    in devDeps (ambiguous) kept test_tool='jest' because a code import node happened
+    to mention 'jest'.
+    """
+
+    def _make_db_with_imports(self, db_path, project, imports):
+        import os
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'brain', 'schema.sql'
+        )
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        with open(schema_path, encoding='utf-8') as f:
+            conn.executescript(f.read())
+        conn.execute(
+            "INSERT OR IGNORE INTO code_nodes "
+            "(id, project, kind, name, language) VALUES "
+            "('file.src', ?, 'file', 'src/index.ts', 'typescript')",
+            (project,)
+        )
+        for imp in imports:
+            node_id = f'import.{imp}'
+            conn.execute(
+                "INSERT OR IGNORE INTO code_nodes (id, project, kind, name) "
+                "VALUES (?, ?, 'import', ?)",
+                (node_id, project, imp)
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO code_edges "
+                "(project, from_id, to_id, kind) "
+                "VALUES (?, 'file.src', ?, 'imports')",
+                (project, node_id)
+            )
+        conn.commit()
+        conn.close()
+
+    def test_ambiguous_config_returns_ambiguous_sentinel(self, tmp_path):
+        """_detect_test_tool_from_config returns AMBIGUOUS (not None) for both-deps case."""
+        from servers.project import AMBIGUOUS
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "vitest": "^1.0.0",
+            }
+        }))
+        result = _detect_test_tool_from_config(tmp_path)
+        assert result == AMBIGUOUS, (
+            f'M1: ambiguous config must return AMBIGUOUS sentinel, got {result!r}')
+
+    def test_ambiguous_config_clears_jest_import_heuristic(
+            self, tmp_path, mock_db_path):
+        """M1 end-to-end: config=AMBIGUOUS overrides stray jest import → test_tool=None.
+
+        Scenario: project has a stray 'jest' import node in the Code Graph
+        (import heuristic says 'jest'), but package.json has both jest+vitest deps
+        with no disambiguating config → AMBIGUOUS → final test_tool must be None
+        (fail-closed; gate will reject rather than run jest on an undetermined project).
+        """
+        import servers as s
+        from servers.project import _detect_tech_stack
+        # Insert a stray 'jest' import into the graph (heuristic would say jest)
+        self._make_db_with_imports(s.BRAIN_DB, 'proj_m1a', ['jest'])
+        # Ambiguous package.json: both jest+vitest, no disambiguating config
+        (tmp_path / "package.json").write_text(json.dumps({
+            "devDependencies": {
+                "jest": "^29.0.0",
+                "vitest": "^1.0.0",
+            }
+        }))
+        result = _detect_tech_stack('proj_m1a', project_path=str(tmp_path))
+        assert result['test_tool'] is None, (
+            f'M1: AMBIGUOUS config must clear jest heuristic → test_tool=None, got {result["test_tool"]!r}')
+
+    def test_no_config_preserves_jest_import_heuristic(
+            self, tmp_path, mock_db_path):
+        """M1 contrast: config=None (no config files) keeps the jest import heuristic.
+
+        When there are NO config files (config_tool=None), the import heuristic
+        is preserved — 'jest' import → test_tool='jest'. Only AMBIGUOUS clears it.
+        """
+        import servers as s
+        from servers.project import _detect_tech_stack
+        # Stray 'jest' import — heuristic says jest
+        self._make_db_with_imports(s.BRAIN_DB, 'proj_m1b', ['jest'])
+        # Empty tmp_path: no config files → config_tool=None → heuristic preserved
+        result = _detect_tech_stack('proj_m1b', project_path=str(tmp_path))
+        assert result['test_tool'] == 'jest', (
+            f'M1: None config must NOT clear jest heuristic → test_tool=jest, got {result["test_tool"]!r}')
+
+    def test_concrete_config_tool_still_overrides_heuristic(
+            self, tmp_path, mock_db_path):
+        """M1: concrete config result ('vitest') still overrides any import heuristic."""
+        import servers as s
+        from servers.project import _detect_tech_stack
+        # Stray 'jest' import — heuristic says jest
+        self._make_db_with_imports(s.BRAIN_DB, 'proj_m1c', ['jest'])
+        # vitest.config.ts → concrete config → must override to vitest
+        (tmp_path / "vitest.config.ts").write_text("export default {};")
+        result = _detect_tech_stack('proj_m1c', project_path=str(tmp_path))
+        assert result['test_tool'] == 'vitest', (
+            f'Concrete config vitest must override jest heuristic, got {result["test_tool"]!r}')

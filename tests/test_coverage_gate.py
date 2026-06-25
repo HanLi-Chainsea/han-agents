@@ -777,16 +777,28 @@ class TestFormatCoverageSummary:
         assert '1/2' in out and 'L2→4' in out and '✗' in out
         assert '✓' not in out
 
-    def test_branchless_target_shows_zero_with_no_branch_lines(self):
-        """無分支函式：0/0、標 ✅、不列任何分支行（不該出現 ✓/✗）。"""
+    def test_branchless_target_shows_neutral_not_green(self):
+        """M2: n_total=0 → neutral display 〇/n/a, NOT 0/0 or ✅.
+
+        A genuinely branchless function legitimately passes — the gate must NOT
+        reject it — but the DISPLAY must not show a misleading green ✅ or "0/0
+        covered" fraction. Only the summary string changes; verdict is unaffected.
+        """
         from servers.coverage import format_coverage_summary
         per_target = [{'file_path': 'x.py', 'name': 'noop', 'line_start': 1, 'line_end': 2,
                        'covered_branches': [], 'missing_branches': [],
                        'n_total': 0, 'n_covered': 0}]
         lines = format_coverage_summary(per_target)
-        assert len(lines) == 1                 # 只有標頭，無分支行
-        assert '0/0' in lines[0] and '✅' in lines[0]
-        assert '✓' not in lines[0] and '✗' not in lines[0]
+        assert len(lines) == 1, "branchless: only header line, no branch sub-lines"
+        header = lines[0]
+        # M2: must NOT show misleading green or fraction
+        assert '✅' not in header, "M2: branchless must not render ✅ (misleading green)"
+        assert '0/0' not in header, "M2: branchless must not show '0/0' as a coverage count"
+        # Must show a neutral marker (n/a or no-branch indicator)
+        assert ('n/a' in header or '無分支' in header or 'no branch' in header.lower()), (
+            f"M2: branchless must show neutral 'n/a'/'無分支' marker, got: {header!r}")
+        # Must still not have ✓/✗ branch sub-lines
+        assert '✓' not in header and '✗' not in header
 
     def test_branches_listed_in_line_order(self):
         """分支不論覆蓋與否，一律依行號排序，方便對照原始碼由上而下核對。"""
@@ -1755,3 +1767,96 @@ class TestK1UndeterminedJsRunner:
             f'K1: jest must proceed to measure, got {verdict["verdict"]}')
         assert js_calls == ['jest'], (
             f'K1: measure must be called with tool=jest, got {js_calls}')
+
+
+# =============================================================================
+# M2 — n_total=0 must not render as green ✅ (display honesty)
+# =============================================================================
+
+class TestM2NoBranchesDisplay:
+    """M2: format_coverage_summary with n_total=0 must show neutral marker,
+    NOT ✅ and NOT '0/0'. Gate verdict is unaffected (branchless functions
+    legitimately pass; this is a display-only fix).
+    """
+
+    def test_zero_total_no_green_check_mark(self):
+        """M2 primary: n_total=0 → ✅ absent, 0/0 absent, neutral marker present."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'utils.py', 'name': 'noop',
+                       'line_start': 5, 'line_end': 6,
+                       'covered_branches': [], 'missing_branches': [],
+                       'n_total': 0, 'n_covered': 0}]
+        lines = format_coverage_summary(per_target)
+        assert lines, "Must produce at least one output line"
+        header = lines[0]
+        assert '✅' not in header, f"M2: ✅ must not appear for branchless: {header!r}"
+        assert '0/0' not in header, f"M2: '0/0' must not appear for branchless: {header!r}"
+        assert 'n/a' in header or '無分支' in header, (
+            f"M2: neutral marker (n/a or 無分支) must appear: {header!r}")
+
+    def test_zero_total_no_branch_sub_lines(self):
+        """M2: branchless → only the header line, no ✓/✗ sub-lines."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'utils.py', 'name': 'noop',
+                       'line_start': 5, 'line_end': 6,
+                       'covered_branches': [], 'missing_branches': [],
+                       'n_total': 0, 'n_covered': 0}]
+        lines = format_coverage_summary(per_target)
+        assert len(lines) == 1, (
+            f"M2: branchless must emit only header line, got {len(lines)}: {lines}")
+
+    def test_normal_partial_still_shows_fraction_and_marks(self):
+        """M2 regression: n_total>0 with missing branches → ❌ and fraction unchanged."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'compute',
+                       'line_start': 1, 'line_end': 8,
+                       'covered_branches': [{'from': 2, 'to': 3}],
+                       'missing_branches': [{'from': 2, 'to': 4},
+                                            {'from': 4, 'to': 5},
+                                            {'from': 4, 'to': 6}],
+                       'n_total': 4, 'n_covered': 1}]
+        lines = format_coverage_summary(per_target)
+        header = lines[0]
+        assert '1/4' in header, f"Normal partial must show fraction 1/4: {header!r}"
+        assert '❌' in header, f"Normal partial must show ❌: {header!r}"
+        assert '✅' not in header
+        # Branch sub-lines present
+        arc_lines = [ln for ln in lines if 'L' in ln and '→' in ln]
+        assert len(arc_lines) == 4, f"Expect 4 branch lines, got {len(arc_lines)}"
+
+    def test_full_coverage_nonzero_still_shows_green(self):
+        """M2 regression: n_total>0, fully covered → ✅ unchanged."""
+        from servers.coverage import format_coverage_summary
+        per_target = [{'file_path': 'calc.py', 'name': 'compute',
+                       'line_start': 1, 'line_end': 5,
+                       'covered_branches': [{'from': 2, 'to': 3},
+                                            {'from': 2, 'to': 4}],
+                       'missing_branches': [],
+                       'n_total': 2, 'n_covered': 2}]
+        lines = format_coverage_summary(per_target)
+        header = lines[0]
+        assert '2/2' in header, f"Full coverage must show 2/2: {header!r}"
+        assert '✅' in header, f"Full coverage must show ✅: {header!r}"
+
+    def test_mixed_branchless_and_normal_in_same_summary(self):
+        """M2: multiple targets where one is branchless, other normal → each correct."""
+        from servers.coverage import format_coverage_summary
+        per_target = [
+            {'file_path': 'a.py', 'name': 'noop',
+             'line_start': 1, 'line_end': 2,
+             'covered_branches': [], 'missing_branches': [],
+             'n_total': 0, 'n_covered': 0},
+            {'file_path': 'b.py', 'name': 'compute',
+             'line_start': 1, 'line_end': 5,
+             'covered_branches': [{'from': 2, 'to': 3}],
+             'missing_branches': [{'from': 2, 'to': 4}],
+             'n_total': 2, 'n_covered': 1},
+        ]
+        lines = format_coverage_summary(per_target)
+        headers = [ln for ln in lines if ln.startswith('📊')]
+        assert len(headers) == 2
+        # Branchless: neutral
+        assert '✅' not in headers[0] and '0/0' not in headers[0]
+        assert 'n/a' in headers[0] or '無分支' in headers[0]
+        # Normal with missing: fraction + ❌
+        assert '1/2' in headers[1] and '❌' in headers[1]

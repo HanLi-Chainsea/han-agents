@@ -319,6 +319,13 @@ def format_coverage_summary(per_target: List[Dict]) -> List[str]:
     lines = []
     for pt in per_target:
         n_cov, n_tot = pt['n_covered'], pt['n_total']
+        if n_tot == 0:
+            # M2: branchless function — neutral display; gate still proceeds (not a fail)
+            lines.append(
+                f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} "
+                f"〇 無分支 (n/a)"
+            )
+            continue
         mark = '✅' if not pt['missing_branches'] else '❌'
         lines.append(
             f"📊 分支覆蓋 {pt['file_path']}::{pt['name']} "

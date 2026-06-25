@@ -55,6 +55,12 @@ _DEFAULT_TEST_TOOLS = {
     'go': 'go test',
 }
 
+# Sentinel returned by _detect_test_tool_from_config when config signals conflict
+# (e.g. both jest AND vitest in devDeps with no disambiguating config file).
+# Distinct from None (= no config signal at all) so _detect_tech_stack can
+# force test_tool=None (fail-closed) instead of falling back to import heuristic.
+AMBIGUOUS = '__ambiguous__'
+
 # Regex for vite.config 'test:' block detection — tolerates spaces and quoted keys (D4)
 _VITE_TEST_RE = re.compile(r'["\']?test["\']?\s*:')
 
@@ -161,13 +167,13 @@ def _detect_test_tool_from_config(project_path) -> Optional[str]:
                         if (root / f"jest.config.{ext}").exists():
                             return 'jest'
                     return 'jest'
-                # Neither script signal nor config file → truly ambiguous → None
+                # Neither script signal nor config file → truly ambiguous → AMBIGUOUS
                 _jest_config_exts = ('js', 'ts', 'cjs', 'mjs', 'json')
                 for ext in _jest_config_exts:
                     if (root / f"jest.config.{ext}").exists():
                         return 'jest'
-                # Still ambiguous — return None (caller treats as undetermined)
-                return None
+                # Still ambiguous — return AMBIGUOUS (caller clears heuristic; M1)
+                return AMBIGUOUS
 
             # Check vitest signals first (vitest beats jest when only one is present)
             if _vitest_dep or _vitest_script:
@@ -336,9 +342,15 @@ def _detect_tech_stack(project_name, project_path=None):
             )
         # else: >1 test_tools → leave test_tool = None (ambiguous)
 
-    # 4. Config-file pass overrides import heuristic (if project_path given)
+    # 4. Config-file pass overrides import heuristic (if project_path given).
+    # Three distinct outcomes (M1):
+    #   concrete tool → use it (override heuristic)
+    #   AMBIGUOUS     → force None (clear heuristic; ambiguous config = fail-closed)
+    #   None          → no config signal; leave heuristic / language-default in place
     config_tool = _detect_test_tool_from_config(project_path)
-    if config_tool is not None:
+    if config_tool == AMBIGUOUS:
+        result['test_tool'] = None          # M1: ambiguous config clears import heuristic
+    elif config_tool is not None:
         result['test_tool'] = config_tool
 
     return result
