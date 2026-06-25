@@ -15,7 +15,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BASE_DIR)
@@ -96,78 +96,116 @@ def _paths_within_root(paths: List[str], project_root: str) -> bool:
 
 
 # =============================================================================
-# Verdict Parsing (robust: collect ALL matches, conflict → REJECTED)
+# Verdict Parsing — strict line-by-line (closes prefix/suffix/mixed bypasses)
 # =============================================================================
 
-def _parse_verdict(response_text: str):
-    """Parse the critic verdict from response_text.
+# Verdict keywords (for bearing-but-malformed detection)
+_VERDICT_KEYWORDS = re.compile(
+    r'(?:APPROVED|CONDITIONAL|REJECTED|驗證結果)',
+    re.IGNORECASE,
+)
 
-    Collects ALL verdict markers from two sources:
-      1. '驗證結果: X' pattern (inline or heading) — the verdict token must be
-         followed by only optional whitespace to END OF LINE (re.MULTILINE).
-         Anything after the token on the same line ('APPROVEDLY', 'APPROVED-but',
-         'APPROVED LY', etc.) means the token is not clean → no match →
-         unparseable → fail-closed REJECTED.
-      2. '^#+ X$' standalone heading markers — verdict token must be the ONLY
-         content on the line (optional surrounding whitespace allowed).
+# A CLEAN verdict line (after strip):
+#   optional leading #s + optional space, optional 驗證結果[:：] prefix,
+#   then EXACTLY the verdict token, then END OF LINE — nothing else.
+_CLEAN_VERDICT_LINE = re.compile(
+    r'^(?:#+\s*)?(?:驗證結果\s*[:：]\s*)?(APPROVED|CONDITIONAL|REJECTED)$',
+    re.IGNORECASE,
+)
 
-    Pattern 1: 驗證結果\\s*[:：]\\s*(APPROVED|CONDITIONAL|REJECTED)\\s*$
-        with re.MULTILINE | re.IGNORECASE
 
-        '驗證結果: APPROVED'              → APPROVED  (end of string)
-        '## 驗證結果: APPROVED'            → APPROVED  (newline follows)
-        '驗證結果: APPROVED   '            → APPROVED  (trailing spaces then EOL)
-        '驗證結果: APPROVEDLY'             → no match  (extra letters → not \\s*$)
-        '驗證結果: APPROVED-but malformed' → no match  ('-but' → not \\s*$)
-        '驗證結果: APPROVEDL'              → no match  ('L' → not \\s*$)
+def _normalize_to_lines(text: str) -> List[str]:
+    """Normalize literal \\n (two-char sequence) and real newlines into lines.
 
-    Pattern 2: ^#+\\s*(APPROVED|CONDITIONAL|REJECTED)\\s*$
-        with re.MULTILINE | re.IGNORECASE (standalone heading, no 驗證結果 prefix)
-
-    Returns (verdict: str, unparseable: bool):
-    - ZERO matches → ('REJECTED', True)   — unparseable, fail-closed
-    - MULTIPLE DISTINCT verdicts → ('REJECTED', False) — conflicting, fail-closed
-    - SINGLE consistent verdict → (verdict, False)
+    The str() pipeline for a tool_response dict can produce literal backslash-n
+    sequences instead of real newlines. Normalize both so line-by-line parsing
+    works regardless of origin.
     """
-    verdicts_found = set()
+    # Replace literal two-char \\n with real newline, then split
+    normalized = text.replace('\\n', '\n').replace('\\r', '\n')
+    return normalized.splitlines()
 
-    # Pattern 1: 驗證結果: VERDICT
-    # The verdict token must be followed by only optional whitespace to end-of-line.
-    # We handle two forms of "end of line":
-    #   a) Real newline (\n) — for plain strings passed directly to _parse_verdict
-    #   b) Literal \n escape sequence — produced by str(dict) in the hook, where
-    #      the tool_response dict's newlines become the two-char sequence "\\n"
-    # Lookahead: (?=\s*(?:\\n|\\r|$)) means: after optional whitespace, the next
-    # thing is either a literal backslash-n, backslash-r, or end-of-string/line.
-    # This rejects APPROVEDLY, APPROVED-but..., APPROVEDL, etc. in both forms.
-    for m in re.finditer(
-        r'驗證結果\s*[:：]\s*(APPROVED|CONDITIONAL|REJECTED)(?=\s*(?:\\n|\\r|$))',
-        response_text,
-        re.MULTILINE | re.IGNORECASE,
-    ):
-        verdicts_found.add(m.group(1).upper())
 
-    # Pattern 2: ^#+ VERDICT$ (markdown headings — standalone verdict on its own line)
-    for m in re.finditer(
-        r'^#+\s*(APPROVED|CONDITIONAL|REJECTED)\s*$',
-        response_text,
-        re.MULTILINE | re.IGNORECASE,
-    ):
-        verdicts_found.add(m.group(1).upper())
+def _parse_verdict(text: str) -> Tuple[str, bool]:
+    """Parse the critic verdict from text using strict line-by-line rules.
 
-    if not verdicts_found:
-        return "REJECTED", True   # unparseable → fail-closed
+    Algorithm:
+    1. Normalize literal \\n sequences and real newlines, split into lines.
+    2. For each line (after stripping):
+       a. Check if it is a CLEAN verdict line (matches _CLEAN_VERDICT_LINE).
+       b. Check if it is VERDICT-BEARING-BUT-MALFORMED: contains a verdict
+          keyword or '驗證結果' but is NOT a clean verdict line.
+    3. Collect all clean verdicts. Accumulate any malformed verdict-bearing lines.
+    4. Rules:
+       - ZERO clean verdicts → unparseable (return 'REJECTED', True)
+       - ANY malformed verdict-bearing line → unparseable (return 'REJECTED', True)
+         even if a clean verdict also exists
+       - CONFLICTING clean verdicts (>1 distinct value), no malformed →
+         return ('REJECTED', False)
+       - Exactly ONE consistent clean verdict, zero malformed →
+         return (verdict, False)
 
-    if len(verdicts_found) > 1:
-        # Conflicting verdicts → fail-closed
-        return "REJECTED", False
+    Examples:
+      'Critic cannot conclude 驗證結果: APPROVED' → malformed prefix → unparseable
+      '驗證結果: APPROVED\\n驗證結果: REJECTED-but malformed' → malformed REJECTED line → unparseable
+      'APPROVEDLY' → malformed → unparseable
+      '## 驗證結果: APPROVED' → clean → APPROVED
+      '驗證結果: APPROVED\\n驗證結果: REJECTED' → two clean, conflicting → REJECTED (not unparseable)
+    """
+    lines = _normalize_to_lines(text)
 
-    return verdicts_found.pop(), False
+    clean_verdicts: List[str] = []
+    has_malformed = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        clean_match = _CLEAN_VERDICT_LINE.match(line)
+        if clean_match:
+            clean_verdicts.append(clean_match.group(1).upper())
+        elif _VERDICT_KEYWORDS.search(line):
+            # Contains a verdict keyword but is NOT a clean verdict line → malformed
+            has_malformed = True
+
+    if not clean_verdicts:
+        # No parseable verdict found
+        return 'REJECTED', True
+
+    if has_malformed:
+        # Any malformed verdict-bearing line → fail-closed, even with clean verdicts
+        return 'REJECTED', True
+
+    distinct = set(clean_verdicts)
+    if len(distinct) > 1:
+        # Conflicting clean verdicts → fail-closed (not unparseable, just conflicting)
+        return 'REJECTED', False
+
+    return distinct.pop(), False
 
 
 # =============================================================================
 # Deterministic Evidence Gate (test tasks only)
 # =============================================================================
+
+# Strict RESULT line patterns (anchored full-line):
+#   PASS: RESULT: PASS  OR  RESULT: PASS <integer>  (nothing else)
+#   FAIL: RESULT: FAIL  OR  RESULT: FAIL <integer>  OR  RESULT: FAIL <integer> <anything>
+_RESULT_PASS = re.compile(
+    r'^\s*RESULT:\s*PASS(?:\s+\d+)?\s*$',
+    re.IGNORECASE,
+)
+_RESULT_FAIL = re.compile(
+    r'^\s*RESULT:\s*FAIL(?:\s+\d+)?(?:\s+.*)?\s*$',
+    re.IGNORECASE,
+)
+# Any line starting with RESULT: (including bare "RESULT:")
+_RESULT_LINE = re.compile(
+    r'^\s*RESULT:',
+    re.IGNORECASE,
+)
+
 
 def _check_test_evidence(result_text: str, project_root: str):
     """Check that executor result contains valid test evidence.
@@ -176,19 +214,23 @@ def _check_test_evidence(result_text: str, project_root: str):
     - Collect ALL TEST_TARGETS: lines and ALL paths across them (comma or
       space separated).  EVERY path must be within project_root.  ANY path
       escaping the root → REJECT.
-    - Collect ALL RESULT: lines.  Parse each line with a STRICT full-line
-      pattern: PASS or FAIL as a whole token, optionally followed by
-      whitespace + extra content (like a count 'PASS 3'), to end of line.
-      Any character immediately following PASS/FAIL that is not whitespace
-      or end-of-line makes the RESULT line MALFORMED.
+    - Collect ALL RESULT: lines (including bare 'RESULT:' with nothing after).
+      Parse each line with STRICT whole-line patterns:
+        PASS pattern: ^\\s*RESULT:\\s*PASS(?:\\s+\\d+)?\\s*$
+        FAIL pattern: ^\\s*RESULT:\\s*FAIL(?:\\s+\\d+)?(?:\\s+.*)?\\s*$
+      Any RESULT: line matching NEITHER → MALFORMED → evidence INVALID → REJECT.
       Rules:
         - ANY malformed RESULT: line → evidence INVALID → REJECT
         - At least one clean RESULT: PASS required
         - Zero clean RESULT: FAIL allowed; any FAIL → REJECT
-      So 'RESULT: PASS-FAIL' → malformed → REJECT.
-         'RESULT: PASS/FAIL' → malformed → REJECT.
-         'RESULT: PASS 3'    → valid PASS.
-         'RESULT: PASSIVE'   → malformed → REJECT.
+      So:
+        'RESULT: PASS FAIL'      → malformed → REJECT
+        'RESULT: PASS / FAIL'    → malformed → REJECT
+        'RESULT: PASS - FAIL 1'  → malformed → REJECT
+        'RESULT: PASS tests failed' → malformed → REJECT (non-digit after PASS token)
+        'RESULT:'                → malformed (bare, no PASS/FAIL) → REJECT
+        'RESULT: PASS 3'         → valid PASS
+        'RESULT: PASSIVE'        → malformed (not PASS or FAIL token) → REJECT
 
     Returns (ok: bool, reason: str):
     - ok=True  → evidence is present and valid
@@ -236,40 +278,31 @@ def _check_test_evidence(result_text: str, project_root: str):
             "測試檔必須在專案目錄內"
         )
 
-    # ── Collect ALL RESULT: lines and parse each strictly ────────────────────
-    # First, find every line that starts with RESULT: (any content after colon).
-    all_result_lines = re.findall(
-        r'^\s*RESULT:\s*.+$',
-        result_text,
-        re.MULTILINE | re.IGNORECASE,
-    )
-
-    # Strict full-line pattern: PASS or FAIL as a whole token, optionally
-    # followed by whitespace + extra content (e.g. a count), to end of line.
-    # The character immediately after PASS/FAIL must be whitespace or EOL —
-    # so 'PASS-FAIL', 'PASS/FAIL', 'PASSIVE' are all MALFORMED.
-    _STRICT_RESULT = re.compile(
-        r'^\s*RESULT:\s*(PASS|FAIL)(?:\s+\S.*)?\s*$',
-        re.IGNORECASE,
-    )
+    # ── Collect ALL RESULT: lines (including bare RESULT:) ───────────────────
+    # We must find every line starting with RESULT: — including bare ones with
+    # nothing after the colon (e.g. "RESULT:").
+    # Split into lines and check each line.
+    all_lines = result_text.splitlines()
 
     pass_count = 0
     fail_count = 0
     malformed_count = 0
-    for line in all_result_lines:
-        m = _STRICT_RESULT.match(line)
-        if m:
-            tok = m.group(1).upper()
-            if tok == 'PASS':
-                pass_count += 1
-            else:
-                fail_count += 1
+
+    for line in all_lines:
+        if not _RESULT_LINE.match(line):
+            continue
+        # This line starts with RESULT: — classify it strictly
+        if _RESULT_PASS.match(line):
+            pass_count += 1
+        elif _RESULT_FAIL.match(line):
+            fail_count += 1
         else:
+            # Matches RESULT: prefix but not PASS or FAIL pattern → MALFORMED
             malformed_count += 1
 
     if malformed_count > 0:
         return False, (
-            "缺可信 evidence: RESULT: 行格式不合法（如 PASS-FAIL、PASS/FAIL、PASSIVE），"
+            "缺可信 evidence: RESULT: 行格式不合法（如 PASS-FAIL、PASS/FAIL、PASSIVE、bare RESULT:），"
             "RESULT 必須為 PASS 或 FAIL 加可選數量，不可含其他連接字元"
         )
 
@@ -349,9 +382,10 @@ def _handle_task_event(input_data: Dict[str, Any]) -> Optional[Dict]:
             log("ERROR: ORIGINAL_TASK_ID not found in prompt")
             return None
 
-        response_text = str(tool_response)
+        # Use the real agent output text (not str(tool_response)) for parsing
+        response_text = _agent_output_text(tool_response)
 
-        # Robust verdict parsing: collect ALL matches; conflict/zero → REJECTED
+        # Strict line-by-line verdict parsing: prefix/suffix/mixed → fail-closed
         verdict, unparseable = _parse_verdict(response_text)
         approved = verdict != "REJECTED"
 

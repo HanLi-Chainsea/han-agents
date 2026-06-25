@@ -648,12 +648,25 @@ def test_parse_verdict_unparseable():
 
 
 def test_parse_verdict_conflicting():
+    """Two CLEAN conflicting verdicts → REJECTED, unparseable=False (conflict, not malformed)."""
+    hook = _load_post_task()
+    # Both lines are clean verdict lines; they conflict → REJECTED, not unparseable
+    verdict, unparseable = hook._parse_verdict(
+        "## 驗證結果: APPROVED\n\n## 驗證結果: REJECTED\n\nMissing coverage."
+    )
+    assert verdict == "REJECTED"
+    assert unparseable is False
+
+
+def test_parse_verdict_conflicting_with_malformed_prefix():
+    """'But wait: ## 驗證結果: REJECTED' has a prefix → malformed → unparseable=True."""
     hook = _load_post_task()
     verdict, unparseable = hook._parse_verdict(
         "## 驗證結果: APPROVED\n\nBut wait: ## 驗證結果: REJECTED"
     )
     assert verdict == "REJECTED"
-    assert unparseable is False
+    # The second line has a prefix → malformed → unparseable (not a clean conflict)
+    assert unparseable is True
 
 
 def test_parse_verdict_heading_pattern():
@@ -1477,3 +1490,179 @@ class TestMetadataTaskTypeHookGating:
             f"(no TEST_TARGETS in result). "
             f"validation_status={task.get('validation_status')!r}"
         )
+
+
+# =============================================================================
+# R6 — Strict line-by-line parser: new adversarial cases (codex-listed)
+# =============================================================================
+
+# ── Verdict adversarial cases ─────────────────────────────────────────────────
+
+def test_parse_verdict_prefix_critic_cannot_conclude_not_approved():
+    """'Critic cannot conclude 驗證結果: APPROVED' → prefix before 驗證結果 → malformed → unparseable."""
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict(
+        "Critic cannot conclude 驗證結果: APPROVED"
+    )
+    assert verdict == "REJECTED", (
+        f"Prefix text before 驗證結果 must make the line malformed. verdict={verdict!r}"
+    )
+    assert unparseable is True, (
+        f"Malformed verdict-bearing line → unparseable must be True. unparseable={unparseable!r}"
+    )
+
+
+def test_parse_verdict_clean_approved_plus_malformed_rejected_line_not_approved():
+    """Clean APPROVED line + '驗證結果: REJECTED-but malformed' → malformed line present → unparseable.
+
+    Even though a valid APPROVED exists, the malformed REJECTED line forces fail-closed.
+    """
+    hook = _load_post_task()
+    text = "驗證結果: APPROVED\n驗證結果: REJECTED-but malformed"
+    verdict, unparseable = hook._parse_verdict(text)
+    assert verdict == "REJECTED", (
+        f"Malformed verdict-bearing line must force REJECTED. verdict={verdict!r}"
+    )
+    assert unparseable is True, (
+        f"Malformed line must produce unparseable=True even with a clean verdict. "
+        f"unparseable={unparseable!r}"
+    )
+
+
+def test_parse_verdict_heading_approved_clean():
+    """'## 驗證結果: APPROVED' is a clean whole line → APPROVED (positive case)."""
+    hook = _load_post_task()
+    verdict, unparseable = hook._parse_verdict(
+        "Reviewed carefully.\n## 驗證結果: APPROVED\n\nLooks good."
+    )
+    assert verdict == "APPROVED", f"Clean heading APPROVED must parse. verdict={verdict!r}"
+    assert unparseable is False
+
+
+# ── RESULT adversarial cases ──────────────────────────────────────────────────
+
+def test_check_test_evidence_result_pass_space_fail_malformed(tmp_path):
+    """'RESULT: PASS FAIL' → malformed (PASS followed by non-digit word) → evidence INVALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, f"'RESULT: PASS FAIL' must be INVALID. reason={reason!r}"
+
+
+def test_check_test_evidence_result_pass_slash_fail_new(tmp_path):
+    """'RESULT: PASS / FAIL' → malformed → evidence INVALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS / FAIL\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, f"'RESULT: PASS / FAIL' must be INVALID. reason={reason!r}"
+
+
+def test_check_test_evidence_result_pass_dash_fail_1_malformed(tmp_path):
+    """'RESULT: PASS - FAIL 1' → malformed → evidence INVALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS - FAIL 1\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, f"'RESULT: PASS - FAIL 1' must be INVALID. reason={reason!r}"
+
+
+def test_check_test_evidence_result_pass_tests_failed_malformed(tmp_path):
+    """'RESULT: PASS tests failed' → 'tests' is non-digit after PASS → malformed → INVALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS tests failed\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, f"'RESULT: PASS tests failed' must be INVALID. reason={reason!r}"
+
+
+def test_check_test_evidence_result_pass_1_then_bare_result_malformed(tmp_path):
+    """'RESULT: PASS 1\\nRESULT:' (trailing bare RESULT:) → malformed → evidence INVALID."""
+    hook = _load_post_task()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert True")
+
+    result_text = (
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS 1\n"
+        "RESULT:\n"
+        "CMD: pytest tests/ok.py\n"
+    )
+    ok, reason = hook._check_test_evidence(result_text, str(tmp_path))
+    assert ok is False, (
+        f"Bare 'RESULT:' line must be MALFORMED → INVALID. reason={reason!r}"
+    )
+
+
+# ── Full positive case: clean ## heading + PASS 3 → APPROVED ─────────────────
+
+def test_full_hook_clean_heading_verdict_with_pass_3_approved(mock_db_path, tmp_path):
+    """Positive: '## 驗證結果: APPROVED' + TEST_TARGETS: tests/ok.py + RESULT: PASS 3 → APPROVED."""
+    from servers.tasks import create_task, get_task, update_task_status, advance_task_phase
+
+    parent_id = create_task('test', 'parent task')
+    original_task_id = create_task('test', 'Write unit tests for servers/memory.py',
+                                   parent_id=parent_id)
+    critic_task_id = create_task('test', 'critic task', parent_id=parent_id)
+
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "ok.py").write_text("def test_x(): assert 1 == 1")
+
+    result_text = (
+        "Ran the tests.\n"
+        "TEST_TARGETS: tests/ok.py\n"
+        "RESULT: PASS 3\n"
+        "CMD: pytest tests/ok.py -q\n"
+    )
+    update_task_status(original_task_id, 'done', result=result_text)
+    advance_task_phase(original_task_id, 'validation')
+
+    hook = _load_post_task()
+    hook.handle_event({
+        "tool_name": "Task",
+        "tool_input": {
+            "prompt": _make_critic_prompt_with_path(
+                critic_task_id, original_task_id, str(tmp_path)
+            ),
+            "subagent_type": "critic",
+        },
+        "tool_response": {
+            "output": (
+                "I verified the tests carefully.\n"
+                "## 驗證結果: APPROVED\n\n"
+                "All assertions are real and RESULT shows PASS."
+            )
+        },
+    })
+
+    task = get_task(original_task_id)
+    assert task is not None
+    assert task.get('validation_status') == 'approved', (
+        f"Clean heading verdict + valid evidence must be APPROVED. "
+        f"validation_status={task.get('validation_status')!r}"
+    )
