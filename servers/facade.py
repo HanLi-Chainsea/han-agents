@@ -1375,6 +1375,14 @@ def finish_validation(
         log_agent_action('critic', original_task_id, 'rejected',
                         json.dumps({'issues': issues or [], 'suggestions': suggestions or []}))
 
+        # Fix A: persist critic reason so executor retry prompt picks it up
+        # (same key _gate_reject writes; idempotent when called via _gate_reject)
+        reason_lines = (issues or []) + (suggestions or [])
+        if reason_lines:
+            from servers.memory import set_working_memory
+            set_working_memory(original_task_id, 'critic_suggestions',
+                               '\n'.join(str(x) for x in reason_lines))
+
         return {
             'status': 'rejected',
             'original_task_phase': 'execution',
@@ -2500,12 +2508,46 @@ Please address the issues above in this retry.
     # Playbook 原則注入（依描述分類；未命中則為空，fail-open）
     playbook_section = ""
     try:
-        from servers.playbooks import resolve_playbook, executor_section
+        from servers.playbooks import resolve_playbook, executor_section, is_test_task
         pb = resolve_playbook(description)
         if pb:
             playbook_section = "\n" + executor_section(pb)
     except Exception:
         playbook_section = ""
+
+    # Only inject the compact TEST_TARGETS evidence block for test-type tasks.
+    # Non-test tasks (code_review, docs, analysis) must NOT be required to supply
+    # TEST_TARGETS — that would block them unconditionally (regression fix).
+    # Fix 3: pass the full task dict so is_test_task can prefer metadata['task_type'].
+    try:
+        from servers.playbooks import is_test_task as _is_test
+        _need_evidence = _is_test(task)
+    except Exception:
+        _need_evidence = False
+
+    if _need_evidence:
+        output_format_section = """
+## Required Output Format (COMPACT EVIDENCE BLOCK)
+
+After completing the task, END your report with the following compact evidence
+block — exactly four lines, one per field, no extra prose. Do NOT reproduce the
+full test file or paste long output; the block replaces verbose prose:
+
+TEST_TARGETS: <relative test file path(s), comma-separated>
+RESULT: PASS <n>   (or: FAIL <n> — <one-line reason>)
+CHANGED: <files created or modified, comma-separated>
+CMD: <the exact test command you ran>
+
+You MUST still actually run the tests; the compact block records the run, it
+does not replace it. Running tests is mandatory — NEVER omit the CMD/RESULT.
+"""
+    else:
+        output_format_section = """
+## Required Output Format
+
+After completing the task, summarise what was done clearly and concisely.
+Include: what was changed or produced, any key findings or decisions made.
+"""
 
     prompt = f'''TASK_ID = "{task_id}"
 PROJECT = "{project_name}"
@@ -2523,7 +2565,7 @@ PROJECT_PATH = "{project_path}"
 1. Read relevant source files
 2. Execute the task as described
 3. Output results clearly
-'''
+{output_format_section}'''
     return prompt.strip()
 
 
@@ -2533,6 +2575,12 @@ def _build_critic_prompt(
     project_path: str
 ) -> str:
     """建構 Critic agent 的完整 prompt
+
+    Task-type-aware: only injects the TEST_TARGETS evidence-verification block
+    for test-type tasks (unit_test / integration_test / e2e_test / refactor).
+    Non-test tasks (code_review, docs, analysis) get the standard checklist
+    without the fail-closed-on-missing-TEST_TARGETS rule — they would otherwise
+    be unconditionally blocked (regression fix).
 
     Args:
         critic_task: reserve_critic_task() 返回的 dict
@@ -2556,6 +2604,61 @@ def _build_critic_prompt(
     except Exception:
         playbook_section = ""
 
+    # Determine if this is a test-type task that requires evidence gating.
+    # Fix 3: prefer metadata['task_type'] from the original task when available;
+    # fall back to description keyword inference for legacy tasks.
+    try:
+        from servers.playbooks import is_test_task as _is_test
+        _orig_task_id = critic_task.get('original_task_id')
+        if _orig_task_id:
+            try:
+                from servers.tasks import get_task as _get_task
+                _orig = _get_task(_orig_task_id)
+                if _orig is not None:
+                    _need_evidence = _is_test(_orig)
+                else:
+                    _need_evidence = _is_test(description)
+            except Exception:
+                _need_evidence = _is_test(description)
+        else:
+            _need_evidence = _is_test(description)
+    except Exception:
+        _need_evidence = False
+
+    if _need_evidence:
+        evidence_section = """
+## Evidence Verification — MANDATORY STEPS (fail-closed)
+
+The executor's result above should end with a compact evidence block containing
+TEST_TARGETS:, RESULT:, CHANGED:, and CMD: lines.
+
+You MUST perform the following steps BEFORE rendering a verdict:
+
+1. Parse the TEST_TARGETS: line from the executor evidence above.
+2. For each path listed, resolve it relative to PROJECT_PATH (shown at the top
+   of this prompt) and READ the actual test file using your Read tool.
+3. Verify the file contains real, meaningful assertions — not just `assert True`,
+   empty test bodies, or placeholder stubs.
+4. Confirm the RESULT: line shows a PASS (not FAIL) for this execution.
+5. Confirm the CMD: line shows the actual test command that was run.
+
+FAIL-CLOSED RULE — output `## 驗證結果: REJECTED` immediately if ANY of:
+- The executor evidence has no TEST_TARGETS: line
+- A listed test file path cannot be read (file missing or unreadable)
+- The test file(s) contain no real executed assertions (e.g. only `assert True`,
+  empty test bodies, or no actual test functions)
+- The RESULT: line is absent or shows FAIL
+- The CMD: line is absent (no execution evidence)
+
+NEVER output APPROVED or CONDITIONAL without having:
+  (a) successfully read at least one actual test file listed in TEST_TARGETS:,
+  (b) confirmed it contains real assertions, AND
+  (c) seen a PASS result in the RESULT: line.
+須附執行輸出否則 REJECT（實際被執行的測試才算數）。
+"""
+    else:
+        evidence_section = ""
+
     prompt = f'''TASK_ID = "{critic_task_id}"
 ORIGINAL_TASK_ID = "{original_task_id}"
 PROJECT = "{project_name}"
@@ -2564,8 +2667,11 @@ PROJECT_PATH = "{project_path}"
 ## Validation Target
 
 Task: {description}
-Result: {critic_task.get('result', 'See code changes')}
 
+## Executor Evidence
+
+{critic_task.get('result', 'See code changes')}
+{evidence_section}
 ## Validation Criteria
 
 1. Does the output match the task description?
@@ -2580,6 +2686,11 @@ You MUST output one of:
 - `## 驗證結果: APPROVED` — if the task is done correctly
 - `## 驗證結果: CONDITIONAL` — if acceptable with minor suggestions
 - `## 驗證結果: REJECTED` — if significant issues need fixing
+
+After rendering your verdict, output SPECIFIC, ACTIONABLE issues in the verdict
+text describing exactly what the executor must fix. The hook will persist your
+output text as feedback for the executor on retry.
+
 '''
     return prompt.strip()
 
